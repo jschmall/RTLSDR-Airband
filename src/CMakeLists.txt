@@ -358,6 +358,7 @@ if(BUILD_UNITTESTS)
 		ctcss.cpp
 		generate_signal.cpp
 		helper_functions.cpp
+		udp_stream.cpp
 	)
 
 	add_executable(

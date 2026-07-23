@@ -26,6 +26,15 @@ Keep the local delta small and well understood.
    upload completed transmission files to RDIO via API.
 2. **`sendto` byte-length fix** in `src/udp_stream.cpp` — `sendto()` was being passed a float
    *element* count where it needs a *byte* count. Corrected to `len * sizeof(float)`.
+3. **UDP unit-mismatch follow-up fix** — the fix above changed `udp_stream_write()`'s internal
+   `len` convention from "already bytes" to "sample count, converted to bytes internally", but the
+   three call sites (`src/rtl_airband.cpp` `init_output()`, `src/output.cpp` `process_outputs()`
+   mono/stereo branches) were left passing `WAVE_BATCH * sizeof(float)` — a byte count under the
+   old convention. Net effect: every UDP packet carried 4x the intended payload, reading past the
+   end of `channel->waveout`/`waveout_r` into adjacent `channel_t` memory. This explains the
+   "~4x realtime throughput" and choppy-audio symptoms below — it was never a pacing problem.
+   Fixed by making `len` a sample count at all three call sites; see `test_udp_stream.cpp` for the
+   regression test on `udp_stream.cpp`'s byte-length contract.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
@@ -281,31 +290,24 @@ the option name against `parse_outputs()` before assuming a code bug.
 
 Tests use Google Test (fetched via CMake FetchContent). Test files in `src/test_*.cpp` cover filters, squelch, CTCSS, helper functions, and signal generation. `src/test_base_class.h` provides test utilities.
 
-## Open Issue: UDP Stream Pacing
+## Resolved Issue: UDP Stream "Pacing" Was a Byte-Length Bug
 
-The `udp_stream` output produces valid 32-bit float LE PCM at `WAVE_RATE`, but delivery does not
-appear to be paced to realtime. A downstream `ffmpeg -f null` read of the stream reported ~4x
-realtime throughput, and every Liquidsoap consumption strategy tried so far — `input.ffmpeg`
-directly on the UDP socket, the same wrapped in `buffer()`, with and without `self_sync`, and MP3
-transcoded into `input.harbor` — produced choppy audio or a latency snowball ending in a broken
-Icecast pipe.
+Previously tracked here as an open pacing mystery: a downstream `ffmpeg -f null` read of the
+`udp_stream` output reported ~4x realtime throughput, and every Liquidsoap consumption strategy
+tried — `input.ffmpeg` directly on the UDP socket, the same wrapped in `buffer()`, with and
+without `self_sync`, and MP3 transcoded into `input.harbor` — produced choppy audio or a latency
+snowball ending in a broken Icecast pipe.
 
-**Root cause is not confirmed.** The unfinished diagnostic is inter-packet timing on the wire:
+**Root cause found without needing the tcpdump diagnostic**: item 3 under "Local changes carried
+on top of upstream" above. The send side was emitting exactly 4x the correct byte count per
+buffer (confirmed by code inspection, not packet capture), which fully accounts for the "~4x
+realtime throughput" reading and the downstream jitter/latency symptoms — there was no pacing
+gap to diagnose. Fixed in `src/output.cpp`, `src/rtl_airband.cpp`, and `src/udp_stream.cpp`.
 
-```bash
-timeout 10 tcpdump -i eth0 -n -ttt udp port 9001 | head -40
-```
-
-- Tight bursts separated by gaps → the send side needs realtime pacing, and the fix belongs in
-  `udp_stream_write()` or its caller in `process_outputs()`.
-- Evenly spaced packets → the problem is downstream jitter or buffering, and nothing in this repo
-  needs to change.
-
-**Do not add pacing code before that measurement exists.** It is easy to write a plausible-looking
-realtime send loop for a problem that may not be on the send side.
-
-Note that `tcpdump -i any` did not capture this traffic on the deployment host; use the specific
-interface.
+If choppy audio or throughput anomalies reappear after this fix, re-open the tcpdump-based
+inter-packet-timing diagnostic (`tcpdump -i eth0 -n -ttt udp port 9001`, not `-i any` — that
+didn't capture this traffic on the deployment host) before assuming a new pacing bug and writing
+send-side pacing code; confirm with a wire capture first.
 
 ## Deployment Context
 

@@ -611,9 +611,9 @@ void process_outputs(channel_t* channel, int cur_scan_freq) {
             }
 
             if (channel->mode == MM_MONO) {
-                udp_stream_write(sdata, channel->waveout, (size_t)WAVE_BATCH * sizeof(float));
+                udp_stream_write(sdata, channel->waveout, (size_t)WAVE_BATCH);
             } else {
-                udp_stream_write(sdata, channel->waveout, channel->waveout_r, (size_t)WAVE_BATCH * sizeof(float));
+                udp_stream_write(sdata, channel->waveout, channel->waveout_r, (size_t)WAVE_BATCH);
             }
 
 #ifdef WITH_PULSEAUDIO
