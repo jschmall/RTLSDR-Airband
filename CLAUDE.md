@@ -58,6 +58,26 @@ Keep the local delta small and well understood.
    system test with a fake `/api/call-upload` fixture is a documented follow-up, not yet done.
    `R_SCAN` (frequency-scanning) channels are not yet supported — the per-channel `talkgroup_id`
    model only maps cleanly to `R_MULTICHANNEL`, which is how this fork is deployed.
+5. **`dateTime` instead of `timestamp` in the rdio-scanner upload fields** (`src/rdio_scanner.cpp`,
+   `rdio_scanner_build_fields()`) — the initial implementation sent rdio-scanner's `timestamp`
+   field (ms-epoch; per rdio-scanner's docs this is the *more* precise of its two accepted
+   time fields). In production against the `10.0.50.36:3000` instance this caused nearly every
+   real, distinct transmission on a busy talkgroup to be rejected as `duplicate call rejected`,
+   with roughly one upload succeeding per hour (diagnosed from the rdio-scanner server log:
+   every rejected call had a distinct filename/timestamp seconds-to-minutes apart, ruling out
+   client-side retries — already confirmed separately by testing with `max_retries=0` — and
+   ruling out a blanket server-side dedup time window, since the pre-existing external
+   `post_write_script` upload script uploaded the same files successfully with calls only
+   seconds apart). The one substantive difference between the two upload paths was this field:
+   the script sends `dateTime` (RFC3339); the native code sent `timestamp` (ms epoch). Switched
+   to `dateTime`, sent as a plain Unix epoch in **seconds** (`tv_sec`, UTC, no string formatting
+   or hardcoded timezone — unlike the script this replaces, which parses the filename and
+   applies a hardcoded `America/Los_Angeles` offset). This fix is a hypothesis validated by the
+   script/native contrast, not a confirmed root cause inside rdio-scanner's own code — if
+   duplicate rejections persist after this change, the next thing to check is whether this
+   specific rdio-scanner deployment's `/api/call-upload` implementation has drifted from its
+   documented field semantics for `timestamp` (version-specific parsing bug) rather than
+   anything on this fork's side.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

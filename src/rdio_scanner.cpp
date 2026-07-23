@@ -142,7 +142,7 @@ std::vector<std::pair<std::string, std::string>> rdio_scanner_build_fields(const
     std::vector<std::pair<std::string, std::string>> fields;
 
     fields.push_back(std::make_pair("audioType", "audio/mpeg"));
-    fields.push_back(std::make_pair("timestamp", std::to_string(job.timestamp_ms)));
+    fields.push_back(std::make_pair("dateTime", std::to_string(job.timestamp_sec)));
     fields.push_back(std::make_pair("frequency", std::to_string(job.frequency)));
     fields.push_back(std::make_pair("key", job.config.api_key));
     fields.push_back(std::make_pair("source", std::to_string(job.config.source_id)));
@@ -199,7 +199,7 @@ void rdio_scanner_enqueue(rdio_scanner_data* config, const std::string& file_pat
     job.config = *config;
     job.file_path = file_path;
     job.frequency = frequency;
-    job.timestamp_ms = (long long)open_time.tv_sec * 1000 + open_time.tv_usec / 1000;
+    job.timestamp_sec = (long long)open_time.tv_sec;
 
     pthread_mutex_lock(&queue_mutex);
     if (job_queue.size() >= MAX_QUEUE_DEPTH) {

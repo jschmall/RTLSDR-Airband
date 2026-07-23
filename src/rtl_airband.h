@@ -155,7 +155,7 @@ struct rdio_scanner_data {
 struct rdio_scanner_job {
     rdio_scanner_data config;
     std::string file_path;
-    long long timestamp_ms;
+    long long timestamp_sec;  // Unix epoch seconds, UTC - sent as the "dateTime" field
     int frequency;
 };
 #endif /* WITH_RDIO_SCANNER */

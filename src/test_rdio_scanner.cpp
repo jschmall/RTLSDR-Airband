@@ -54,7 +54,7 @@ rdio_scanner_job make_job() {
     job.config.timeout_ms = 5000;
     job.config.max_retries = 2;
     job.file_path = "/mnt/audio/cdf/tac_1/cdf_tac_1_20260723_120000.mp3";
-    job.timestamp_ms = 1784894400123LL;
+    job.timestamp_sec = 1784894400LL;
     job.frequency = 154265000;
     return job;
 }
@@ -68,7 +68,7 @@ TEST_F(RdioScannerTest, required_fields_always_present) {
     map<string, string> fields = as_map(rdio_scanner_build_fields(job));
 
     EXPECT_EQ(fields.at("audioType"), "audio/mpeg");
-    EXPECT_EQ(fields.at("timestamp"), "1784894400123");
+    EXPECT_EQ(fields.at("dateTime"), "1784894400");
     EXPECT_EQ(fields.at("frequency"), "154265000");
     EXPECT_EQ(fields.at("key"), "a9823e02-fe4e-4c91-b513-c809a032827e");
     EXPECT_EQ(fields.at("source"), "0");
