@@ -376,6 +376,11 @@ static void close_file(output_t* output) {
                     waitpid(pid, NULL, 0);
                 }
             }
+#ifdef WITH_RDIO_SCANNER
+            if (fdata->split_on_transmission && fdata->rdio_scanner) {
+                rdio_scanner_enqueue(fdata->rdio_scanner, fdata->file_path, fdata->open_time, fdata->open_frequency);
+            }
+#endif /* WITH_RDIO_SCANNER */
         } else {
             unlink(fdata->file_path_tmp.c_str());
         }
@@ -493,6 +498,9 @@ static bool output_file_ready(channel_t* channel, output_t* output) {
     fdata->file_path_tmp = fdata->file_path + ".tmp";
 
     fdata->open_time = fdata->last_write_time = current_time;
+#ifdef WITH_RDIO_SCANNER
+    fdata->open_frequency = channel->freqlist[channel->freq_idx].frequency;
+#endif /* WITH_RDIO_SCANNER */
 
     const int is_audio = output->type == O_RAWFILE ? 0 : 1;
     if (open_file(fdata, channel->mode, is_audio) < 0) {

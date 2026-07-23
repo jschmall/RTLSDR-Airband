@@ -126,9 +126,43 @@ static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, in
                 if (outs[o].exists("post_write_script")) {
                     fdata->post_write_script = outs[o]["post_write_script"].c_str();
                 }
+#ifdef WITH_RDIO_SCANNER
+                if (outs[o].exists("rdio_scanner")) {
+                    libconfig::Setting& rs = outs[o]["rdio_scanner"];
+                    if (!rs.exists("server") || !rs.exists("port") || !rs.exists("api_key") || !rs.exists("talkgroup_id")) {
+                        cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: ";
+                        cerr << "rdio_scanner requires server, port, api_key, and talkgroup_id\n";
+                        error();
+                    }
+                    rdio_scanner_data* rsdata = new rdio_scanner_data();
+                    rsdata->server = rs["server"].c_str();
+                    rsdata->port = (int)rs["port"];
+                    rsdata->use_tls = rs.exists("use_tls") ? (bool)rs["use_tls"] : false;
+                    rsdata->api_key = rs["api_key"].c_str();
+                    rsdata->talkgroup_id = (int)rs["talkgroup_id"];
+                    rsdata->system_id = rs.exists("system_id") ? (int)rs["system_id"] : -1;
+                    rsdata->system_label = rs.exists("system_label") ? rs["system_label"].c_str() : "";
+                    rsdata->talkgroup_label = rs.exists("talkgroup_label") ? rs["talkgroup_label"].c_str() : "";
+                    rsdata->talkgroup_tag = rs.exists("talkgroup_tag") ? rs["talkgroup_tag"].c_str() : "";
+                    rsdata->talkgroup_group = rs.exists("talkgroup_group") ? rs["talkgroup_group"].c_str() : "";
+                    rsdata->source_id = rs.exists("source_id") ? (int)rs["source_id"] : 0;
+                    rsdata->delete_after_upload = rs.exists("delete_after_upload") ? (bool)rs["delete_after_upload"] : false;
+                    rsdata->timeout_ms = rs.exists("timeout_ms") ? (long)(int)rs["timeout_ms"] : 5000;
+                    rsdata->max_retries = rs.exists("max_retries") ? (int)rs["max_retries"] : 2;
+                    fdata->rdio_scanner = rsdata;
+                    rdio_scanner_enabled = true;
+                }
+#else
+                if (outs[o].exists("rdio_scanner")) {
+                    cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: ";
+                    cerr << "rdio_scanner support was not compiled in (build with -DRDIO_SCANNER=ON)\n";
+                    error();
+                }
+#endif /* WITH_RDIO_SCANNER */
             } else {
-                if (outs[o].exists("min_rx_seconds") || outs[o].exists("post_write_script")) {
-                    cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: min_rx_seconds and post_write_script require split_on_transmission\n";
+                if (outs[o].exists("min_rx_seconds") || outs[o].exists("post_write_script") || outs[o].exists("rdio_scanner")) {
+                    cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o
+                         << "]: min_rx_seconds, post_write_script, and rdio_scanner require split_on_transmission\n";
                     error();
                 }
             }

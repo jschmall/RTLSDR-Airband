@@ -35,6 +35,29 @@ Keep the local delta small and well understood.
    "~4x realtime throughput" and choppy-audio symptoms below — it was never a pacing problem.
    Fixed by making `len` a sample count at all three call sites; see `test_udp_stream.cpp` for the
    regression test on `udp_stream.cpp`'s byte-length contract.
+4. **Native rdio-scanner call-upload support** (`src/rdio_scanner.cpp`, new) — replaces the
+   `post_write_script` + external CSV lookup this fork previously used to push completed
+   transmissions to a [rdio-scanner](https://github.com/chuot/rdio-scanner) instance's
+   `/api/call-upload` endpoint. Adds a `rdio_scanner: { ... }` nested config group on `file`
+   outputs (requires `split_on_transmission = true`, same precedent as `min_rx_seconds` /
+   `post_write_script`): `server`, `port`, `use_tls`, `api_key`, `system_id`, `system_label`,
+   `talkgroup_id`, `talkgroup_label`, `talkgroup_tag`, `talkgroup_group`, `source_id`,
+   `delete_after_upload`, `timeout_ms`, `max_retries`. System/talkgroup metadata is declared
+   directly per-channel in the config (no path parsing, no CSV file to keep in sync — the CSV
+   this replaced mapped `(agency, channel)` directory names to those same fields).
+   Uploads are queued (bounded, drop-oldest-and-log on overflow) and sent by a single background
+   worker thread via libcurl, so a slow/unreachable rdio-scanner instance never blocks the output
+   thread; a completed local MP3 is never deleted on a failed upload, even with
+   `delete_after_upload = true`. New build dependency: `libcurl4-openssl-dev`
+   (`libcurl`/`CURL::libcurl` via CMake's `FindCURL`), gated behind `-DRDIO_SCANNER=ON` (default
+   ON) / `#ifdef WITH_RDIO_SCANNER`, mirroring the existing `PULSEAUDIO` option pattern — builds
+   with `-DRDIO_SCANNER=OFF` compile and run identically to before this feature existed.
+   Pure field-mapping logic is unit tested in `test_rdio_scanner.cpp`; the worker
+   thread/queue/libcurl path was validated manually end-to-end against a mock HTTP server (see
+   git history for the session that added this) rather than via an automated system test — a
+   system test with a fake `/api/call-upload` fixture is a documented follow-up, not yet done.
+   `R_SCAN` (frequency-scanning) channels are not yet supported — the per-channel `talkgroup_id`
+   model only maps cleanly to `R_MULTICHANNEL`, which is how this fork is deployed.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
@@ -95,7 +118,7 @@ file recording, UDP, and PulseAudio.
 
 ## Build Commands
 
-Dependencies: libconfig++, libmp3lame, libshout, libfftw3f, librtlsdr, libsoapysdr, libpulse.
+Dependencies: libconfig++, libmp3lame, libshout, libfftw3f, librtlsdr, libsoapysdr, libpulse, libcurl (fork-only, for `RDIO_SCANNER`).
 Install via `.github/install_dependencies`.
 
 ```bash
@@ -126,6 +149,7 @@ Key CMake flags (all in `src/CMakeLists.txt`):
 | `MIRISDR` | ON | Mirics SDR driver |
 | `SOAPYSDR` | ON | SoapySDR (vendor-neutral) driver |
 | `PULSEAUDIO` | ON | PulseAudio output |
+| `RDIO_SCANNER` | ON | Native rdio-scanner call-upload output (fork-only, needs libcurl) |
 | `BUILD_UNITTESTS` | OFF | Build Google Test unit tests |
 | `BCM_VC` | OFF | Broadcom VideoCore GPU FFT (RPi v2 only) |
 

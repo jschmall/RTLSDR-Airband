@@ -1099,6 +1099,10 @@ int main(int argc, char* argv[]) {
     pulse_start();
 #endif /* WITH_PULSEAUDIO */
 
+#ifdef WITH_RDIO_SCANNER
+    rdio_scanner_start();
+#endif /* WITH_RDIO_SCANNER */
+
     sincosf_lut_init();
 
     // Startup the demod threads
@@ -1153,6 +1157,11 @@ int main(int argc, char* argv[]) {
             }
         }
     }
+
+#ifdef WITH_RDIO_SCANNER
+    log(LOG_INFO, "Closing rdio_scanner upload queue\n");
+    rdio_scanner_shutdown();
+#endif /* WITH_RDIO_SCANNER */
 
     close_debug();
 #ifdef WITH_PROFILING

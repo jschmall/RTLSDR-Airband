@@ -30,6 +30,8 @@
 #include <cstdio>
 #include <libconfig.h++>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "config.h"
 
@@ -129,6 +131,35 @@ struct icecast_data {
     shout_t* shout;
 };
 
+#ifdef WITH_RDIO_SCANNER
+struct rdio_scanner_data {
+    std::string server;
+    int port;
+    bool use_tls;
+    std::string api_key;
+    int system_id;  // -1 if unset
+    std::string system_label;
+    int talkgroup_id;
+    std::string talkgroup_label;
+    std::string talkgroup_tag;
+    std::string talkgroup_group;
+    int source_id;
+    bool delete_after_upload;
+    long timeout_ms;
+    int max_retries;
+};
+
+// one completed transmission queued for upload; config is copied so the
+// worker thread never touches file_data/rdio_scanner_data concurrently with
+// the output thread that produced it
+struct rdio_scanner_job {
+    rdio_scanner_data config;
+    std::string file_path;
+    long long timestamp_ms;
+    int frequency;
+};
+#endif /* WITH_RDIO_SCANNER */
+
 struct file_data {
     std::string basedir;
     std::string basename;
@@ -142,6 +173,10 @@ struct file_data {
     bool include_freq;
     double min_rx_seconds;
     std::string post_write_script;
+#ifdef WITH_RDIO_SCANNER
+    rdio_scanner_data* rdio_scanner;  // NULL if not configured for this output
+    int open_frequency;               // frequency (Hz) captured at transmission-open time, for rdio_scanner upload
+#endif                                /* WITH_RDIO_SCANNER */
     timeval open_time;
     timeval last_write_time;
     FILE* f;
@@ -405,6 +440,17 @@ bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len);
 void udp_stream_write(udp_stream_data* sdata, const float* data, size_t len);
 void udp_stream_write(udp_stream_data* sdata, const float* data_left, const float* data_right, size_t len);
 void udp_stream_shutdown(udp_stream_data* sdata);
+
+#ifdef WITH_RDIO_SCANNER
+// rdio_scanner.cpp
+extern bool rdio_scanner_enabled;
+void rdio_scanner_start();
+void rdio_scanner_shutdown();
+void rdio_scanner_enqueue(rdio_scanner_data* config, const std::string& file_path, const timeval& open_time, int frequency);
+// exposed for unit testing - pure mapping from a job to the multipart form
+// fields that would be sent, with no network I/O
+std::vector<std::pair<std::string, std::string>> rdio_scanner_build_fields(const rdio_scanner_job& job);
+#endif /* WITH_RDIO_SCANNER */
 
 #ifdef WITH_PULSEAUDIO
 #define PULSE_STREAM_LATENCY_LIMIT 10000000UL

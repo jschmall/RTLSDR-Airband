@@ -8,6 +8,27 @@ This fork has no release tags; the binary's `-v` output is a git commit hash, ge
 time from the working tree (see `CMakeLists.txt` / `src/CMakeModules/version.cmake`). Entries below
 are dated by when the change was made, not by a version number.
 
+## 2026-07-23 (rdio_api branch)
+
+- **Add native rdio-scanner call-upload support** (`src/rdio_scanner.cpp`, new) — replaces the
+  `post_write_script` + external CSV mapping (`rdio_mappings.csv`) previously used to push
+  completed transmissions to a [rdio-scanner](https://github.com/chuot/rdio-scanner) instance.
+  New `rdio_scanner: { server; port; use_tls; api_key; system_id; system_label; talkgroup_id;
+  talkgroup_label; talkgroup_tag; talkgroup_group; source_id; delete_after_upload; timeout_ms;
+  max_retries; }` config group on `file` outputs (requires `split_on_transmission = true`).
+  System/talkgroup metadata now lives directly in the channel's config instead of being looked
+  up from a directory-name-keyed CSV, and the upload timestamp/frequency come straight from the
+  transmission's actual `timeval`/`channel_t` state instead of being re-parsed out of the output
+  filename. Uploads run on a single background worker thread via libcurl (bounded queue,
+  drop-oldest-and-log on overflow, bounded retries), so an unreachable rdio-scanner instance
+  can't block the output thread or the audio pipeline; a failed upload never deletes the local
+  MP3 even with `delete_after_upload = true`. New build dependency: `libcurl4-openssl-dev`,
+  gated behind `-DRDIO_SCANNER=ON` (default ON). Field-mapping logic covered by
+  `test_rdio_scanner.cpp`; the worker/queue/libcurl path was validated end-to-end by hand against
+  a mock `/api/call-upload` server (success, `delete_after_upload`, and unreachable-server retry
+  cases) rather than an automated system test — that's a documented follow-up.
+  `R_SCAN` (frequency-scanning) channels are not yet supported.
+
 ## 2026-07-23
 
 - **Fix: `udp_stream` output sent 4x too much data per buffer, reading past `channel->waveout`.**

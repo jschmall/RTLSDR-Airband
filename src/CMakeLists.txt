@@ -124,6 +124,9 @@ set(WITH_SOAPYSDR FALSE)
 option(PULSEAUDIO "Enable PulseAudio support" ON)
 set(WITH_PULSEAUDIO FALSE)
 
+option(RDIO_SCANNER "Enable native rdio-scanner call-upload support" ON)
+set(WITH_RDIO_SCANNER FALSE)
+
 option(PROFILING "Enable profiling with gperftools")
 set(WITH_PROFILING FALSE)
 
@@ -171,6 +174,15 @@ if(PULSEAUDIO)
 		list(APPEND rtl_airband_include_dirs ${PULSEAUDIO_INCLUDE_DIRS})
 		list(APPEND link_dirs ${PULSEAUDIO_LIBRARY_DIRS})
 		set(WITH_PULSEAUDIO TRUE)
+	endif()
+endif()
+
+if(RDIO_SCANNER)
+	find_package(CURL)
+	if(CURL_FOUND)
+		list(APPEND rtl_airband_extra_sources rdio_scanner.cpp)
+		list(APPEND rtl_airband_extra_libs CURL::libcurl)
+		set(WITH_RDIO_SCANNER TRUE)
 	endif()
 endif()
 
@@ -254,6 +266,7 @@ message(STATUS "  - Build Unit Tests:\t${BUILD_UNITTESTS}")
 message(STATUS "  - Broadcom VideoCore GPU:\t${WITH_BCM_VC}")
 message(STATUS "  - NFM support:\t\t${NFM}")
 message(STATUS "  - PulseAudio:\t\trequested: ${PULSEAUDIO}, enabled: ${WITH_PULSEAUDIO}")
+message(STATUS "  - rdio-scanner upload:\trequested: ${RDIO_SCANNER}, enabled: ${WITH_RDIO_SCANNER}")
 message(STATUS "  - Profiling:\t\trequested: ${PROFILING}, enabled: ${WITH_PROFILING}")
 message(STATUS "  - Icecast TLS support:\t${LIBSHOUT_HAS_TLS}")
 
@@ -360,6 +373,9 @@ if(BUILD_UNITTESTS)
 		helper_functions.cpp
 		udp_stream.cpp
 	)
+	if(WITH_RDIO_SCANNER)
+		list(APPEND TEST_FILES rdio_scanner.cpp)
+	endif()
 
 	add_executable(
 		unittests

@@ -18,7 +18,8 @@ case "${unameOut}" in
             librtlsdr-dev \
             libsoapysdr-dev \
             libpulse-dev \
-            libopenblas0-pthread
+            libopenblas0-pthread \
+            libcurl4-openssl-dev
 
         (
             git clone https://github.com/f4exb/libmirisdr-4
@@ -54,7 +55,8 @@ case "${unameOut}" in
             librtlsdr \
             soapysdr \
             pulseaudio \
-            pkg-config
+            pkg-config \
+            curl
 
         ;;
 
