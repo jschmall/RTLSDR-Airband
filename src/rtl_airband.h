@@ -103,6 +103,7 @@ extern "C" void samplefft(sample_fft_arg* a, unsigned char* buffer, float* windo
 enum status { NO_SIGNAL = ' ', SIGNAL = '*', AFC_UP = '<', AFC_DOWN = '>' };
 enum ch_states { CH_DIRTY, CH_WORKING, CH_READY };
 enum mix_modes { MM_MONO, MM_STEREO };
+enum udp_stream_format { STREAM_FORMAT_FLOAT32 = 0, STREAM_FORMAT_S16LE, STREAM_FORMAT_S8 };
 enum output_type {
     O_ICECAST,
     O_FILE,
@@ -190,6 +191,10 @@ struct udp_stream_data {
     bool continuous;
     const char* dest_address;
     const char* dest_port;
+
+    udp_stream_format format;  // set by config parser, default STREAM_FORMAT_FLOAT32
+    void* convert_buffer;      // NULL when format == STREAM_FORMAT_FLOAT32
+    size_t convert_buffer_len;
 
     int send_socket;
     struct sockaddr dest_sockaddr;

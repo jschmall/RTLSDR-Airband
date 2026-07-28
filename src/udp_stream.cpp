@@ -20,11 +20,55 @@
 #include <syslog.h>  // LOG_INFO / LOG_ERR
 #include <unistd.h>  // close()
 #include <cassert>   // assert()
+#include <cmath>     // lrintf()
+#include <cstdint>   // int16_t, int8_t
 
 #include <arpa/inet.h>  // inet_aton()
 #include <netdb.h>      // getaddrinfo()
 
 #include "rtl_airband.h"
+
+static size_t bytes_per_sample(udp_stream_format format) {
+    switch (format) {
+        case STREAM_FORMAT_S16LE:
+            return sizeof(int16_t);
+        case STREAM_FORMAT_S8:
+            return sizeof(int8_t);
+        case STREAM_FORMAT_FLOAT32:
+        default:
+            return sizeof(float);
+    }
+}
+
+static const char* format_name(udp_stream_format format) {
+    switch (format) {
+        case STREAM_FORMAT_S16LE:
+            return "16-bit signed int";
+        case STREAM_FORMAT_S8:
+            return "8-bit signed int";
+        case STREAM_FORMAT_FLOAT32:
+        default:
+            return "32-bit float";
+    }
+}
+
+static int16_t float_to_s16(float sample) {
+    if (sample > 1.0f) {
+        sample = 1.0f;
+    } else if (sample < -1.0f) {
+        sample = -1.0f;
+    }
+    return (int16_t)lrintf(sample * 32767.0f);
+}
+
+static int8_t float_to_s8(float sample) {
+    if (sample > 1.0f) {
+        sample = 1.0f;
+    } else if (sample < -1.0f) {
+        sample = -1.0f;
+    }
+    return (int8_t)lrintf(sample * 127.0f);
+}
 
 bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len) {
     // pre-allocate the stereo buffer
@@ -34,6 +78,15 @@ bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len) {
     } else {
         sdata->stereo_buffer_len = 0;
         sdata->stereo_buffer = NULL;
+    }
+
+    // pre-allocate the format conversion buffer, if the configured format is not native float
+    if (sdata->format != STREAM_FORMAT_FLOAT32) {
+        sdata->convert_buffer_len = (mode == MM_STEREO) ? len * 2 : len;
+        sdata->convert_buffer = XCALLOC(sdata->convert_buffer_len, bytes_per_sample(sdata->format));
+    } else {
+        sdata->convert_buffer_len = 0;
+        sdata->convert_buffer = NULL;
     }
 
     sdata->send_socket = -1;
@@ -79,15 +132,40 @@ bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len) {
         return false;
     }
 
-    log(LOG_INFO, "udp_stream: sending %s 32-bit float at %d Hz to %s:%s\n", mode == MM_MONO ? "Mono" : "Stereo", WAVE_RATE, sdata->dest_address, sdata->dest_port);
+    log(LOG_INFO, "udp_stream: sending %s %s at %d Hz to %s:%s\n", mode == MM_MONO ? "Mono" : "Stereo", format_name(sdata->format), WAVE_RATE, sdata->dest_address, sdata->dest_port);
     return true;
 }
 
 // len is a sample count (not a byte count) in all udp_stream_write()/udp_stream_init() signatures.
 void udp_stream_write(udp_stream_data* sdata, const float* data, size_t len) {
-    if (sdata->send_socket != -1) {
-        // Send without blocking or checking for success
-        sendto(sdata->send_socket, data, len * sizeof(float), MSG_DONTWAIT | MSG_NOSIGNAL, &sdata->dest_sockaddr, sdata->dest_sockaddr_len);
+    if (sdata->send_socket == -1) {
+        return;
+    }
+
+    // Send without blocking or checking for success
+    switch (sdata->format) {
+        case STREAM_FORMAT_S16LE: {
+            assert(len <= sdata->convert_buffer_len);
+            int16_t* buf = (int16_t*)sdata->convert_buffer;
+            for (size_t i = 0; i < len; ++i) {
+                buf[i] = float_to_s16(data[i]);
+            }
+            sendto(sdata->send_socket, buf, len * sizeof(int16_t), MSG_DONTWAIT | MSG_NOSIGNAL, &sdata->dest_sockaddr, sdata->dest_sockaddr_len);
+            break;
+        }
+        case STREAM_FORMAT_S8: {
+            assert(len <= sdata->convert_buffer_len);
+            int8_t* buf = (int8_t*)sdata->convert_buffer;
+            for (size_t i = 0; i < len; ++i) {
+                buf[i] = float_to_s8(data[i]);
+            }
+            sendto(sdata->send_socket, buf, len * sizeof(int8_t), MSG_DONTWAIT | MSG_NOSIGNAL, &sdata->dest_sockaddr, sdata->dest_sockaddr_len);
+            break;
+        }
+        case STREAM_FORMAT_FLOAT32:
+        default:
+            sendto(sdata->send_socket, data, len * sizeof(float), MSG_DONTWAIT | MSG_NOSIGNAL, &sdata->dest_sockaddr, sdata->dest_sockaddr_len);
+            break;
     }
 }
 

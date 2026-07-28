@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -73,6 +74,7 @@ class UdpStreamTest : public TestBaseClass {
     void TearDown(void) override {
         udp_stream_shutdown(&sdata);
         free(sdata.stereo_buffer);
+        free(sdata.convert_buffer);
         close(listen_socket);
         TestBaseClass::TearDown();
     }
@@ -125,4 +127,80 @@ TEST_F(UdpStreamTest, no_socket_does_not_crash) {
     sdata.send_socket = -1;
     float data[4] = {1.0f, 2.0f, 3.0f, 4.0f};
     udp_stream_write(&sdata, data, 4);
+}
+
+TEST_F(UdpStreamTest, mono_s16le_sends_exact_byte_count_and_clamped_values) {
+    const size_t len = 4;
+    sdata.format = STREAM_FORMAT_S16LE;
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_MONO, len));
+
+    float data[len] = {0.5f, -0.5f, 1.5f, -2.0f};  // last two exercise clamping to [-1,1]
+    udp_stream_write(&sdata, data, len);
+
+    int16_t received[len + 100];
+    ssize_t bytes = recv_packet(received, sizeof(received));
+
+    ASSERT_EQ(bytes, (ssize_t)(len * sizeof(int16_t)));
+    EXPECT_NEAR(received[0], 16384, 1);
+    EXPECT_NEAR(received[1], -16384, 1);
+    EXPECT_EQ(received[2], 32767);   // clamped from 1.5f
+    EXPECT_EQ(received[3], -32767);  // clamped from -2.0f
+}
+
+TEST_F(UdpStreamTest, stereo_s16le_sends_exact_interleaved_byte_count) {
+    const size_t len = 4;
+    sdata.format = STREAM_FORMAT_S16LE;
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_STEREO, len));
+    ASSERT_EQ(sdata.convert_buffer_len, len * 2);
+
+    float left[len] = {0.5f, 0.5f, 0.5f, 0.5f};
+    float right[len] = {-0.5f, -0.5f, -0.5f, -0.5f};
+    udp_stream_write(&sdata, left, right, len);
+
+    int16_t received[len * 2 + 100];
+    ssize_t bytes = recv_packet(received, sizeof(received));
+
+    ASSERT_EQ(bytes, (ssize_t)(len * 2 * sizeof(int16_t)));
+    for (size_t i = 0; i < len; ++i) {
+        EXPECT_NEAR(received[2 * i], 16384, 1);
+        EXPECT_NEAR(received[2 * i + 1], -16384, 1);
+    }
+}
+
+TEST_F(UdpStreamTest, mono_s8_sends_exact_byte_count_and_clamped_values) {
+    const size_t len = 4;
+    sdata.format = STREAM_FORMAT_S8;
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_MONO, len));
+
+    float data[len] = {0.4f, -0.4f, 1.5f, -2.0f};  // last two exercise clamping to [-1,1]
+    udp_stream_write(&sdata, data, len);
+
+    int8_t received[len + 100];
+    ssize_t bytes = recv_packet(received, sizeof(received));
+
+    ASSERT_EQ(bytes, (ssize_t)(len * sizeof(int8_t)));
+    EXPECT_NEAR(received[0], 51, 1);
+    EXPECT_NEAR(received[1], -51, 1);
+    EXPECT_EQ(received[2], 127);   // clamped from 1.5f
+    EXPECT_EQ(received[3], -127);  // clamped from -2.0f
+}
+
+TEST_F(UdpStreamTest, stereo_s8_sends_exact_interleaved_byte_count) {
+    const size_t len = 4;
+    sdata.format = STREAM_FORMAT_S8;
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_STEREO, len));
+    ASSERT_EQ(sdata.convert_buffer_len, len * 2);
+
+    float left[len] = {0.4f, 0.4f, 0.4f, 0.4f};
+    float right[len] = {-0.4f, -0.4f, -0.4f, -0.4f};
+    udp_stream_write(&sdata, left, right, len);
+
+    int8_t received[len * 2 + 100];
+    ssize_t bytes = recv_packet(received, sizeof(received));
+
+    ASSERT_EQ(bytes, (ssize_t)(len * 2 * sizeof(int8_t)));
+    for (size_t i = 0; i < len; ++i) {
+        EXPECT_NEAR(received[2 * i], 51, 1);
+        EXPECT_NEAR(received[2 * i + 1], -51, 1);
+    }
 }

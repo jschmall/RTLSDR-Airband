@@ -78,6 +78,20 @@ Keep the local delta small and well understood.
    specific rdio-scanner deployment's `/api/call-upload` implementation has drifted from its
    documented field semantics for `timestamp` (version-specific parsing bug) rather than
    anything on this fork's side.
+6. **Configurable `bit_depth` for `udp_stream` output** (`src/udp_stream.cpp`, `src/config.cpp`,
+   `src/rtl_airband.h`) — the `udp_stream` output previously always sent raw 32-bit IEEE-754
+   float PCM (`channel->waveout`/`waveout_r`, normalized to roughly ±1.0). Added an optional
+   `bit_depth` integer field on a `udp_stream` output block: `32` (default, unchanged float32
+   behavior), `16` (signed 16-bit little-endian PCM), or `8` (signed 8-bit PCM), to cut bandwidth
+   for downstream consumers that don't need float precision. Conversion clamps each sample to
+   [-1.0, 1.0] before scaling (by `INT16_MAX`/`INT8_MAX`) and rounding, so out-of-range AGC
+   overshoot can't wrap/UB rather than erroring. Omitting `bit_depth` is fully backward
+   compatible — existing configs and the pre-existing float32 byte-length regression test in
+   `test_udp_stream.cpp` are unaffected. New `udp_stream_format` enum in `rtl_airband.h`;
+   conversion buffer is separate from the existing float interleave `stereo_buffer`, so stereo
+   interleaving logic is untouched. Unit tested (byte counts, converted values, clamping) in
+   `test_udp_stream.cpp`; not yet validated against a live downstream PCM consumer in production
+   — do that before relying on `bit_depth = 16`/`8` for a live feed.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

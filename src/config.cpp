@@ -276,6 +276,26 @@ static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, in
                 cerr << "missing dest_port\n";
                 error();
             }
+
+            sdata->format = STREAM_FORMAT_FLOAT32;
+            if (outs[o].exists("bit_depth")) {
+                int bit_depth = (int)outs[o]["bit_depth"];
+                if (bit_depth == 32) {
+                    sdata->format = STREAM_FORMAT_FLOAT32;
+                } else if (bit_depth == 16) {
+                    sdata->format = STREAM_FORMAT_S16LE;
+                } else if (bit_depth == 8) {
+                    sdata->format = STREAM_FORMAT_S8;
+                } else {
+                    if (parsing_mixers) {
+                        cerr << "Configuration error: mixers.[" << i << "] outputs.[" << o << "]: ";
+                    } else {
+                        cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: ";
+                    }
+                    cerr << "invalid value for bit_depth (must be one of: 32, 16, 8)\n";
+                    error();
+                }
+            }
 #ifdef WITH_PULSEAUDIO
         } else if (!strncmp(outs[o]["type"], "pulse", 5)) {
             channel->outputs[oo].data = XCALLOC(1, sizeof(struct pulse_data));
