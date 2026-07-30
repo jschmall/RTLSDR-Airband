@@ -90,8 +90,20 @@ Keep the local delta small and well understood.
    `test_udp_stream.cpp` are unaffected. New `udp_stream_format` enum in `rtl_airband.h`;
    conversion buffer is separate from the existing float interleave `stereo_buffer`, so stereo
    interleaving logic is untouched. Unit tested (byte counts, converted values, clamping) in
-   `test_udp_stream.cpp`; not yet validated against a live downstream PCM consumer in production
-   — do that before relying on `bit_depth = 16`/`8` for a live feed.
+   `test_udp_stream.cpp`. The 16-bit *format* (signed int16 PCM) matches what a real downstream
+   consumer expects on the wire — trunkrecorder's own UDP audio plugin documents the same
+   contract (16-bit int, 8 or 16 kHz, mono) — but the *sample rate* half of that contract is
+   still open. A 2026-07-28 TTD (TwoToneDetect) log showing a clean `8000 Hz, mono, s16` WAV
+   conversion was initially read as production validation of `bit_depth = 16`, but that's not
+   solid: the WAV header's rate comes from whatever TTD itself is configured to write, not from
+   anything rtl_airband sends, and ffmpeg will convert a mismatched-rate PCM stream cleanly
+   without error (just wrong pitch/speed) — so a clean conversion doesn't prove the rate TTD
+   assumed matches the rate rtl_airband actually sent. This instance is confirmed built with
+   NFM enabled, so `WAVE_RATE` is 16000 (`rtl_airband.h:70`), not 8000 — TTD needs to be set to
+   16000 Hz to match. `bit_depth = 32` (float) remains the default; `bit_depth = 16` is the
+   right setting for trunkrecorder/TTD-style consumers, but end-to-end validation against a live
+   consumer at the *correct* matching rate (16000, not 8000) is still outstanding.
+   `bit_depth = 8` remains unit-tested only, not yet validated against a live consumer.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
