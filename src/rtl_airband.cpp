@@ -84,6 +84,8 @@ bool multiple_demod_threads = false;
 bool multiple_output_threads = false;
 bool log_scan_activity = false;
 char* stats_filepath = NULL;
+char* stats_http_address = NULL;
+int stats_http_port = 0;
 size_t fft_size_log = DEFAULT_FFT_SIZE_LOG;
 size_t fft_size = 1 << fft_size_log;
 
@@ -863,6 +865,22 @@ int main(int argc, char* argv[]) {
             log_scan_activity = true;
         if (root.exists("stats_filepath"))
             stats_filepath = strdup(root["stats_filepath"]);
+        if (root.exists("stats_http_address") || root.exists("stats_http_port")) {
+            if (!root.exists("stats_http_address") || !root.exists("stats_http_port")) {
+                cerr << "Configuration error: stats_http_address and stats_http_port must be set together\n";
+                error();
+            }
+            if (!stats_filepath) {
+                cerr << "Configuration error: stats_http_address/stats_http_port require stats_filepath to also be set\n";
+                error();
+            }
+            stats_http_address = strdup(root["stats_http_address"]);
+            stats_http_port = (int)root["stats_http_port"];
+            if (stats_http_port <= 0 || stats_http_port > 65535) {
+                cerr << "Configuration error: stats_http_port must be between 1 and 65535\n";
+                error();
+            }
+        }
 #ifdef NFM
         if (root.exists("tau"))
             alpha = ((int)root["tau"] == 0 ? 0.0f : exp(-1.0f / (WAVE_RATE * 1e-6 * (int)root["tau"])));
@@ -1120,6 +1138,8 @@ int main(int argc, char* argv[]) {
     rdio_scanner_start();
 #endif /* WITH_RDIO_SCANNER */
 
+    stats_http_start();
+
     sincosf_lut_init();
 
     // Startup the demod threads
@@ -1179,6 +1199,8 @@ int main(int argc, char* argv[]) {
     log(LOG_INFO, "Closing rdio_scanner upload queue\n");
     rdio_scanner_shutdown();
 #endif /* WITH_RDIO_SCANNER */
+
+    stats_http_shutdown();
 
     close_debug();
 #ifdef WITH_PROFILING
