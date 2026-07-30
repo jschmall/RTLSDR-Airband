@@ -77,9 +77,8 @@ void shout_setup(icecast_data* icecast, mix_modes mixmode) {
         return;
     }
 #endif /* LIBSHOUT_HAS_TLS */
-    char mp[100];
-    sprintf(mp, "/%s", icecast->mountpoint);
-    if (shout_set_mount(shouttemp, mp) != SHOUTERR_SUCCESS) {
+    std::string mp = make_icecast_mountpoint(icecast->mountpoint);
+    if (shout_set_mount(shouttemp, mp.c_str()) != SHOUTERR_SUCCESS) {
         shout_free(shouttemp);
         return;
     }

@@ -118,6 +118,22 @@ TEST_F(HelperFunctionsTest, make_subdirs_file_in_the_way) {
     EXPECT_TRUE(file_exists(file_in_dir));
 }
 
+TEST_F(HelperFunctionsTest, make_icecast_mountpoint_normal) {
+    EXPECT_EQ(make_icecast_mountpoint("stream.mp3"), "/stream.mp3");
+}
+
+TEST_F(HelperFunctionsTest, make_icecast_mountpoint_empty) {
+    EXPECT_EQ(make_icecast_mountpoint(""), "/");
+}
+
+TEST_F(HelperFunctionsTest, make_icecast_mountpoint_longer_than_fixed_buffer_used_to_allow) {
+    // output.cpp used to build this string into a fixed char[100] stack buffer via
+    // sprintf(), which would overflow for a mountpoint this long. Confirm a long value
+    // is preserved in full rather than truncated or overflowing.
+    const string long_mountpoint(500, 'a');
+    EXPECT_EQ(make_icecast_mountpoint(long_mountpoint), "/" + long_mountpoint);
+}
+
 TEST_F(HelperFunctionsTest, make_subdirs_create_base) {
     EXPECT_FALSE(dir_exists(temp_dir + "/base_dir/a"));
     EXPECT_TRUE(make_subdirs(temp_dir + "/base_dir", "a"));
