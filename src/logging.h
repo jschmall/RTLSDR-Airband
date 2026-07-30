@@ -23,6 +23,7 @@
 
 #include <syslog.h>  // LOG_ERR
 #include <cstdio>    // FILE
+#include <string>
 
 #define nop() \
     do {      \
@@ -47,11 +48,16 @@
 
 enum LogDestination { SYSLOG, STDERR, NONE };
 extern LogDestination log_destination;
+extern bool log_json_format;
 extern FILE* debugf;
 
 void error();
 void init_debug(const char* file);
 void close_debug();
 void log(int priority, const char* format, ...);
+
+// pure - no I/O or wall-clock dependency in the escaping logic itself - so it can be
+// unit tested directly. message should not include a trailing newline.
+std::string build_json_log_line(int priority, const std::string& message);
 
 #endif /* _LOGGING_H */
