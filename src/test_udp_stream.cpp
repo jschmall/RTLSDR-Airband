@@ -235,3 +235,113 @@ TEST_F(UdpStreamTest, stereo_s8_sends_exact_interleaved_byte_count) {
         EXPECT_NEAR(received[2 * i + 1], -51, 1);
     }
 }
+
+// --- resample_linear() ---------------------------------------------------
+
+TEST(ResampleLinearTest, identity_when_rates_match) {
+    float in[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float out[4];
+    size_t n = resample_linear(in, 4, 8000, 8000, out, 4);
+    ASSERT_EQ(n, 4u);
+    for (size_t i = 0; i < 4; ++i) {
+        EXPECT_FLOAT_EQ(out[i], in[i]);
+    }
+}
+
+TEST(ResampleLinearTest, downsamples_2to1_by_picking_every_other_sample) {
+    // 16000 -> 8000 is exactly the NFM-build-to-trunkrecorder case this feature
+    // targets. With a clean 2:1 ratio every output sample lands exactly on an
+    // input sample (no fractional blending), so this is exact, not approximate.
+    float in[6] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    float out[3];
+    size_t n = resample_linear(in, 6, 16000, 8000, out, 3);
+    ASSERT_EQ(n, 3u);
+    EXPECT_FLOAT_EQ(out[0], 1.0f);
+    EXPECT_FLOAT_EQ(out[1], 3.0f);
+    EXPECT_FLOAT_EQ(out[2], 5.0f);
+}
+
+TEST(ResampleLinearTest, upsamples_1to2_by_interpolating_between_samples) {
+    float in[3] = {0.0f, 10.0f, 20.0f};
+    float out[6];
+    size_t n = resample_linear(in, 3, 8000, 16000, out, 6);
+    ASSERT_EQ(n, 6u);
+    EXPECT_FLOAT_EQ(out[0], 0.0f);   // in[0]
+    EXPECT_FLOAT_EQ(out[1], 5.0f);   // midpoint of in[0], in[1]
+    EXPECT_FLOAT_EQ(out[2], 10.0f);  // in[1]
+    EXPECT_FLOAT_EQ(out[3], 15.0f);  // midpoint of in[1], in[2]
+    EXPECT_FLOAT_EQ(out[4], 20.0f);  // in[2]
+    EXPECT_FLOAT_EQ(out[5], 20.0f);  // past the end - clamped to the last sample
+}
+
+TEST(ResampleLinearTest, truncates_to_out_capacity) {
+    float in[6] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    float out[2];
+    size_t n = resample_linear(in, 6, 16000, 8000, out, 2);
+    ASSERT_EQ(n, 2u);
+    EXPECT_FLOAT_EQ(out[0], 1.0f);
+    EXPECT_FLOAT_EQ(out[1], 3.0f);
+}
+
+TEST(ResampleLinearTest, handles_zero_length_input) {
+    float out[4];
+    EXPECT_EQ(resample_linear(nullptr, 0, 16000, 8000, out, 4), 0u);
+}
+
+TEST(ResampleLinearTest, handles_invalid_rates) {
+    float in[2] = {1.0f, 2.0f};
+    float out[4];
+    EXPECT_EQ(resample_linear(in, 2, 0, 8000, out, 4), 0u);
+    EXPECT_EQ(resample_linear(in, 2, 16000, 0, out, 4), 0u);
+}
+
+// --- udp_stream_write() with a configured sample_rate ---------------------
+
+TEST_F(UdpStreamTest, mono_downsamples_before_sending_when_sample_rate_configured) {
+    const size_t len = 4;
+    sdata.sample_rate = WAVE_RATE / 2;
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_MONO, len));
+    ASSERT_EQ(sdata.resample_buffer_len, len / 2);
+
+    float data[len] = {1.0f, 2.0f, 3.0f, 4.0f};
+    udp_stream_write(&sdata, data, len);
+
+    float received[len + 100];
+    ssize_t bytes = recv_packet(received, sizeof(received));
+
+    // half the samples, at half the "rate" - the resampler picks every other
+    // input sample for a clean 2:1 ratio (see ResampleLinearTest above)
+    ASSERT_EQ(bytes, (ssize_t)((len / 2) * sizeof(float)));
+    EXPECT_FLOAT_EQ(received[0], 1.0f);
+    EXPECT_FLOAT_EQ(received[1], 3.0f);
+}
+
+TEST_F(UdpStreamTest, stereo_downsamples_each_channel_independently) {
+    const size_t len = 4;
+    sdata.sample_rate = WAVE_RATE / 2;
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_STEREO, len));
+    ASSERT_EQ(sdata.resample_stereo_buffer_len, len / 2);
+
+    float left[len] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float right[len] = {-1.0f, -2.0f, -3.0f, -4.0f};
+    udp_stream_write(&sdata, left, right, len);
+
+    float received[len + 100];
+    ssize_t bytes = recv_packet(received, sizeof(received));
+
+    // 2 output samples per channel, interleaved - confirms resampling each
+    // channel separately (before interleaving) didn't blend left into right
+    ASSERT_EQ(bytes, (ssize_t)(len * sizeof(float)));  // (len/2 samples) * 2 channels
+    EXPECT_FLOAT_EQ(received[0], 1.0f);                // left[0]
+    EXPECT_FLOAT_EQ(received[1], -1.0f);               // right[0]
+    EXPECT_FLOAT_EQ(received[2], 3.0f);                // left[2]
+    EXPECT_FLOAT_EQ(received[3], -3.0f);               // right[2]
+}
+
+TEST_F(UdpStreamTest, unset_sample_rate_defaults_to_wave_rate_no_resampling) {
+    const size_t len = 4;
+    ASSERT_EQ(sdata.sample_rate, 0);  // zero-initialized in SetUp, like a real config default
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_MONO, len));
+    EXPECT_EQ(sdata.sample_rate, WAVE_RATE);
+    EXPECT_EQ(sdata.resample_buffer, nullptr);
+}
