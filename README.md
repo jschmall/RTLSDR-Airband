@@ -7,18 +7,24 @@
 This is a personal fork of [`rtl-airband/RTLSDR-Airband`](https://github.com/rtl-airband/RTLSDR-Airband)
 that tracks upstream `main` and carries a small delta on top of it:
 
-- **`post_write_script` and `min_rx_seconds` file-output options** — cherry-picked from
-  [`yegors/RTLSDR-Airband`](https://github.com/yegors/RTLSDR-Airband) (commit `bb36bb0`,
-  "Rework file output options"). Both require `split_on_transmission = true`.
-- **UDP stream byte-length fix** — corrects a bug where `udp_stream` output packets
-  carried 4x the intended payload.
-- **Native rdio-scanner call-upload support** — a `rdio_scanner: { ... }` config block
-  on `file` outputs that uploads completed transmissions directly to a
-  [rdio-scanner](https://github.com/chuot/rdio-scanner) instance's `/api/call-upload`
-  endpoint, no external script or CSV lookup required.
-- **Configurable `bit_depth` for `udp_stream` output** — send 32-bit float, 16-bit, or
-  8-bit signed PCM, to cut bandwidth for downstream consumers that don't need float
-  precision.
+- **`post_write_script` and `min_rx_seconds` file-output options** — run a script after
+  each completed recording and skip saving very short transmissions. Cherry-picked from
+  [`yegors/RTLSDR-Airband`](https://github.com/yegors/RTLSDR-Airband). Both require
+  `split_on_transmission = true`.
+- **Native rdio-scanner call uploads** — send completed transmissions straight to a
+  [rdio-scanner](https://github.com/chuot/rdio-scanner) server for playback, no external
+  script or CSV lookup required.
+- **Configurable `udp_stream` output** — choose the bit depth (32/16/8-bit PCM) and
+  sample rate sent over UDP, to match what a downstream consumer like trunk-recorder
+  expects.
+- **Structured JSON logging** — optional `-j` flag for single-line JSON logs, easier to
+  parse and aggregate than the default plain-text format.
+- **HTTP metrics endpoint** — serve the existing Prometheus stats file over plain HTTP
+  so it can be scraped directly, instead of relying on a textfile collector.
+- **SIGHUP config reload** — SIGHUP now triggers a clean restart to pick up config
+  changes, instead of just exiting.
+- **Assorted stability fixes** — buffer overflow, thread-safety, and error-handling
+  fixes not yet merged upstream.
 
 ### Major / Minor Version Changes:
 
