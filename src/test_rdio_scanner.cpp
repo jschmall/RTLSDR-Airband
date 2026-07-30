@@ -23,6 +23,14 @@
 
 #ifdef WITH_RDIO_SCANNER
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <map>
 
 using namespace std;
@@ -111,6 +119,75 @@ TEST_F(RdioScannerTest, system_id_zero_is_a_valid_value_not_unset) {
 
     ASSERT_EQ(fields.count("system"), 1u);
     EXPECT_EQ(fields.at("system"), "0");
+}
+
+class RdioScannerShutdownTest : public TestBaseClass {
+   protected:
+    void TearDown(void) override {
+        rdio_scanner_shutdown();  // no-op if already shut down
+        if (listen_fd != -1)
+            close(listen_fd);
+        TestBaseClass::TearDown();
+    }
+
+    // Sets up a listening socket that accepts the TCP connection but never sends a
+    // response, so a client blocks waiting for one - simulating a stalled upload target.
+    // Returns the port it's bound to.
+    int start_stalled_listener() {
+        listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        EXPECT_NE(listen_fd, -1);
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+        addr.sin_port = 0;  // let the OS pick a free port
+        EXPECT_EQ(bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)), 0);
+        EXPECT_EQ(listen(listen_fd, 1), 0);
+
+        socklen_t addr_len = sizeof(addr);
+        EXPECT_EQ(getsockname(listen_fd, (struct sockaddr*)&addr, &addr_len), 0);
+        return ntohs(addr.sin_port);
+    }
+
+    int listen_fd = -1;
+};
+
+TEST_F(RdioScannerShutdownTest, shutdown_interrupts_stalled_upload_promptly) {
+    // Before this fix, rdio_scanner_shutdown()'s pthread_join() had to wait out the
+    // full connect/transfer timeout (and any retry backoff) on a job stuck talking to
+    // an unresponsive server. Use a deliberately long timeout_ms so a non-interruptible
+    // shutdown would clearly stall this test; the fix should make shutdown return in
+    // roughly the curl progress-callback interval (~1s), not anywhere near 60s.
+    int port = start_stalled_listener();
+
+    const string file_path = temp_dir + "/stalled_upload.mp3";
+    FILE* f = fopen(file_path.c_str(), "wb");
+    ASSERT_NE(f, nullptr);
+    fwrite("fake mp3 data", 1, 13, f);
+    fclose(f);
+
+    rdio_scanner_job job = make_job();
+    job.config.server = "127.0.0.1";
+    job.config.port = port;
+    job.config.timeout_ms = 60000;
+    job.config.max_retries = 2;
+    job.file_path = file_path;
+
+    rdio_scanner_start();
+    struct timeval open_time;
+    open_time.tv_sec = job.timestamp_sec;
+    open_time.tv_usec = 0;
+    rdio_scanner_enqueue(&job.config, job.file_path, open_time, job.frequency);
+
+    // give the worker thread time to dequeue the job and get into the stalled upload
+    usleep(300000);
+
+    auto shutdown_start = chrono::steady_clock::now();
+    rdio_scanner_shutdown();
+    auto elapsed_sec = chrono::duration_cast<chrono::duration<double>>(chrono::steady_clock::now() - shutdown_start).count();
+
+    EXPECT_LT(elapsed_sec, 5.0);
 }
 
 #endif /* WITH_RDIO_SCANNER */
