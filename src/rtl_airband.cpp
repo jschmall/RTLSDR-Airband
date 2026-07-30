@@ -708,6 +708,7 @@ void usage() {
     cout << "\t-d <file>\t\tLog debugging information to <file> (default is " << DEBUG_PATH << ")\n";
 #endif /* DEBUG */
     cout << "\t-e\t\t\tPrint messages to standard error (disables syslog logging)\n";
+    cout << "\t-j\t\t\tLog messages as single-line JSON instead of plain text\n";
     cout << "\t-c <config_file_path>\tUse non-default configuration file\n\t\t\t\t(default: " << CFGFILE << ")\n\
 \t-v\t\t\tDisplay version and exit\n";
     exit(EXIT_SUCCESS);
@@ -734,7 +735,7 @@ int main(int argc, char* argv[]) {
 #pragma GCC diagnostic warning "-Wwrite-strings"
 
     int opt;
-    char optstring[16] = "efFhvc:";
+    char optstring[16] = "efFhjvc:";
 
 #ifdef NFM
     strcat(optstring, "Q");
@@ -763,6 +764,9 @@ int main(int argc, char* argv[]) {
 
             case 'e':
                 do_syslog = 0;
+                break;
+            case 'j':
+                log_json_format = true;
                 break;
             case 'f':
                 foreground = 1;
