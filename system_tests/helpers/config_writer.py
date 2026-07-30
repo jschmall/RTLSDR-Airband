@@ -7,6 +7,54 @@ Generates minimal libconfig++-format .conf files for the rtl_airband binary.
 from pathlib import Path
 
 
+def _build_output_lines(ch: dict, mp3_tmp_dir: Path | None) -> list[str]:
+    """Build the "outputs: ( ... );" block lines for one channel dict.
+
+    File outputs use directory+template+append, mixer outputs use
+    name+balance. extra_output_blocks lets a test supply a fully-formed
+    "{ ... }" output entry verbatim for output types (e.g. icecast,
+    rdio_scanner's nested config) this helper doesn't otherwise know the
+    schema of.
+    """
+    output_entries: list[dict | str] = []
+    if mp3_tmp_dir is not None:
+        output_entries.append(
+            {
+                "type": "file",
+                "directory": str(mp3_tmp_dir),
+                "template": ch["output_filename_template"],
+            }
+        )
+    if ch.get("mixer_output") is not None:
+        output_entries.append(
+            {
+                "type": "mixer",
+                "name": ch["mixer_output"]["name"],
+                "balance": ch["mixer_output"]["balance"],
+            }
+        )
+    output_entries.extend(ch.get("extra_output_blocks", []))
+
+    lines = ["      outputs: ("]
+    for j, entry in enumerate(output_entries):
+        is_last_out = j == len(output_entries) - 1
+        if isinstance(entry, str):
+            lines.append(entry + ("" if is_last_out else ","))
+            continue
+        lines.append("        {")
+        lines.append(f'          type = "{entry["type"]}";')
+        if entry["type"] == "mixer":
+            lines.append(f'          name = "{entry["name"]}";')
+            lines.append(f'          balance = {entry["balance"]:.1f};')
+        else:
+            lines.append(f'          directory = "{entry["directory"]}";')
+            lines.append(f'          filename_template = "{entry["template"]}";')
+            lines.append("          append = false;")
+        lines.append("        }" + ("" if is_last_out else ","))
+    lines.append("      );")
+    return lines
+
+
 def write_config(
     config_path: Path,
     iq_filepath: Path,
@@ -40,6 +88,10 @@ def write_config(
               (used only when mp3_tmp_dir is provided).
             - mixer_output (dict|None): {"name": str, "balance": float}, omitted if None.
             - scan_freqs_hz (list[int]): Scan mode only — list of frequencies in Hz.
+            - extra_output_blocks (list[str]): Fully-formed "{ ... }" output
+              config entries appended verbatim after the file/mixer outputs,
+              for output types (icecast, rdio_scanner) this helper doesn't
+              otherwise know the schema of.
         output_dir: Directory where mixer MP3 outputs are written. Unused when
             mixers is empty/None.
         speedup_factor: IQ replay speed factor (1.0 = real-time).
@@ -119,40 +171,7 @@ def write_config(
         if ch.get("squelch") is not None:
             lines.append(f"      squelch_snr_threshold = {ch['squelch']:.1f};")
 
-        # Build output entries: file outputs use directory+template+append,
-        # mixer outputs use name+balance.
-        output_entries: list[dict] = []
-        if mp3_tmp_dir is not None:
-            output_entries.append(
-                {
-                    "type": "file",
-                    "directory": str(mp3_tmp_dir),
-                    "template": ch["output_filename_template"],
-                }
-            )
-        if ch.get("mixer_output") is not None:
-            output_entries.append(
-                {
-                    "type": "mixer",
-                    "name": ch["mixer_output"]["name"],
-                    "balance": ch["mixer_output"]["balance"],
-                }
-            )
-
-        lines.append("      outputs: (")
-        for j, entry in enumerate(output_entries):
-            is_last_out = j == len(output_entries) - 1
-            lines.append("        {")
-            lines.append(f'          type = "{entry["type"]}";')
-            if entry["type"] == "mixer":
-                lines.append(f'          name = "{entry["name"]}";')
-                lines.append(f'          balance = {entry["balance"]:.1f};')
-            else:
-                lines.append(f'          directory = "{entry["directory"]}";')
-                lines.append(f'          filename_template = "{entry["template"]}";')
-                lines.append("          append = false;")
-            lines.append("        }" + ("" if is_last_out else ","))
-        lines.append("      );")
+        lines.extend(_build_output_lines(ch, mp3_tmp_dir))
 
         lines.append("    }" + ("" if is_last else ","))
 
