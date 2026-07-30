@@ -31,7 +31,7 @@
 
 using namespace std;
 
-static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, int j, bool parsing_mixers) {
+static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, int j, bool parsing_mixers, rec_modes dev_mode) {
     int oo = 0;
     for (int o = 0; o < channel->output_count; o++) {
         channel->outputs[oo].has_mp3_output = false;
@@ -132,6 +132,12 @@ static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, in
                     if (!rs.exists("server") || !rs.exists("port") || !rs.exists("api_key") || !rs.exists("talkgroup_id")) {
                         cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: ";
                         cerr << "rdio_scanner requires server, port, api_key, and talkgroup_id\n";
+                        error();
+                    }
+                    if (dev_mode == R_SCAN) {
+                        cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: ";
+                        cerr << "rdio_scanner is not supported on R_SCAN (scan mode) channels - talkgroup_id and the other "
+                                "per-channel fields are fixed at config time and can't track the frequency currently being scanned\n";
                         error();
                     }
                     rdio_scanner_data* rsdata = new rdio_scanner_data();
@@ -735,7 +741,7 @@ static int parse_channels(libconfig::Setting& chans, device_t* dev, int i) {
             error();
         }
         channel->outputs = (output_t*)XCALLOC(channel->output_count, sizeof(struct output_t));
-        int outputs_enabled = parse_outputs(outputs, channel, i, j, false);
+        int outputs_enabled = parse_outputs(outputs, channel, i, j, false, dev->mode);
         if (outputs_enabled < 1) {
             cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "]: no outputs defined\n";
             error();
@@ -951,7 +957,7 @@ int parse_mixers(libconfig::Setting& mx) {
             error();
         }
         channel->outputs = (output_t*)XCALLOC(channel->output_count, sizeof(struct output_t));
-        int outputs_enabled = parse_outputs(outputs, channel, i, 0, true);
+        int outputs_enabled = parse_outputs(outputs, channel, i, 0, true, R_MULTICHANNEL);
         if (outputs_enabled < 1) {
             cerr << "Configuration error: mixers.[" << i << "]: no outputs defined\n";
             error();
