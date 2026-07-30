@@ -2,78 +2,23 @@
 
 ![version tag](https://img.shields.io/github/v/tag/rtl-airband/RTLSDR-Airband?label=)
 
-### CI Workflow Status
+## Fork-Specific Features
 
-<table>
-  <thead>
-    <tr>
-      <th></th>
-      <th><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml">Run CI</a></th>
-      <th><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/platform_build.yml">Platform Build</a></th>
-      <th><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/code_formatting.yml">Code Formatting</a></th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>x86_64 ubuntu-22.04</td>
-      <td align="center"><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml"><img src="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml/badge.svg?branch=main" alt="Run CI"></a></td>
-      <td></td>
-      <td align="center" rowspan="10"><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/code_formatting.yml"><img src="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/code_formatting.yml/badge.svg?branch=main" alt="Code Formatting"></a></td>
-    </tr>
-    <tr>
-      <td>x86_64 ubuntu-24.04</td>
-      <td align="center"><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml"><img src="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml/badge.svg?branch=main" alt="Run CI"></a></td>
-      <td></td>
-    </tr>
-    <tr>
-      <td>ARM64 ubuntu-22.04</td>
-      <td align="center"><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml"><img src="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml/badge.svg?branch=main" alt="Run CI"></a></td>
-      <td align="center"><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/platform_build.yml"><img src="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/platform_build.yml/badge.svg?branch=main" alt="Platform Build"></a></td>
-    </tr>
-    <tr>
-      <td>ARM64 ubuntu-24.04</td>
-      <td align="center"><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml"><img src="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml/badge.svg?branch=main" alt="Run CI"></a></td>
-      <td></td>
-    </tr>
-    <tr>
-      <td>ARM64 macos-14</td>
-      <td align="center"><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml"><img src="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml/badge.svg?branch=main" alt="Run CI"></a></td>
-      <td></td>
-    </tr>
-    <tr>
-      <td>ARM64 macos-15</td>
-      <td align="center"><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml"><img src="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml/badge.svg?branch=main" alt="Run CI"></a></td>
-      <td></td>
-    </tr>
-    <tr>
-      <td>ARM64 macos-26</td>
-      <td align="center"><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml"><img src="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml/badge.svg?branch=main" alt="Run CI"></a></td>
-      <td></td>
-    </tr>
-    <tr>
-      <td>x86_64 macos-15 (Intel)</td>
-      <td align="center"><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml"><img src="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml/badge.svg?branch=main" alt="Run CI"></a></td>
-      <td></td>
-    </tr>
-    <tr>
-      <td>x86_64 macos-26 (Intel)</td>
-      <td align="center"><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml"><img src="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/ci_build.yml/badge.svg?branch=main" alt="Run CI"></a></td>
-      <td></td>
-    </tr>
-    <tr>
-      <td>ARM64 Debian Trixie (Pi 4B)</td>
-      <td></td>
-      <td align="center"><a href="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/platform_build.yml"><img src="https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/platform_build.yml/badge.svg?branch=main" alt="Platform Build"></a></td>
-    </tr>
-  </tbody>
-</table>
+This is a personal fork of [`rtl-airband/RTLSDR-Airband`](https://github.com/rtl-airband/RTLSDR-Airband)
+that tracks upstream `main` and carries a small delta on top of it:
 
-### [Published Containers](https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/build_docker_containers.yml)
-
-| linux/amd64 | linux/386 | linux/arm64 | linux/arm/v6 | linux/arm/v7 |
-|:---:|:---:|:---:|:---:|:---:|
-| [![Build Containers](https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/build_docker_containers.yml/badge.svg?branch=main)](https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/build_docker_containers.yml) | [![Build Containers](https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/build_docker_containers.yml/badge.svg?branch=main)](https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/build_docker_containers.yml) | [![Build Containers](https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/build_docker_containers.yml/badge.svg?branch=main)](https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/build_docker_containers.yml) | [![Build Containers](https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/build_docker_containers.yml/badge.svg?branch=main)](https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/build_docker_containers.yml) | [![Build Containers](https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/build_docker_containers.yml/badge.svg?branch=main)](https://github.com/rtl-airband/RTLSDR-Airband/actions/workflows/build_docker_containers.yml) |
-
+- **`post_write_script` and `min_rx_seconds` file-output options** — cherry-picked from
+  [`yegors/RTLSDR-Airband`](https://github.com/yegors/RTLSDR-Airband) (commit `bb36bb0`,
+  "Rework file output options"). Both require `split_on_transmission = true`.
+- **UDP stream byte-length fix** — corrects a bug where `udp_stream` output packets
+  carried 4x the intended payload.
+- **Native rdio-scanner call-upload support** — a `rdio_scanner: { ... }` config block
+  on `file` outputs that uploads completed transmissions directly to a
+  [rdio-scanner](https://github.com/chuot/rdio-scanner) instance's `/api/call-upload`
+  endpoint, no external script or CSV lookup required.
+- **Configurable `bit_depth` for `udp_stream` output** — send 32-bit float, 16-bit, or
+  8-bit signed PCM, to cut bandwidth for downstream consumers that don't need float
+  precision.
 
 ### Major / Minor Version Changes:
 
