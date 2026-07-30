@@ -185,6 +185,43 @@ TEST_F(UdpStreamTest, mono_s8_sends_exact_byte_count_and_clamped_values) {
     EXPECT_EQ(received[3], -127);  // clamped from -2.0f
 }
 
+TEST_F(UdpStreamTest, mono_s16le_oversized_len_does_not_overflow_buffer) {
+    // These bounds checks used to be assert(), which is compiled out by -DNDEBUG in the
+    // default Release build - so a len/buffer-size mismatch (the same bug class behind
+    // this fork's historical 4x-oversend incident) would silently overrun convert_buffer
+    // in a shipped binary. Confirm the check is a real runtime guard, not just a debug-mode
+    // assertion: no crash, and nothing sent for the oversized call.
+    const size_t len = 4;
+    sdata.format = STREAM_FORMAT_S16LE;
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_MONO, len));
+
+    float oversized_data[len * 10];
+    for (size_t i = 0; i < len * 10; ++i)
+        oversized_data[i] = 0.5f;
+    udp_stream_write(&sdata, oversized_data, len * 10);
+
+    int16_t received[len * 10 + 100];
+    ssize_t bytes = recv_packet(received, sizeof(received));
+    EXPECT_EQ(bytes, -1);  // nothing sent - the write was dropped, not truncated or overflowed
+}
+
+TEST_F(UdpStreamTest, stereo_oversized_len_does_not_overflow_buffer) {
+    const size_t len = 4;
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_STEREO, len));
+
+    float left[len * 10];
+    float right[len * 10];
+    for (size_t i = 0; i < len * 10; ++i) {
+        left[i] = 0.5f;
+        right[i] = -0.5f;
+    }
+    udp_stream_write(&sdata, left, right, len * 10);
+
+    float received[len * 20 + 100];
+    ssize_t bytes = recv_packet(received, sizeof(received));
+    EXPECT_EQ(bytes, -1);  // nothing sent - the write was dropped, not truncated or overflowed
+}
+
 TEST_F(UdpStreamTest, stereo_s8_sends_exact_interleaved_byte_count) {
     const size_t len = 4;
     sdata.format = STREAM_FORMAT_S8;

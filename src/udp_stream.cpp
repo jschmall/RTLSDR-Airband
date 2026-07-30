@@ -19,7 +19,6 @@
 #include <string.h>  // strerror()
 #include <syslog.h>  // LOG_INFO / LOG_ERR
 #include <unistd.h>  // close()
-#include <cassert>   // assert()
 #include <cmath>     // lrintf()
 #include <cstdint>   // int16_t, int8_t
 
@@ -145,7 +144,10 @@ void udp_stream_write(udp_stream_data* sdata, const float* data, size_t len) {
     // Send without blocking or checking for success
     switch (sdata->format) {
         case STREAM_FORMAT_S16LE: {
-            assert(len <= sdata->convert_buffer_len);
+            if (len > sdata->convert_buffer_len) {
+                log(LOG_ERR, "udp_stream: len %zu exceeds S16LE convert buffer size %zu, dropping packet\n", len, sdata->convert_buffer_len);
+                return;
+            }
             int16_t* buf = (int16_t*)sdata->convert_buffer;
             for (size_t i = 0; i < len; ++i) {
                 buf[i] = float_to_s16(data[i]);
@@ -154,7 +156,10 @@ void udp_stream_write(udp_stream_data* sdata, const float* data, size_t len) {
             break;
         }
         case STREAM_FORMAT_S8: {
-            assert(len <= sdata->convert_buffer_len);
+            if (len > sdata->convert_buffer_len) {
+                log(LOG_ERR, "udp_stream: len %zu exceeds S8 convert buffer size %zu, dropping packet\n", len, sdata->convert_buffer_len);
+                return;
+            }
             int8_t* buf = (int8_t*)sdata->convert_buffer;
             for (size_t i = 0; i < len; ++i) {
                 buf[i] = float_to_s8(data[i]);
@@ -171,7 +176,10 @@ void udp_stream_write(udp_stream_data* sdata, const float* data, size_t len) {
 
 void udp_stream_write(udp_stream_data* sdata, const float* data_left, const float* data_right, size_t len) {
     if (sdata->send_socket != -1) {
-        assert(len * 2 <= sdata->stereo_buffer_len);
+        if (len * 2 > sdata->stereo_buffer_len) {
+            log(LOG_ERR, "udp_stream: len %zu exceeds stereo buffer size %zu, dropping packet\n", len * 2, sdata->stereo_buffer_len);
+            return;
+        }
         for (size_t i = 0; i < len; ++i) {
             sdata->stereo_buffer[2 * i] = data_left[i];
             sdata->stereo_buffer[2 * i + 1] = data_right[i];
