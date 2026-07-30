@@ -26,6 +26,7 @@
 #include <shout/shout.h>
 #include <stdint.h>  // uint32_t
 #include <sys/time.h>
+#include <atomic>
 #include <complex>
 #include <cstdio>
 #include <libconfig.h++>
@@ -306,14 +307,18 @@ struct channel_t {
 #endif                         /* NFM */
     uint32_t dm_dphi, dm_phi;  // derotation frequency and current phase value
     enum mix_modes mode;       // mono or stereo
-    status axcindicate;
+    // axcindicate, freq_idx, and state are each written by one thread (demod/mixer) and
+    // read by others (output, controller, stats) with no lock between them - atomic so
+    // that's well-defined rather than a data race, at no runtime cost over a plain
+    // load/store on the platforms this project targets.
+    std::atomic<status> axcindicate;
     unsigned char afc;  // 0 - AFC disabled; 1 - minimal AFC; 2 - more aggressive AFC and so on to 255
     struct freq_t* freqlist;
     int freq_count;
-    int freq_idx;
+    std::atomic<int> freq_idx;
     int needs_raw_iq;
     int has_iq_outputs;
-    enum ch_states state;  // mixer channel state flag
+    std::atomic<ch_states> state;  // mixer channel state flag
     int output_count;
     output_t* outputs;
     int highpass;  // highpass filter cutoff
