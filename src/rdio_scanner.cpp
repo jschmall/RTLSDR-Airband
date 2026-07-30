@@ -25,6 +25,7 @@
 #include <syslog.h>  // LOG_WARNING / LOG_ERR
 #include <unistd.h>  // usleep(), unlink()
 #include <cerrno>
+#include <ctime>  // clock_gettime(), struct timespec
 #include <deque>
 
 #include "rtl_airband.h"
@@ -45,6 +46,20 @@ bool worker_started = false;
 size_t curl_append_response(char* ptr, size_t size, size_t nmemb, void* userdata) {
     ((std::string*)userdata)->append(ptr, size * nmemb);
     return size * nmemb;
+}
+
+bool is_shutdown_requested() {
+    pthread_mutex_lock(&queue_mutex);
+    bool requested = shutdown_requested;
+    pthread_mutex_unlock(&queue_mutex);
+    return requested;
+}
+
+// libcurl calls this roughly once a second during a transfer (and while connecting); a
+// non-zero return aborts curl_easy_perform() early, so a shutdown doesn't have to wait
+// out a full connect/transfer timeout on a stalled upload.
+int curl_abort_on_shutdown(void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    return is_shutdown_requested() ? 1 : 0;
 }
 
 // builds the multipart body (minus the audio file itself) for one upload attempt
@@ -77,6 +92,8 @@ bool upload_once(const rdio_scanner_job& job, std::string* response, long* http_
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_append_response);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_abort_on_shutdown);
 
     CURLcode res = curl_easy_perform(curl);
     bool ok = false;
@@ -92,14 +109,44 @@ bool upload_once(const rdio_scanner_job& job, std::string* response, long* http_
     return ok;
 }
 
+// interruptible version of usleep(): returns early if shutdown is requested while waiting
+void backoff_sleep(int attempt) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    long backoff_ms = (long)attempt * 1000;  // 1s, 2s, ...
+    deadline.tv_sec += backoff_ms / 1000;
+    deadline.tv_nsec += (backoff_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&queue_mutex);
+    while (!shutdown_requested) {
+        if (pthread_cond_timedwait(&queue_cond, &queue_mutex, &deadline) == ETIMEDOUT) {
+            break;
+        }
+    }
+    pthread_mutex_unlock(&queue_mutex);
+}
+
 void process_job(const rdio_scanner_job& job) {
     bool ok = false;
     std::string response;
     long http_code = 0;
 
     for (int attempt = 0; attempt <= job.config.max_retries && !ok; ++attempt) {
+        // always make the first attempt regardless of shutdown state, but don't retry
+        // (including the backoff wait) once a shutdown has been requested - a stalled
+        // upload can still be cut short mid-attempt via curl_abort_on_shutdown()
         if (attempt > 0) {
-            usleep((useconds_t)attempt * 1000 * 1000);  // 1s, 2s, ...
+            if (is_shutdown_requested()) {
+                break;
+            }
+            backoff_sleep(attempt);
+            if (is_shutdown_requested()) {
+                break;
+            }
         }
         response.clear();
         http_code = 0;
