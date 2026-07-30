@@ -148,7 +148,17 @@ static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, in
                     rsdata->source_id = rs.exists("source_id") ? (int)rs["source_id"] : 0;
                     rsdata->delete_after_upload = rs.exists("delete_after_upload") ? (bool)rs["delete_after_upload"] : false;
                     rsdata->timeout_ms = rs.exists("timeout_ms") ? (long)(int)rs["timeout_ms"] : 5000;
+                    if (rsdata->timeout_ms <= 0) {
+                        cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: ";
+                        cerr << "rdio_scanner timeout_ms must be greater than 0 (libcurl treats 0 as no timeout)\n";
+                        error();
+                    }
                     rsdata->max_retries = rs.exists("max_retries") ? (int)rs["max_retries"] : 2;
+                    if (rsdata->max_retries < 0) {
+                        cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: ";
+                        cerr << "rdio_scanner max_retries must not be negative\n";
+                        error();
+                    }
                     fdata->rdio_scanner = rsdata;
                     rdio_scanner_enabled = true;
                 }
