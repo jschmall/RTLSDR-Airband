@@ -197,6 +197,17 @@ struct udp_stream_data {
     void* convert_buffer;      // NULL when format == STREAM_FORMAT_FLOAT32
     size_t convert_buffer_len;
 
+    // set by config parser, default WAVE_RATE (no resampling). When different from
+    // WAVE_RATE, each channel is linear-interpolation-resampled to this rate before
+    // the format conversion/send above - decouples the wire rate from the build's
+    // internal WAVE_RATE (8000 without NFM, 16000 with).
+    int sample_rate;
+    float* resample_buffer;  // mono resampling scratch space; NULL when sample_rate == WAVE_RATE
+    size_t resample_buffer_len;
+    float* resample_left_buffer;        // stereo resampling scratch space, one per channel;
+    float* resample_right_buffer;       // NULL when sample_rate == WAVE_RATE
+    size_t resample_stereo_buffer_len;  // capacity of each of the above two buffers
+
     int send_socket;
     struct sockaddr dest_sockaddr;
     socklen_t dest_sockaddr_len;
@@ -454,6 +465,9 @@ bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len);
 void udp_stream_write(udp_stream_data* sdata, const float* data, size_t len);
 void udp_stream_write(udp_stream_data* sdata, const float* data_left, const float* data_right, size_t len);
 void udp_stream_shutdown(udp_stream_data* sdata);
+// pure - no I/O - so it can be unit tested directly. Returns the number of samples
+// written to out (capped at out_capacity).
+size_t resample_linear(const float* in, size_t len_in, int rate_in, int rate_out, float* out, size_t out_capacity);
 
 // stats_http.cpp
 void stats_http_start();

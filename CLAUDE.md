@@ -133,6 +133,24 @@ Keep the local delta small and well understood.
    `stats_http_shutdown()` is idempotent) and manually verified with `curl` against a live
    instance. No new build dependency — plain POSIX sockets, unconditionally compiled in (unlike
    `PULSEAUDIO`/`RDIO_SCANNER`, no `-D...=ON` flag needed).
+9. **Configurable `sample_rate` for `udp_stream` output** (`src/udp_stream.cpp`, `src/config.cpp`,
+   `src/rtl_airband.h`) — addresses the root cause behind item 6's still-open rate-matching
+   follow-up: the wire sample rate was hard-coupled to the build's internal `WAVE_RATE` (8000
+   without `NFM`, 16000 with), so a downstream consumer expecting a fixed rate (e.g.
+   trunkrecorder/TTD's 8000 Hz) had no way to get it from an `NFM` build without the operator
+   separately knowing to reconfigure the consumer side. Adds an optional `sample_rate` integer
+   field on a `udp_stream` output block; when set and different from `WAVE_RATE`, each channel
+   (mono, or left/right independently before interleaving for stereo — resampling the
+   already-interleaved buffer would blend channels together) is linear-interpolation-resampled
+   to the configured rate before the existing `bit_depth` conversion/send. Not broadcast-quality
+   resampling, but correct and adequate for narrowband voice audio, and avoids pulling in a real
+   DSP resampling library for what's typically a single fixed 16000→8000 conversion. Omitting
+   `sample_rate` (or setting it equal to `WAVE_RATE`) is fully backward compatible — no
+   resampling buffers are allocated and existing configs/tests are unaffected; confirmed via the
+   existing `assert`-turned-real-check byte-length tests in `test_udp_stream.cpp` (item 2) plus
+   new ones (`ResampleLinearTest`, plus mono/stereo `udp_stream_write()` cases with a configured
+   rate). Also manually validated end-to-end: real binary, real UDP listener, `sample_rate` set
+   to half `WAVE_RATE` — every received packet was exactly the expected halved byte count.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

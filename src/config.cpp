@@ -312,6 +312,20 @@ static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, in
                     error();
                 }
             }
+
+            sdata->sample_rate = WAVE_RATE;
+            if (outs[o].exists("sample_rate")) {
+                sdata->sample_rate = (int)outs[o]["sample_rate"];
+                if (sdata->sample_rate <= 0) {
+                    if (parsing_mixers) {
+                        cerr << "Configuration error: mixers.[" << i << "] outputs.[" << o << "]: ";
+                    } else {
+                        cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: ";
+                    }
+                    cerr << "sample_rate must be greater than 0\n";
+                    error();
+                }
+            }
 #ifdef WITH_PULSEAUDIO
         } else if (!strncmp(outs[o]["type"], "pulse", 5)) {
             channel->outputs[oo].data = XCALLOC(1, sizeof(struct pulse_data));
