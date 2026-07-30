@@ -34,8 +34,6 @@ bool rdio_scanner_enabled = false;
 
 namespace {
 
-const size_t MAX_QUEUE_DEPTH = 64;
-
 pthread_t worker_thread;
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
@@ -249,7 +247,7 @@ void rdio_scanner_enqueue(rdio_scanner_data* config, const std::string& file_pat
     job.timestamp_sec = (long long)open_time.tv_sec;
 
     pthread_mutex_lock(&queue_mutex);
-    if (job_queue.size() >= MAX_QUEUE_DEPTH) {
+    if (job_queue.size() >= (size_t)rdio_scanner_queue_depth) {
         log(LOG_WARNING, "rdio_scanner: upload queue full (%zu), dropping oldest job for %s\n", job_queue.size(), job_queue.front().file_path.c_str());
         job_queue.pop_front();
     }

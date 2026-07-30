@@ -35,6 +35,12 @@
 
 using namespace std;
 
+// rdio_scanner.cpp references this as extern; normally defined in rtl_airband.cpp,
+// which can't be linked here (its main() would conflict with gtest's) - matches the
+// xcalloc-stub pattern in test_udp_stream.cpp for the same reason. rdio_scanner_build_fields(),
+// the only thing under test here, never touches the upload queue depth.
+int rdio_scanner_queue_depth = 64;
+
 namespace {
 
 map<string, string> as_map(const vector<pair<string, string>>& fields) {
