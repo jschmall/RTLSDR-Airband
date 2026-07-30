@@ -440,6 +440,8 @@ void mixer_disable_input(mixer_t* mixer, int input_idx);
 void mixer_put_samples(mixer_t* mixer, int input_idx, const float* samples, bool has_signal, unsigned int len);
 void* mixer_thread(void* params);
 const char* mixer_get_error();
+// pure - no I/O or global state - so it can be unit tested directly
+void mix_waveforms(float* sum, const float* in, float mult, int size);
 
 // config.cpp
 int parse_devices(libconfig::Setting& devs);

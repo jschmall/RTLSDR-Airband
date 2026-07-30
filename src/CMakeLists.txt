@@ -372,6 +372,8 @@ if(BUILD_UNITTESTS)
 		generate_signal.cpp
 		helper_functions.cpp
 		udp_stream.cpp
+		util.cpp
+		mixer.cpp
 	)
 	if(WITH_RDIO_SCANNER)
 		list(APPEND TEST_FILES rdio_scanner.cpp)
