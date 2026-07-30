@@ -84,7 +84,15 @@
 #define DEFAULT_FFT_SIZE_LOG 9
 #define MAX_FFT_SIZE_LOG 13
 
-#define LAMEBUF_SIZE 22000  // todo: calculate
+// LAME's documented worst-case buffer requirement (lame.h): mp3buf_size = 1.25*num_samples
+// + 7200. The largest single lame_encode_buffer_ieee_float() call in this codebase is
+// LameTone's 1-second silence marker (output.cpp open_file(), used to fill gaps when
+// resuming a continuous-mode file output) - it encodes WAVE_RATE samples in one call, not
+// WAVE_BATCH, which only covers the smaller per-tick Icecast/streaming path. An extra
+// +7200 covers the lame_encode_flush() call that follows into the same buffer (bounded by
+// roughly one frame of still-buffered PCM plus final-frame padding - comparable to the
+// encoder-state overhead LAME's own formula already allows for via its flat +7200 term).
+#define LAMEBUF_SIZE ((5 * WAVE_RATE) / 4 + 14400)
 #define MIX_DIVISOR 2
 
 #ifdef WITH_BCM_VC
@@ -419,6 +427,9 @@ extern bool multiple_output_threads;
 extern char* stats_filepath;
 extern char* stats_http_address;
 extern int stats_http_port;
+#ifdef WITH_RDIO_SCANNER
+extern int rdio_scanner_queue_depth;
+#endif /* WITH_RDIO_SCANNER */
 extern size_t fft_size, fft_size_log;
 extern int device_count, mixer_count;
 extern int shout_metadata_delay;

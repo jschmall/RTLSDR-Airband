@@ -86,6 +86,9 @@ bool log_scan_activity = false;
 char* stats_filepath = NULL;
 char* stats_http_address = NULL;
 int stats_http_port = 0;
+#ifdef WITH_RDIO_SCANNER
+int rdio_scanner_queue_depth = 64;  // matches the previous hardcoded MAX_QUEUE_DEPTH
+#endif                              /* WITH_RDIO_SCANNER */
 size_t fft_size_log = DEFAULT_FFT_SIZE_LOG;
 size_t fft_size = 1 << fft_size_log;
 
@@ -750,20 +753,23 @@ int main(int argc, char* argv[]) {
 #pragma GCC diagnostic warning "-Wwrite-strings"
 
     int opt;
-    char optstring[16] = "efFhjvc:";
+    // std::string rather than a fixed-size buffer manually grown with strcat() - the
+    // fixed buffer this replaced needed its size bumped by hand for every option added
+    // below it, with no compiler-enforced guardrail against silently overflowing it
+    std::string optstring = "efFhjvc:";
 
 #ifdef NFM
-    strcat(optstring, "Q");
+    optstring += "Q";
 #endif /* NFM */
 
 #ifdef DEBUG
-    strcat(optstring, "d:");
+    optstring += "d:";
 #endif /* DEBUG */
 
     int foreground = 0;  // daemonize
     int do_syslog = 1;
 
-    while ((opt = getopt(argc, argv, optstring)) != -1) {
+    while ((opt = getopt(argc, argv, optstring.c_str())) != -1) {
         switch (opt) {
 #ifdef NFM
             case 'Q':
@@ -881,6 +887,15 @@ int main(int argc, char* argv[]) {
                 error();
             }
         }
+#ifdef WITH_RDIO_SCANNER
+        if (root.exists("rdio_scanner_queue_depth")) {
+            rdio_scanner_queue_depth = (int)root["rdio_scanner_queue_depth"];
+            if (rdio_scanner_queue_depth <= 0) {
+                cerr << "Configuration error: rdio_scanner_queue_depth must be greater than 0\n";
+                error();
+            }
+        }
+#endif /* WITH_RDIO_SCANNER */
 #ifdef NFM
         if (root.exists("tau"))
             alpha = ((int)root["tau"] == 0 ? 0.0f : exp(-1.0f / (WAVE_RATE * 1e-6 * (int)root["tau"])));

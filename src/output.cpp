@@ -993,7 +993,7 @@ void* output_thread(void* param) {
                 for (int j = 0; j < dev->channel_count; j++) {
                     channel_t* channel = devices[i].channels + j;
                     process_outputs(channel, new_freq);
-                    memcpy(channel->waveout, channel->waveout + WAVE_BATCH, AGC_EXTRA * 4);
+                    memcpy(channel->waveout, channel->waveout + WAVE_BATCH, AGC_EXTRA * sizeof(float));
                 }
                 dev->waveavail = 0;
             }
@@ -1016,7 +1016,7 @@ void* output_thread(void* param) {
         for (int j = 0; j < dev->channel_count; j++) {
             channel_t* channel = devices[i].channels + j;
             process_outputs(channel, -1);
-            memcpy(channel->waveout, channel->waveout + WAVE_BATCH, AGC_EXTRA * 4);
+            memcpy(channel->waveout, channel->waveout + WAVE_BATCH, AGC_EXTRA * sizeof(float));
         }
         dev->waveavail = 0;
     }
