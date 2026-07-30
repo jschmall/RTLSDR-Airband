@@ -151,6 +151,89 @@ Keep the local delta small and well understood.
    new ones (`ResampleLinearTest`, plus mono/stereo `udp_stream_write()` cases with a configured
    rate). Also manually validated end-to-end: real binary, real UDP listener, `sample_rate` set
    to half `WAVE_RATE` — every received packet was exactly the expected halved byte count.
+10. **Icecast mountpoint buffer-overflow fix** (`src/output.cpp`, `src/helper_functions.{h,cpp}`)
+    — `shout_setup()` built the Icecast mountpoint into a fixed `char mp[100]` stack buffer via
+    `sprintf()`, with no length validation on the config-supplied `mountpoint` value. Replaced
+    with `std::string` built by a new `make_icecast_mountpoint()` helper, removing the
+    fixed-size buffer (and the overflow risk) entirely rather than adding an arbitrary cap.
+    Unit tested in `test_helper_functions.cpp`, including a 500-char mountpoint that would have
+    overflowed the old buffer.
+11. **UDP stream bounds checks are real, not `assert()`** (`src/udp_stream.cpp`) —
+    `udp_stream_write()`'s `len`-vs-buffer-size checks were `assert()`, which is stripped by
+    `-DNDEBUG` in the default `Release` build — the same bug class behind item 3's historical
+    4x-oversend incident had no runtime protection left in the binary that actually ships.
+    Replaced with real conditionals that log and drop the packet on a mismatch instead of
+    writing past the buffer. Verified the check still compiles in under a Release build.
+12. **rdio-scanner config validation for `timeout_ms`/`max_retries`** (`src/config.cpp`) —
+    `timeout_ms = 0` passed straight through to libcurl's `CURLOPT_TIMEOUT_MS`, where 0 means
+    "never time out," risking an indefinitely stuck worker thread; `max_retries < 0` silently
+    skipped the retry loop entirely instead of erroring, reporting every job "failed" without a
+    single upload attempt. Both are now rejected at config parse time, matching the validation
+    already in place for this block's other fields.
+13. **rdio-scanner worker shutdown is interruptible mid-retry** (`src/rdio_scanner.cpp`) — the
+    retry/backoff loop never checked the shutdown flag, so `rdio_scanner_shutdown()` could block
+    for the full duration of any in-progress retry (backoff sleep plus curl connect/transfer
+    timeout) — directly delaying the one-at-a-time systemd restarts this fork's deployment
+    relies on. A `CURLOPT_XFERINFOFUNCTION` progress callback now aborts an in-flight
+    `curl_easy_perform()` once shutdown is requested, and the retry backoff waits on the same
+    condvar the shutdown path signals instead of sleeping the full interval. A job already
+    in flight at shutdown always gets its first attempt; only further retries are skipped.
+14. **`channel_t::axcindicate`/`freq_idx`/`state` made atomic** (`src/rtl_airband.h`) — each is
+    written by one thread and read by others (demod/controller/mixer/output) with no lock or
+    atomic between them — a data race under the C++ memory model, even though it never caused a
+    torn read in practice on this project's target platforms. Switched to `std::atomic<T>`; the
+    implicit `T` conversion meant every existing call site needed zero changes.
+15. **`init_output()` checks `airlame_init()`/`malloc()` failures** (`src/rtl_airband.cpp`) —
+    previously returned `true` unconditionally even when LAME init or the `lamebuf` allocation
+    failed, which would silently leave `output->lame`/`lamebuf` null and crash the *next* time
+    the output thread tried to encode on that output, instead of failing cleanly at startup like
+    both call sites in `main()` already expect.
+16. **RTL-SDR tuning failures are now fatal** (`src/input-rtlsdr.cpp`) — `rtlsdr_init()` logged
+    failures from `rtlsdr_set_sample_rate()`/`rtlsdr_set_center_freq()`/
+    `rtlsdr_set_freq_correction()` but always returned success, so a device could report itself
+    initialized and start streaming while silently sampling the wrong rate or frequency. Now
+    returns `-1` on these three failures so `input_init()`'s existing fail-fast path
+    (`INPUT_FAILED` → `error()`) actually fires, matching how the runtime retune path already
+    handles the same failure.
+17. **System tests for Icecast and rdio-scanner outputs**
+    (`system_tests/helpers/fake_icecast_server.py`, `fake_rdio_scanner_server.py`,
+    `tests/test_icecast_output.py`, `tests/test_rdio_scanner_output.py`) — the only two output
+    types this fork's production deployment actually uses had no end-to-end coverage. Getting
+    the fake Icecast fixture working surfaced two real libshout protocol quirks (documented
+    inline): it needs `Connection: Keep-Alive` echoed back or it won't stream, and it always
+    sends a second `Authorization`-bearing request on the same connection regardless of how the
+    first was answered.
+18. **`rdio_scanner` rejected on `R_SCAN` channels at config time** (`src/config.cpp`) — an
+    `R_SCAN` channel's `talkgroup_id`/`system_id`/labels are fixed at config time, but its
+    actual frequency changes at runtime as it scans — so every scanned frequency's completed
+    transmission would silently upload under one static, near-certainly-wrong `talkgroup_id`.
+    This was already a documented limitation (see item 4); this makes the parser actually
+    enforce it instead of relying on the docs alone, by threading `dev->mode` through to
+    `parse_outputs()`.
+19. **Structured JSON logging (`-j`)** (`src/logging.{h,cpp}`) — opt-in flag that switches
+    `log()` from plain-text `vsyslog`/`vfprintf` output to one JSON object per line
+    (`{timestamp, level, pid, message}`), to whichever destination was already configured.
+    Makes correlating log lines across this fork's ~12 concurrent instances in a central
+    pipeline (Loki/ELK/journald) a field lookup instead of a regex. Plain text remains the
+    default. `build_json_log_line()` is a pure function, unit tested directly, including
+    escaping of quotes/backslashes/newlines/control characters.
+20. **Unit tests for `util.cpp`/`mixer.cpp` pure functions** (`src/test_util.cpp`,
+    `src/test_mixer.cpp`) — `delta_sec()`, `atofs()`, the `sincosf` LUT,
+    `dBFS_to_level()`/`level_to_dBFS()`, and `mixer.cpp`'s `mix_waveforms()` had no coverage.
+    Most of the rest of these files (and `output.cpp`/`rtl_airband.cpp`/`config.cpp`) is tightly
+    coupled to threading, real sockets/files, or `libconfig::Setting` and isn't a good
+    unit-test target without a larger refactor — this extracts what was already genuinely pure.
+21. **Four small magic-number/fragility cleanups** — `rdio_scanner`'s hardcoded
+    `MAX_QUEUE_DEPTH = 64` is now a validated `rdio_scanner_queue_depth` config option
+    (`src/rdio_scanner.cpp`); two `memcpy()` calls in `src/output.cpp` used a hardcoded float
+    size of `4` instead of `sizeof(float)`; `LAMEBUF_SIZE` (`src/rtl_airband.h`) was a flat
+    `22000` marked `// todo: calculate` — tracing actual usage found the real worst case is
+    `LameTone`'s 1-second silence marker (`WAVE_RATE` samples in one
+    `lame_encode_buffer_ieee_float()` call), and per LAME's own `1.25*num_samples + 7200`
+    formula the old value was actually **insufficient** on NFM builds
+    (`1.25*16000+7200 = 27200 > 22000`) — now computed from `WAVE_RATE`; and the `getopt()`
+    optstring in `src/rtl_airband.cpp` was a manually-sized `char[16]` grown with `strcat()` for
+    each conditional build flag, replaced with `std::string` to remove the silent-overflow risk.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
