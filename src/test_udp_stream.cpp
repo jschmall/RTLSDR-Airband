@@ -33,12 +33,6 @@
 
 using namespace std;
 
-// udp_stream.cpp calls XCALLOC (-> xcalloc), which is normally defined in util.cpp;
-// stub it here rather than link in util.cpp, which pulls in unrelated globals (fft_size).
-void* xcalloc(size_t nmemb, size_t size, const char*, const int, const char*) {
-    return calloc(nmemb, size);
-}
-
 // len passed to udp_stream_init()/udp_stream_write() is a sample count, not a byte
 // count - this test exists because a unit mismatch here once caused every packet
 // to carry 4x the intended payload (see src/udp_stream.cpp).
