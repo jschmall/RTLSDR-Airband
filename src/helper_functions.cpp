@@ -84,3 +84,7 @@ string make_dated_subdirs(const string& basedir, const struct tm* time) {
     // on any error return empty string
     return "";
 }
+
+string make_icecast_mountpoint(const string& mountpoint) {
+    return "/" + mountpoint;
+}
