@@ -78,6 +78,7 @@ static int devices_running = 0;
 int tui = 0;  // do not display textual user interface
 int shout_metadata_delay = 3;
 volatile int do_exit = 0;
+volatile sig_atomic_t reload_requested = 0;
 bool use_localtime = false;
 bool multiple_demod_threads = false;
 bool multiple_output_threads = false;
@@ -97,7 +98,12 @@ char* debug_path;
 #endif /* DEBUG */
 
 void sighandler(int sig) {
-    log(LOG_NOTICE, "Got signal %d, exiting\n", sig);
+    if (sig == SIGHUP) {
+        log(LOG_NOTICE, "Got SIGHUP, reloading (re-exec)\n");
+        reload_requested = 1;
+    } else {
+        log(LOG_NOTICE, "Got signal %d, exiting\n", sig);
+    }
     do_exit = 1;
 }
 
@@ -1174,5 +1180,19 @@ int main(int argc, char* argv[]) {
 #ifdef WITH_PROFILING
     ProfilerStop();
 #endif /* WITH_PROFILING */
+
+    if (reload_requested) {
+        // Re-exec rather than a true in-process reload: devices/channels/threads
+        // are torn down above exactly as for a normal exit, then this replaces
+        // the process image with a fresh instance (same argv, so the same -c
+        // config path gets re-read from disk) instead of actually exiting. Only
+        // reached once shutdown has fully completed, so there's no live state
+        // left to worry about carrying across the exec.
+        log(LOG_NOTICE, "Reload: re-executing %s\n", argv[0]);
+        execvp(argv[0], argv);
+        // execvp() only returns on failure
+        log(LOG_ERR, "Reload failed: execvp(%s): %s - exiting instead\n", argv[0], strerror(errno));
+    }
+
     return 0;
 }

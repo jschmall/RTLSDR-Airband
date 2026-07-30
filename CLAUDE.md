@@ -104,6 +104,20 @@ Keep the local delta small and well understood.
    right setting for trunkrecorder/TTD-style consumers, but end-to-end validation against a live
    consumer at the *correct* matching rate (16000, not 8000) is still outstanding.
    `bit_depth = 8` remains unit-tested only, not yet validated against a live consumer.
+7. **SIGHUP reload via re-exec** (`src/rtl_airband.cpp`) — SIGHUP previously mapped to the same
+   `do_exit` path as SIGINT/TERM/QUIT (a plain exit), meaning any config change across the ~12
+   concurrent instances required a manual, one-at-a-time restart. SIGHUP now still runs the exact
+   same clean-shutdown sequence (all devices/channels/threads torn down identically to a normal
+   exit), but instead of returning from `main()`, calls `execvp(argv[0], argv)` once shutdown has
+   fully completed, replacing the process image with a fresh instance under the same PID that
+   re-reads the same `-c` config path from disk. This is a re-exec, not a true in-process hot
+   reload — audio outputs still momentarily drop during the swap, same as a real restart, and a
+   non-foreground (self-daemonizing, no `-F`) invocation would double-fork again on every reload,
+   breaking PID-file-based tracking; this fork's actual deployment always uses `-F` (systemd
+   manages the process directly), so that path isn't hit in practice. Manually validated end-to-end
+   (not covered by an automated test): started the binary, sent `SIGHUP`, confirmed the same PID
+   persisted through a full shutdown+restart log sequence; separately confirmed `SIGTERM` still
+   exits normally without reloading.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
