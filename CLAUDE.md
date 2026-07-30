@@ -118,6 +118,21 @@ Keep the local delta small and well understood.
    (not covered by an automated test): started the binary, sent `SIGHUP`, confirmed the same PID
    persisted through a full shutdown+restart log sequence; separately confirmed `SIGTERM` still
    exits normally without reloading.
+8. **HTTP metrics endpoint** (`src/stats_http.cpp`, new) — `write_stats_file()` (`src/output.cpp`)
+   already writes Prometheus-format stats to `stats_filepath` every 15s, but only to a file,
+   requiring a textfile collector per host to scrape across the ~12 concurrent instances. Adds
+   two top-level config options, `stats_http_address` and `stats_http_port` (must be set
+   together, and require `stats_filepath` to also be set) — when present, a background thread
+   serves the *current* content of `stats_filepath` (read fresh off disk on every request) over
+   plain HTTP to any request on that address:port, regardless of method/path. Single-purpose and
+   deliberately minimal: no request parsing beyond discarding the bytes, one connection handled
+   at a time (a low-frequency Prometheus scrape target doesn't need concurrency), shutdown polls
+   a flag every 500ms rather than force-closing the listening socket from another thread (which
+   is racy on Linux). Unit tested end-to-end in `test_stats_http.cpp` (real sockets, real HTTP
+   GET, asserts on response content, confirms a second scrape reflects an updated file, confirms
+   `stats_http_shutdown()` is idempotent) and manually verified with `curl` against a live
+   instance. No new build dependency — plain POSIX sockets, unconditionally compiled in (unlike
+   `PULSEAUDIO`/`RDIO_SCANNER`, no `-D...=ON` flag needed).
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

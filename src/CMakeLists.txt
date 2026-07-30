@@ -302,6 +302,7 @@ add_library (rtl_airband_base OBJECT
 	logging.cpp
 	filters.cpp
 	helper_functions.cpp
+	stats_http.cpp
 	${CMAKE_CURRENT_BINARY_DIR}/version.cpp
 	${rtl_airband_extra_sources}
 	)
@@ -374,6 +375,7 @@ if(BUILD_UNITTESTS)
 		udp_stream.cpp
 		util.cpp
 		mixer.cpp
+		stats_http.cpp
 	)
 	if(WITH_RDIO_SCANNER)
 		list(APPEND TEST_FILES rdio_scanner.cpp)

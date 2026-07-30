@@ -406,6 +406,8 @@ extern bool use_localtime;
 extern bool multiple_demod_threads;
 extern bool multiple_output_threads;
 extern char* stats_filepath;
+extern char* stats_http_address;
+extern int stats_http_port;
 extern size_t fft_size, fft_size_log;
 extern int device_count, mixer_count;
 extern int shout_metadata_delay;
@@ -452,6 +454,10 @@ bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len);
 void udp_stream_write(udp_stream_data* sdata, const float* data, size_t len);
 void udp_stream_write(udp_stream_data* sdata, const float* data_left, const float* data_right, size_t len);
 void udp_stream_shutdown(udp_stream_data* sdata);
+
+// stats_http.cpp
+void stats_http_start();
+void stats_http_shutdown();
 
 #ifdef WITH_RDIO_SCANNER
 // rdio_scanner.cpp
