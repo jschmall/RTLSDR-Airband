@@ -106,16 +106,19 @@ int rtlsdr_init(input_t* const input) {
     int r = rtlsdr_set_sample_rate(rtl, input->sample_rate);
     if (r < 0) {
         log(LOG_ERR, "Failed to set sample rate for device #%d. Error %d.\n", dev_data->index, r);
+        return -1;
     }
 
     r = rtlsdr_set_center_freq(rtl, input->centerfreq);
     if (r < 0) {
         log(LOG_ERR, "Failed to set center freq for device #%d. Error %d.\n", dev_data->index, r);
+        return -1;
     }
 
     r = rtlsdr_set_freq_correction(rtl, dev_data->correction);
     if (r < 0 && r != -2) {
         log(LOG_ERR, "Failed to set freq correction for device #%d. Error %d.\n", dev_data->index, r);
+        return -1;
     }
 
     // Fitipower FC0012 gain needs to be initialized to its lowest value before setting it to the desired value
