@@ -300,12 +300,17 @@ Keep the local delta small and well understood.
     gives for `overflow_count`/`output_overrun_count`: they're tightly coupled to real network
     sockets, files, or PulseAudio/libcurl state, not pure logic. Verified instead by a full
     build + unit test pass across Debug, Debug+NFM, and `-DPULSEAUDIO=OFF` (all green).
-    **Found but did not fix, out of scope for this change**: `-DRDIO_SCANNER=OFF` currently
-    fails to build (`config.cpp`'s `parse_outputs()` has an unused `dev_mode` parameter under
-    `-Werror=unused-parameter` when `WITH_RDIO_SCANNER` is off) — a regression from item 18's
-    `dev_mode` threading, predating this session's changes (reproduced against the commit
-    before this item). `RDIO_SCANNER` defaults to `ON`, and CI doesn't build the `OFF`
-    configuration, so this had gone unnoticed.
+24. **`-DRDIO_SCANNER=OFF` build fix** (`src/config.cpp`) — flagged as found-but-not-fixed in
+    item 23: `parse_outputs()`'s `dev_mode` parameter (added by item 18) is only read inside an
+    `#ifdef WITH_RDIO_SCANNER` block, so it's unused — and thus a `-Werror=unused-parameter`
+    build failure — whenever `RDIO_SCANNER` is off. `RDIO_SCANNER` defaults to `ON` and CI
+    doesn't build the `OFF` configuration, so this had gone unnoticed since item 18. Fixed with
+    `(void)dev_mode;` guarded by the inverse `#ifndef WITH_RDIO_SCANNER`. Verified by configuring
+    and building a scratch `-DRDIO_SCANNER=OFF -DBUILD_UNITTESTS=TRUE` tree from clean (fails
+    without the fix, reproducing the exact reported error; builds and passes all 99 tests —
+    5 fewer than the `ON` build's 104, consistent with rdio_scanner-specific tests being
+    excluded — with it), and re-confirmed the default `RDIO_SCANNER=ON` Debug build still passes
+    all 104 tests unaffected.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

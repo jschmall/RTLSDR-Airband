@@ -32,6 +32,9 @@
 using namespace std;
 
 static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, int j, bool parsing_mixers, rec_modes dev_mode) {
+#ifndef WITH_RDIO_SCANNER
+    (void)dev_mode;
+#endif
     int oo = 0;
     for (int o = 0; o < channel->output_count; o++) {
         channel->outputs[oo].has_mp3_output = false;
