@@ -41,6 +41,7 @@ struct input_t {
     void* dev_data;
     size_t buf_size, bufs, bufe;
     size_t overflow_count;
+    size_t underrun_count;
     input_state_t state;
     sample_format_t sfmt;
     float fullscale;

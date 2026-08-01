@@ -88,3 +88,7 @@ string make_dated_subdirs(const string& basedir, const struct tm* time) {
 string make_icecast_mountpoint(const string& mountpoint) {
     return "/" + mountpoint;
 }
+
+double rusage_cpu_seconds(const struct rusage& ru) {
+    return (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6 + (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
+}

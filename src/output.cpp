@@ -21,6 +21,7 @@
 #include <ogg/ogg.h>
 #include <shout/shout.h>
 #include <stdio.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -871,6 +872,35 @@ static void output_device_buffer_overflows(FILE* f) {
     fprintf(f, "\n");
 }
 
+static void output_device_buffer_underruns(FILE* f) {
+    fprintf(f,
+            "# HELP buffer_underrun_count Number of times a device's demod loop found insufficient input "
+            "data to process a batch. Expected to increment frequently under healthy load, since the demod "
+            "thread normally waits on new samples between batches; a low/flat value alongside a climbing "
+            "buffer_overflow_count for the same device indicates the demod thread is CPU-saturated rather "
+            "than waiting on input.\n"
+            "# TYPE buffer_underrun_count counter\n");
+
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        fprintf(f, "buffer_underrun_count{device=\"%d\"}\t%zu\n", i, dev->input->underrun_count);
+    }
+    fprintf(f, "\n");
+}
+
+static void output_process_cpu_seconds(FILE* f) {
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        return;
+    }
+
+    fprintf(f,
+            "# HELP process_cpu_seconds_total Total user and system CPU time spent by this process, in seconds.\n"
+            "# TYPE process_cpu_seconds_total counter\n"
+            "process_cpu_seconds_total\t%.6f\n\n",
+            rusage_cpu_seconds(ru));
+}
+
 static void output_output_overruns(FILE* f) {
     fprintf(f,
             "# HELP output_overrun_count Number of times a device or mixer output has overrun.\n"
@@ -938,8 +968,10 @@ void write_stats_file(timeval* last_stats_write) {
     output_channel_ctcss_counter(file);
     output_channel_no_ctcss_counter(file);
     output_device_buffer_overflows(file);
+    output_device_buffer_underruns(file);
     output_output_overruns(file);
     output_input_overruns(file);
+    output_process_cpu_seconds(file);
 
     fclose(file);
 }

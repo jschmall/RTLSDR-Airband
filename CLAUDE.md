@@ -234,6 +234,30 @@ Keep the local delta small and well understood.
     (`1.25*16000+7200 = 27200 > 22000`) — now computed from `WAVE_RATE`; and the `getopt()`
     optstring in `src/rtl_airband.cpp` was a manually-sized `char[16]` grown with `strcat()` for
     each conditional build flag, replaced with `std::string` to remove the silent-overflow risk.
+22. **`buffer_underrun_count` metric and `process_cpu_seconds_total` metric** — added while
+    investigating whether output-overrun events on this fork's deployment are compute-bound or
+    USB/host-bound. `buffer_overflow_count` (the RX-thread-to-demod-thread ring buffer overflow
+    counter) only shows *that* the demod thread fell behind, not why. Two additions close that
+    diagnosability gap (they don't change *when* overruns happen, only what's observable about
+    them):
+    - `buffer_underrun_count{device}` (`src/rtl_airband.cpp`, the "not enough data yet" branch in
+      the demod loop; counter added to `input_t` in `src/input-common.h`, reset alongside
+      `overflow_count` in `src/config.cpp`) — counts how often the demod thread found insufficient
+      samples to process a batch and had to wait. This increments frequently under normal, healthy
+      load (the demod thread is *supposed* to spend time waiting between batches); read it as a
+      trend, not an absolute value — a device whose `buffer_underrun_count` goes flat while its
+      `buffer_overflow_count` climbs is the signature of the demod thread being CPU-saturated
+      rather than starved for USB input.
+    - `process_cpu_seconds_total` (`src/output.cpp`, `output_process_cpu_seconds()`, via
+      `getrusage(RUSAGE_SELF, ...)`) — standard Prometheus-convention cumulative process CPU time
+      (user+system seconds), so `rate()` over it in Grafana gives host CPU utilization
+      correlatable by timestamp against the overrun counters above, without cross-referencing
+      external host monitoring.
+    Both are exposed via the existing `write_stats_file()` / HTTP metrics endpoint (item 8) with
+    no new config options. The pure `rusage_cpu_seconds()` summation is unit tested in
+    `test_helper_functions.cpp`; the counters themselves follow the same untested-by-design
+    pattern as the pre-existing `overflow_count`/`output_overrun_count` (tightly coupled to
+    `device_t`/threading, not a good unit-test target — see item 20).
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

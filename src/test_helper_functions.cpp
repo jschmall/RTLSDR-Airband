@@ -19,6 +19,7 @@
 
 #include "test_base_class.h"
 
+#include <cstring>
 #include "helper_functions.h"
 
 using namespace std;
@@ -164,6 +165,24 @@ TEST_F(HelperFunctionsTest, make_dated_subdirs_fail) {
     strptime("2010-3-7", "%Y-%m-%d", &time_struct);
 
     EXPECT_EQ(make_dated_subdirs("/invalid/base/dir", &time_struct), "");
+}
+
+TEST_F(HelperFunctionsTest, rusage_cpu_seconds_combines_user_and_system_time) {
+    struct rusage ru;
+    memset(&ru, 0, sizeof(ru));
+    ru.ru_utime.tv_sec = 2;
+    ru.ru_utime.tv_usec = 500000;
+    ru.ru_stime.tv_sec = 1;
+    ru.ru_stime.tv_usec = 250000;
+
+    EXPECT_DOUBLE_EQ(rusage_cpu_seconds(ru), 3.75);
+}
+
+TEST_F(HelperFunctionsTest, rusage_cpu_seconds_zero) {
+    struct rusage ru;
+    memset(&ru, 0, sizeof(ru));
+
+    EXPECT_DOUBLE_EQ(rusage_cpu_seconds(ru), 0.0);
 }
 
 TEST_F(HelperFunctionsTest, make_dated_subdirs_some_exist) {

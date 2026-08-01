@@ -20,7 +20,8 @@
 #ifndef _HELPER_FUNCTIONS_H
 #define _HELPER_FUNCTIONS_H
 
-#include <ctime>  // struct tm
+#include <sys/resource.h>  // struct rusage
+#include <ctime>           // struct tm
 #include <string>
 
 bool dir_exists(const std::string& dir_path);
@@ -29,5 +30,6 @@ bool make_dir(const std::string& dir_path);
 bool make_subdirs(const std::string& basedir, const std::string& subdirs);
 std::string make_dated_subdirs(const std::string& basedir, const struct tm* time);
 std::string make_icecast_mountpoint(const std::string& mountpoint);
+double rusage_cpu_seconds(const struct rusage& ru);
 
 #endif /* _HELPER_FUNCTIONS_H */
