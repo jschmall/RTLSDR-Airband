@@ -527,6 +527,7 @@ void process_outputs(channel_t* channel, int cur_scan_freq) {
             int mp3_bytes = lame_encode_buffer_ieee_float(lame, channel->waveout, (channel->mode == MM_STEREO ? channel->waveout_r : NULL), WAVE_BATCH, lamebuf, LAMEBUF_SIZE);
             if (mp3_bytes < 0) {
                 log(LOG_WARNING, "lame_encode_buffer_ieee_float: %d\n", mp3_bytes);
+                channel->outputs[k].lame_encode_failure_count++;
             }
 
             if (mp3_bytes == 0) {
@@ -536,10 +537,13 @@ void process_outputs(channel_t* channel, int cur_scan_freq) {
             int ret = shout_send(icecast->shout, channel->outputs[k].lamebuf, mp3_bytes);
 
             if (ret != SHOUTERR_SUCCESS || shout_queuelen(icecast->shout) > MAX_SHOUT_QUEUELEN) {
-                if (shout_queuelen(icecast->shout) > MAX_SHOUT_QUEUELEN)
+                if (shout_queuelen(icecast->shout) > MAX_SHOUT_QUEUELEN) {
                     log(LOG_WARNING, "Exceeded max backlog for %s:%d/%s, disconnecting\n", icecast->hostname, icecast->port, icecast->mountpoint);
+                    icecast->backlog_exceeded_count++;
+                }
                 // reset connection
                 log(LOG_WARNING, "Lost connection to %s:%d/%s\n", icecast->hostname, icecast->port, icecast->mountpoint);
+                icecast->disconnect_count++;
                 shout_close(icecast->shout);
                 shout_free(icecast->shout);
                 icecast->shout = NULL;
@@ -583,6 +587,7 @@ void process_outputs(channel_t* channel, int cur_scan_freq) {
                 mp3_bytes = lame_encode_buffer_ieee_float(lame, channel->waveout, (channel->mode == MM_STEREO ? channel->waveout_r : NULL), WAVE_BATCH, lamebuf, LAMEBUF_SIZE);
                 if (mp3_bytes < 0) {
                     log(LOG_WARNING, "lame_encode_buffer_ieee_float: %d\n", mp3_bytes);
+                    channel->outputs[k].lame_encode_failure_count++;
                 }
 
                 if (mp3_bytes <= 0) {
@@ -603,6 +608,7 @@ void process_outputs(channel_t* channel, int cur_scan_freq) {
                     log(LOG_WARNING, "Cannot write to %s (%s), output disabled\n", fdata->file_path.c_str(), strerror(errno));
                 else
                     log(LOG_WARNING, "Short write on %s, output disabled\n", fdata->file_path.c_str());
+                fdata->write_failure_count++;
                 close_file(&channel->outputs[k]);
                 channel->outputs[k].enabled = false;
             }
@@ -936,6 +942,254 @@ static void output_input_overruns(FILE* f) {
     fprintf(f, "\n");
 }
 
+static void output_icecast_health(FILE* f) {
+    fprintf(f,
+            "# HELP icecast_disconnect_count Number of times an icecast output lost its connection "
+            "(network error, exceeded send backlog, or the owning device failing) and had to be "
+            "reconnected by output_check_thread.\n"
+            "# TYPE icecast_disconnect_count counter\n");
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        for (int j = 0; j < dev->channel_count; j++) {
+            channel_t* channel = dev->channels + j;
+            for (int k = 0; k < channel->output_count; k++) {
+                if (channel->outputs[k].type != O_ICECAST)
+                    continue;
+                icecast_data* icecast = (icecast_data*)channel->outputs[k].data;
+                fprintf(f, "icecast_disconnect_count{device=\"%d\",channel=\"%d\",output=\"%d\"}\t%zu\n", i, j, k, icecast->disconnect_count);
+            }
+        }
+    }
+    for (int i = 0; i < mixer_count; i++) {
+        mixer_t* mixer = mixers + i;
+        for (int k = 0; k < mixer->channel.output_count; k++) {
+            if (mixer->channel.outputs[k].type != O_ICECAST)
+                continue;
+            icecast_data* icecast = (icecast_data*)mixer->channel.outputs[k].data;
+            fprintf(f, "icecast_disconnect_count{mixer=\"%d\",output=\"%d\"}\t%zu\n", i, k, icecast->disconnect_count);
+        }
+    }
+    fprintf(f, "\n");
+
+    fprintf(f,
+            "# HELP icecast_backlog_exceeded_count Number of times an icecast output's send queue exceeded "
+            "MAX_SHOUT_QUEUELEN, forcing a disconnect. A subset of icecast_disconnect_count - specifically "
+            "the case where the local encode rate outpaced what Icecast could drain, rather than a network-level error.\n"
+            "# TYPE icecast_backlog_exceeded_count counter\n");
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        for (int j = 0; j < dev->channel_count; j++) {
+            channel_t* channel = dev->channels + j;
+            for (int k = 0; k < channel->output_count; k++) {
+                if (channel->outputs[k].type != O_ICECAST)
+                    continue;
+                icecast_data* icecast = (icecast_data*)channel->outputs[k].data;
+                fprintf(f, "icecast_backlog_exceeded_count{device=\"%d\",channel=\"%d\",output=\"%d\"}\t%zu\n", i, j, k, icecast->backlog_exceeded_count);
+            }
+        }
+    }
+    for (int i = 0; i < mixer_count; i++) {
+        mixer_t* mixer = mixers + i;
+        for (int k = 0; k < mixer->channel.output_count; k++) {
+            if (mixer->channel.outputs[k].type != O_ICECAST)
+                continue;
+            icecast_data* icecast = (icecast_data*)mixer->channel.outputs[k].data;
+            fprintf(f, "icecast_backlog_exceeded_count{mixer=\"%d\",output=\"%d\"}\t%zu\n", i, k, icecast->backlog_exceeded_count);
+        }
+    }
+    fprintf(f, "\n");
+}
+
+static void output_lame_encode_failures(FILE* f) {
+    fprintf(f,
+            "# HELP lame_encode_failure_count Number of times lame_encode_buffer_ieee_float() returned an "
+            "error for this output. Only emitted for outputs that actually encode mp3 (icecast, file).\n"
+            "# TYPE lame_encode_failure_count counter\n");
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        for (int j = 0; j < dev->channel_count; j++) {
+            channel_t* channel = dev->channels + j;
+            for (int k = 0; k < channel->output_count; k++) {
+                if (!channel->outputs[k].has_mp3_output)
+                    continue;
+                fprintf(f, "lame_encode_failure_count{device=\"%d\",channel=\"%d\",output=\"%d\"}\t%zu\n", i, j, k, channel->outputs[k].lame_encode_failure_count);
+            }
+        }
+    }
+    for (int i = 0; i < mixer_count; i++) {
+        mixer_t* mixer = mixers + i;
+        for (int k = 0; k < mixer->channel.output_count; k++) {
+            if (!mixer->channel.outputs[k].has_mp3_output)
+                continue;
+            fprintf(f, "lame_encode_failure_count{mixer=\"%d\",output=\"%d\"}\t%zu\n", i, k, mixer->channel.outputs[k].lame_encode_failure_count);
+        }
+    }
+    fprintf(f, "\n");
+}
+
+static void output_file_write_failures(FILE* f) {
+    fprintf(f,
+            "# HELP file_write_failure_count Number of times fwrite() on a file/rawfile output came up "
+            "short (disk full, I/O error). The output is disabled when this happens, so a healthy instance "
+            "should see this stay at 0.\n"
+            "# TYPE file_write_failure_count counter\n");
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        for (int j = 0; j < dev->channel_count; j++) {
+            channel_t* channel = dev->channels + j;
+            for (int k = 0; k < channel->output_count; k++) {
+                if (channel->outputs[k].type != O_FILE && channel->outputs[k].type != O_RAWFILE)
+                    continue;
+                file_data* fdata = (file_data*)channel->outputs[k].data;
+                fprintf(f, "file_write_failure_count{device=\"%d\",channel=\"%d\",output=\"%d\"}\t%zu\n", i, j, k, fdata->write_failure_count);
+            }
+        }
+    }
+    for (int i = 0; i < mixer_count; i++) {
+        mixer_t* mixer = mixers + i;
+        for (int k = 0; k < mixer->channel.output_count; k++) {
+            if (mixer->channel.outputs[k].type != O_FILE && mixer->channel.outputs[k].type != O_RAWFILE)
+                continue;
+            file_data* fdata = (file_data*)mixer->channel.outputs[k].data;
+            fprintf(f, "file_write_failure_count{mixer=\"%d\",output=\"%d\"}\t%zu\n", i, k, fdata->write_failure_count);
+        }
+    }
+    fprintf(f, "\n");
+}
+
+static void output_udp_stream_drops(FILE* f) {
+    fprintf(f,
+            "# HELP udp_stream_dropped_packet_count Number of packets dropped by udp_stream's bounds "
+            "checks (a mismatch between the computed length and the pre-sized send buffer).\n"
+            "# TYPE udp_stream_dropped_packet_count counter\n");
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        for (int j = 0; j < dev->channel_count; j++) {
+            channel_t* channel = dev->channels + j;
+            for (int k = 0; k < channel->output_count; k++) {
+                if (channel->outputs[k].type != O_UDP_STREAM)
+                    continue;
+                udp_stream_data* sdata = (udp_stream_data*)channel->outputs[k].data;
+                fprintf(f, "udp_stream_dropped_packet_count{device=\"%d\",channel=\"%d\",output=\"%d\"}\t%zu\n", i, j, k, sdata->dropped_packet_count);
+            }
+        }
+    }
+    for (int i = 0; i < mixer_count; i++) {
+        mixer_t* mixer = mixers + i;
+        for (int k = 0; k < mixer->channel.output_count; k++) {
+            if (mixer->channel.outputs[k].type != O_UDP_STREAM)
+                continue;
+            udp_stream_data* sdata = (udp_stream_data*)mixer->channel.outputs[k].data;
+            fprintf(f, "udp_stream_dropped_packet_count{mixer=\"%d\",output=\"%d\"}\t%zu\n", i, k, sdata->dropped_packet_count);
+        }
+    }
+    fprintf(f, "\n");
+}
+
+#ifdef WITH_PULSEAUDIO
+static void output_pulse_health(FILE* f) {
+    fprintf(f,
+            "# HELP pulse_underflow_count Number of times a PulseAudio output stream underflowed "
+            "(server drained the buffer faster than we fed it - normal on squelch closing).\n"
+            "# TYPE pulse_underflow_count counter\n");
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        for (int j = 0; j < dev->channel_count; j++) {
+            channel_t* channel = dev->channels + j;
+            for (int k = 0; k < channel->output_count; k++) {
+                if (channel->outputs[k].type != O_PULSE)
+                    continue;
+                pulse_data* pdata = (pulse_data*)channel->outputs[k].data;
+                fprintf(f, "pulse_underflow_count{device=\"%d\",channel=\"%d\",output=\"%d\"}\t%zu\n", i, j, k, pdata->underflow_count);
+            }
+        }
+    }
+    for (int i = 0; i < mixer_count; i++) {
+        mixer_t* mixer = mixers + i;
+        for (int k = 0; k < mixer->channel.output_count; k++) {
+            if (mixer->channel.outputs[k].type != O_PULSE)
+                continue;
+            pulse_data* pdata = (pulse_data*)mixer->channel.outputs[k].data;
+            fprintf(f, "pulse_underflow_count{mixer=\"%d\",output=\"%d\"}\t%zu\n", i, k, pdata->underflow_count);
+        }
+    }
+    fprintf(f, "\n");
+
+    fprintf(f,
+            "# HELP pulse_overflow_count Number of times a PulseAudio output stream overflowed "
+            "(we fed data faster than the server drained it).\n"
+            "# TYPE pulse_overflow_count counter\n");
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        for (int j = 0; j < dev->channel_count; j++) {
+            channel_t* channel = dev->channels + j;
+            for (int k = 0; k < channel->output_count; k++) {
+                if (channel->outputs[k].type != O_PULSE)
+                    continue;
+                pulse_data* pdata = (pulse_data*)channel->outputs[k].data;
+                fprintf(f, "pulse_overflow_count{device=\"%d\",channel=\"%d\",output=\"%d\"}\t%zu\n", i, j, k, pdata->overflow_count);
+            }
+        }
+    }
+    for (int i = 0; i < mixer_count; i++) {
+        mixer_t* mixer = mixers + i;
+        for (int k = 0; k < mixer->channel.output_count; k++) {
+            if (mixer->channel.outputs[k].type != O_PULSE)
+                continue;
+            pulse_data* pdata = (pulse_data*)mixer->channel.outputs[k].data;
+            fprintf(f, "pulse_overflow_count{mixer=\"%d\",output=\"%d\"}\t%zu\n", i, k, pdata->overflow_count);
+        }
+    }
+    fprintf(f, "\n");
+
+    fprintf(f,
+            "# HELP pulse_disconnect_count Number of times a PulseAudio output stream's write path "
+            "(latency check or pa_stream_write()) forced a disconnect.\n"
+            "# TYPE pulse_disconnect_count counter\n");
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        for (int j = 0; j < dev->channel_count; j++) {
+            channel_t* channel = dev->channels + j;
+            for (int k = 0; k < channel->output_count; k++) {
+                if (channel->outputs[k].type != O_PULSE)
+                    continue;
+                pulse_data* pdata = (pulse_data*)channel->outputs[k].data;
+                fprintf(f, "pulse_disconnect_count{device=\"%d\",channel=\"%d\",output=\"%d\"}\t%zu\n", i, j, k, pdata->disconnect_count);
+            }
+        }
+    }
+    for (int i = 0; i < mixer_count; i++) {
+        mixer_t* mixer = mixers + i;
+        for (int k = 0; k < mixer->channel.output_count; k++) {
+            if (mixer->channel.outputs[k].type != O_PULSE)
+                continue;
+            pulse_data* pdata = (pulse_data*)mixer->channel.outputs[k].data;
+            fprintf(f, "pulse_disconnect_count{mixer=\"%d\",output=\"%d\"}\t%zu\n", i, k, pdata->disconnect_count);
+        }
+    }
+    fprintf(f, "\n");
+}
+#endif /* WITH_PULSEAUDIO */
+
+#ifdef WITH_RDIO_SCANNER
+static void output_rdio_scanner_health(FILE* f) {
+    fprintf(f,
+            "# HELP rdio_scanner_queue_drop_count Number of completed transmissions dropped because the "
+            "shared upload queue (rdio_scanner_queue_depth) was full. Process-wide: every rdio_scanner-"
+            "configured output shares one upload queue and worker thread.\n"
+            "# TYPE rdio_scanner_queue_drop_count counter\n"
+            "rdio_scanner_queue_drop_count\t%zu\n\n",
+            rdio_scanner_queue_drop_count.load());
+
+    fprintf(f,
+            "# HELP rdio_scanner_upload_failure_count Number of uploads that failed after exhausting "
+            "max_retries. Process-wide, same reason as rdio_scanner_queue_drop_count.\n"
+            "# TYPE rdio_scanner_upload_failure_count counter\n"
+            "rdio_scanner_upload_failure_count\t%zu\n\n",
+            rdio_scanner_upload_failure_count.load());
+}
+#endif /* WITH_RDIO_SCANNER */
+
 void write_stats_file(timeval* last_stats_write) {
     if (!stats_filepath) {
         return;
@@ -972,6 +1226,16 @@ void write_stats_file(timeval* last_stats_write) {
     output_output_overruns(file);
     output_input_overruns(file);
     output_process_cpu_seconds(file);
+    output_icecast_health(file);
+    output_lame_encode_failures(file);
+    output_file_write_failures(file);
+    output_udp_stream_drops(file);
+#ifdef WITH_PULSEAUDIO
+    output_pulse_health(file);
+#endif /* WITH_PULSEAUDIO */
+#ifdef WITH_RDIO_SCANNER
+    output_rdio_scanner_health(file);
+#endif /* WITH_RDIO_SCANNER */
 
     fclose(file);
 }
@@ -1076,6 +1340,7 @@ void* output_check_thread(void*) {
                         if (dev->input->state == INPUT_FAILED) {
                             if (icecast->shout) {
                                 log(LOG_WARNING, "Device #%d failed, disconnecting stream %s:%d/%s\n", i, icecast->hostname, icecast->port, icecast->mountpoint);
+                                icecast->disconnect_count++;
                                 shout_close(icecast->shout);
                                 shout_free(icecast->shout);
                                 icecast->shout = NULL;

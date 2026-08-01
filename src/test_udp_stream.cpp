@@ -192,11 +192,30 @@ TEST_F(UdpStreamTest, mono_s16le_oversized_len_does_not_overflow_buffer) {
     float oversized_data[len * 10];
     for (size_t i = 0; i < len * 10; ++i)
         oversized_data[i] = 0.5f;
+    ASSERT_EQ(sdata.dropped_packet_count, 0u);
     udp_stream_write(&sdata, oversized_data, len * 10);
 
     int16_t received[len * 10 + 100];
     ssize_t bytes = recv_packet(received, sizeof(received));
     EXPECT_EQ(bytes, -1);  // nothing sent - the write was dropped, not truncated or overflowed
+    EXPECT_EQ(sdata.dropped_packet_count, 1u);
+}
+
+TEST_F(UdpStreamTest, mono_s8_oversized_len_does_not_overflow_buffer) {
+    const size_t len = 4;
+    sdata.format = STREAM_FORMAT_S8;
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_MONO, len));
+
+    float oversized_data[len * 10];
+    for (size_t i = 0; i < len * 10; ++i)
+        oversized_data[i] = 0.5f;
+    ASSERT_EQ(sdata.dropped_packet_count, 0u);
+    udp_stream_write(&sdata, oversized_data, len * 10);
+
+    int8_t received[len * 10 + 100];
+    ssize_t bytes = recv_packet(received, sizeof(received));
+    EXPECT_EQ(bytes, -1);  // nothing sent - the write was dropped, not truncated or overflowed
+    EXPECT_EQ(sdata.dropped_packet_count, 1u);
 }
 
 TEST_F(UdpStreamTest, stereo_oversized_len_does_not_overflow_buffer) {
@@ -209,11 +228,13 @@ TEST_F(UdpStreamTest, stereo_oversized_len_does_not_overflow_buffer) {
         left[i] = 0.5f;
         right[i] = -0.5f;
     }
+    ASSERT_EQ(sdata.dropped_packet_count, 0u);
     udp_stream_write(&sdata, left, right, len * 10);
 
     float received[len * 20 + 100];
     ssize_t bytes = recv_packet(received, sizeof(received));
     EXPECT_EQ(bytes, -1);  // nothing sent - the write was dropped, not truncated or overflowed
+    EXPECT_EQ(sdata.dropped_packet_count, 1u);
 }
 
 TEST_F(UdpStreamTest, stereo_s8_sends_exact_interleaved_byte_count) {

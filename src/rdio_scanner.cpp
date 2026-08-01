@@ -31,6 +31,8 @@
 #include "rtl_airband.h"
 
 bool rdio_scanner_enabled = false;
+std::atomic<size_t> rdio_scanner_queue_drop_count{0};
+std::atomic<size_t> rdio_scanner_upload_failure_count{0};
 
 namespace {
 
@@ -158,6 +160,7 @@ void process_job(const rdio_scanner_job& job) {
         }
     } else {
         log(LOG_WARNING, "rdio_scanner: failed to upload %s after %d attempt(s), http=%ld: %s\n", job.file_path.c_str(), job.config.max_retries + 1, http_code, response.c_str());
+        rdio_scanner_upload_failure_count++;
     }
 }
 
@@ -250,6 +253,7 @@ void rdio_scanner_enqueue(rdio_scanner_data* config, const std::string& file_pat
     if (job_queue.size() >= (size_t)rdio_scanner_queue_depth) {
         log(LOG_WARNING, "rdio_scanner: upload queue full (%zu), dropping oldest job for %s\n", job_queue.size(), job_queue.front().file_path.c_str());
         job_queue.pop_front();
+        rdio_scanner_queue_drop_count++;
     }
     job_queue.push_back(job);
     pthread_cond_signal(&queue_cond);

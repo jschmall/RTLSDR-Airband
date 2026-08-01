@@ -217,6 +217,7 @@ void udp_stream_write(udp_stream_data* sdata, const float* data, size_t len) {
         case STREAM_FORMAT_S16LE: {
             if (len > sdata->convert_buffer_len) {
                 log(LOG_ERR, "udp_stream: len %zu exceeds S16LE convert buffer size %zu, dropping packet\n", len, sdata->convert_buffer_len);
+                sdata->dropped_packet_count++;
                 return;
             }
             int16_t* buf = (int16_t*)sdata->convert_buffer;
@@ -229,6 +230,7 @@ void udp_stream_write(udp_stream_data* sdata, const float* data, size_t len) {
         case STREAM_FORMAT_S8: {
             if (len > sdata->convert_buffer_len) {
                 log(LOG_ERR, "udp_stream: len %zu exceeds S8 convert buffer size %zu, dropping packet\n", len, sdata->convert_buffer_len);
+                sdata->dropped_packet_count++;
                 return;
             }
             int8_t* buf = (int8_t*)sdata->convert_buffer;
@@ -257,6 +259,7 @@ void udp_stream_write(udp_stream_data* sdata, const float* data_left, const floa
         }
         if (len * 2 > sdata->stereo_buffer_len) {
             log(LOG_ERR, "udp_stream: len %zu exceeds stereo buffer size %zu, dropping packet\n", len * 2, sdata->stereo_buffer_len);
+            sdata->dropped_packet_count++;
             return;
         }
         for (size_t i = 0; i < len; ++i) {

@@ -61,12 +61,14 @@ void pulse_shutdown(pulse_data* pdata) {
 
 static void pulse_stream_underflow_cb(pa_stream*, void* userdata) {
     pulse_data* pdata = (pulse_data*)userdata;
+    pdata->underflow_count++;
     if (pdata->continuous)  // do not flood the logs on every squelch closing
         log(LOG_INFO, "pulse: %s: stream \"%s\": underflow\n", SERVER_IFNOTNULL(pdata->server), pdata->stream_name);
 }
 
 static void pulse_stream_overflow_cb(pa_stream*, void* userdata) {
     pulse_data* pdata = (pulse_data*)userdata;
+    pdata->overflow_count++;
     log(LOG_INFO, "pulse: %s: stream \"%s\": overflow\n", SERVER_IFNOTNULL(pdata->server), pdata->stream_name);
 }
 
@@ -214,16 +216,19 @@ static int pulse_write_single_stream(pa_stream* stream, pulse_data* pdata, const
         lret = pa_stream_get_latency(stream, &latency, NULL);
         if (lret < 0) {
             log(LOG_WARNING, "pulse: %s: failed to get latency info for stream \"%s\" (error is: %s), disconnecting\n", SERVER_IFNOTNULL(pdata->server), pdata->stream_name, pa_strerror(lret));
+            pdata->disconnect_count++;
             goto end;
         }
         if (latency > PULSE_STREAM_LATENCY_LIMIT) {
             log(LOG_INFO, "pulse: %s: exceeded max backlog for stream \"%s\", disconnecting\n", SERVER_IFNOTNULL(pdata->server), pdata->stream_name);
+            pdata->disconnect_count++;
             goto end;
         }
         debug_bulk_print("pulse: %s: stream=\"%s\" lret=%d latency=%f ms\n", SERVER_IFNOTNULL(pdata->server), pdata->stream_name, lret, (float)latency / 1000.0f);
     }
     if (pa_stream_write(stream, data, len, NULL, 0LL, PA_SEEK_RELATIVE) < 0) {
         log(LOG_WARNING, "pulse: %s: could not write to stream \"%s\", disconnecting\n", SERVER_IFNOTNULL(pdata->server), pdata->stream_name);
+        pdata->disconnect_count++;
         goto end;
     }
     ret = 0;

@@ -258,6 +258,54 @@ Keep the local delta small and well understood.
     `test_helper_functions.cpp`; the counters themselves follow the same untested-by-design
     pattern as the pre-existing `overflow_count`/`output_overrun_count` (tightly coupled to
     `device_t`/threading, not a good unit-test target — see item 20).
+23. **Failure/health counters for every output type** — item 22 covered the input side
+    (RX→demod ring buffer) and process CPU; this extends the same "log it to the stats file,
+    not just syslog" treatment to the output side, where several failure paths were previously
+    log-only. New per-output counters, all zero-initialized for free (the structs below are
+    either `XCALLOC`'d or `new`'d with no user constructor, so no explicit reset code was
+    needed anywhere), all exposed via `write_stats_file()` with `device`/`channel`/`output` or
+    `mixer`/`output` labels (icecast is also usable on mixer outputs — confirmed by checking
+    `parse_outputs()` and `output_thread()`'s mixer loop):
+    - `icecast_disconnect_count` / `icecast_backlog_exceeded_count` (`icecast_data` in
+      `src/rtl_airband.h`; incremented in `src/output.cpp`'s `process_outputs()` on connection
+      loss, and in `output_check_thread()` when the owning device fails). Backlog-exceeded is a
+      subset of disconnect — called out separately since it means the local encode rate
+      outpaced Icecast, not a network error.
+    - `lame_encode_failure_count` (added to `output_t` itself, since both the icecast and file
+      encode paths already share `output_t.lame`/`lamebuf`) — increments wherever
+      `lame_encode_buffer_ieee_float()` returns negative. Deliberately does not cover the
+      one-shot `LameTone` silence-marker encode at file-open time (item 21's `LAMEBUF_SIZE`
+      fix): that path uses its own throwaway `lame_t`, not an `output_t`, and is a rare
+      startup event already logged, not part of steady-state monitoring.
+    - `file_write_failure_count` (`file_data` in `src/rtl_airband.h`) — increments on a short
+      `fwrite()`/`ferror()` in `process_outputs()`; the output is disabled immediately after,
+      so a healthy instance should see this stay at 0.
+    - `udp_stream_dropped_packet_count` (`udp_stream_data`) — increments at all three
+      bounds-check drop sites added in item 11. Also **added test coverage that was missing**:
+      `test_udp_stream.cpp` had oversized-length tests for the S16LE and stereo-float bounds
+      checks but none for the S8 path; added `mono_s8_oversized_len_does_not_overflow_buffer`
+      and asserted the new counter on all three existing/added oversized-length tests.
+    - `pulse_underflow_count` / `pulse_overflow_count` / `pulse_disconnect_count`
+      (`pulse_data`) — the first two increment in the existing PulseAudio underflow/overflow
+      callbacks; disconnect_count increments at the three write-path failure sites in
+      `pulse_write_single_stream()` (latency-check failure, backlog-exceeded, write failure).
+      Guarded by `#ifdef WITH_PULSEAUDIO` throughout, matching the existing pattern for this
+      build option.
+    - `rdio_scanner_queue_drop_count` / `rdio_scanner_upload_failure_count` — process-wide
+      `std::atomic<size_t>` (not per-output), because the upload queue and its worker thread
+      in `src/rdio_scanner.cpp` are already shared by every `rdio_scanner`-configured output;
+      increments at the existing queue-full drop-oldest site and the existing
+      max-retries-exhausted log site. Guarded by `#ifdef WITH_RDIO_SCANNER`.
+    None of these are unit tested beyond the udp_stream case above, for the same reason item 22
+    gives for `overflow_count`/`output_overrun_count`: they're tightly coupled to real network
+    sockets, files, or PulseAudio/libcurl state, not pure logic. Verified instead by a full
+    build + unit test pass across Debug, Debug+NFM, and `-DPULSEAUDIO=OFF` (all green).
+    **Found but did not fix, out of scope for this change**: `-DRDIO_SCANNER=OFF` currently
+    fails to build (`config.cpp`'s `parse_outputs()` has an unused `dev_mode` parameter under
+    `-Werror=unused-parameter` when `WITH_RDIO_SCANNER` is off) — a regression from item 18's
+    `dev_mode` threading, predating this session's changes (reproduced against the commit
+    before this item). `RDIO_SCANNER` defaults to `ON`, and CI doesn't build the `OFF`
+    configuration, so this had gone unnoticed.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

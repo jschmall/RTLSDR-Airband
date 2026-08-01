@@ -26,6 +26,41 @@ that tracks upstream `main` and carries a small delta on top of it:
 - **Assorted stability fixes** — buffer overflow, thread-safety, and error-handling
   fixes not yet merged upstream.
 
+### Metrics Exposed via the Stats Endpoint
+
+`stats_filepath` (and the HTTP metrics endpoint serving it) is written in Prometheus
+text-exposition format every 15 seconds. On top of upstream's per-channel signal/squelch
+metrics, this fork adds counters for diagnosing *why* a device or output is falling behind,
+rather than just knowing that it is.
+
+**Per-device input buffer** (label: `device`):
+| Metric | Meaning |
+|---|---|
+| `buffer_overflow_count` | RX thread overwrote I/Q samples the demod thread hadn't read yet — the demod thread is falling behind. |
+| `buffer_underrun_count` | Demod thread found insufficient samples to process a batch and had to wait. Expected to increment frequently under healthy load; a value that goes flat while `buffer_overflow_count` climbs for the same device is the signature of a CPU-saturated demod thread rather than USB/host starvation. |
+
+**Output handoff** (labels: `device` or `mixer`, plus `input` for mixer inputs):
+| Metric | Meaning |
+|---|---|
+| `output_overrun_count` | Demod (or mixer) thread produced a new batch before the output thread drained the previous one. |
+| `input_overrun_count` | A device fed a mixer input before the mixer thread consumed the prior contents. |
+
+**Per-output** (labels: `device`+`channel`+`output`, or `mixer`+`output`):
+| Metric | Meaning |
+|---|---|
+| `icecast_disconnect_count` | Icecast output's connection was lost (network error, exceeded send backlog, or the owning device failing) and had to be reconnected. |
+| `icecast_backlog_exceeded_count` | Subset of the above — specifically caused by the local encode rate outpacing what Icecast could drain. |
+| `lame_encode_failure_count` | `lame_encode_buffer_ieee_float()` returned an error, for any output that encodes mp3 (icecast, file). |
+| `file_write_failure_count` | Short/failed `fwrite()` on a file or rawfile output; the output is disabled immediately after, so this should stay at 0 on a healthy instance. |
+| `udp_stream_dropped_packet_count` | A `udp_stream` packet was dropped by a bounds check (length/buffer-size mismatch) instead of overrunning a buffer. |
+| `pulse_underflow_count` / `pulse_overflow_count` / `pulse_disconnect_count` | PulseAudio stream underflow/overflow, and disconnects forced by the write path (latency check or a failed write). Requires the `PULSEAUDIO` build option. |
+
+**Process-wide**:
+| Metric | Meaning |
+|---|---|
+| `process_cpu_seconds_total` | Cumulative user+system CPU time for this process (standard Prometheus convention — `rate()` this in Grafana to get CPU utilization, correlatable against the buffer/output counters above). |
+| `rdio_scanner_queue_drop_count` / `rdio_scanner_upload_failure_count` | Completed transmissions dropped because the shared upload queue was full, and uploads that failed after exhausting retries. Shared by every `rdio_scanner`-configured output (one upload queue/worker thread process-wide). Requires the `RDIO_SCANNER` build option. |
+
 ### Major / Minor Version Changes:
 
 Changes as of v5.1.0:

@@ -139,6 +139,13 @@ struct icecast_data {
     const char* description;
     bool send_scan_freq_tags;
     shout_t* shout;
+    // number of times this stream's connection was lost (network error or the
+    // owning device failing) and had to be torn down for output_check_thread to reconnect
+    size_t disconnect_count;
+    // number of times shout_queuelen() exceeded MAX_SHOUT_QUEUELEN, forcing a disconnect -
+    // a subset of disconnect_count, called out separately since it means the local
+    // encode rate outpaced what Icecast could drain, not a network-level failure
+    size_t backlog_exceeded_count;
 };
 
 #ifdef WITH_RDIO_SCANNER
@@ -191,6 +198,9 @@ struct file_data {
     timeval last_write_time;
     FILE* f;
     enum output_type type;
+    // number of times fwrite() on this output came up short (disk full, I/O error) -
+    // the output is disabled when this happens, so it should stay at 0 or 1 in practice
+    size_t write_failure_count;
 };
 
 struct udp_stream_data {
@@ -219,6 +229,10 @@ struct udp_stream_data {
     int send_socket;
     struct sockaddr dest_sockaddr;
     socklen_t dest_sockaddr_len;
+
+    // number of packets dropped by the bounds checks in udp_stream_write() (item 11 in
+    // CLAUDE.md - real checks, not assert(), so this can actually increment in a Release build)
+    size_t dropped_packet_count;
 };
 
 #ifdef WITH_PULSEAUDIO
@@ -232,6 +246,11 @@ struct pulse_data {
     pa_channel_map lmap, rmap;
     mix_modes mode;
     bool continuous;
+    size_t underflow_count;
+    size_t overflow_count;
+    // number of times the write path (latency check or pa_stream_write()) forced a
+    // disconnect - a subset of what PulseAudio itself would call an underflow/overflow
+    size_t disconnect_count;
 };
 #endif /* WITH_PULSEAUDIO */
 
@@ -254,6 +273,10 @@ struct output_t {
     // if `uses_mp3_output` is true
     lame_t lame;
     unsigned char* lamebuf;
+
+    // number of times lame_encode_buffer_ieee_float() returned a negative (error) code
+    // for this output; only meaningful when has_mp3_output is true
+    size_t lame_encode_failure_count;
 };
 
 struct freq_tag {
@@ -487,6 +510,10 @@ void stats_http_shutdown();
 #ifdef WITH_RDIO_SCANNER
 // rdio_scanner.cpp
 extern bool rdio_scanner_enabled;
+// process-wide, not per-output: the upload queue and its worker thread are shared by
+// every rdio_scanner-configured output, so these counters are too
+extern std::atomic<size_t> rdio_scanner_queue_drop_count;
+extern std::atomic<size_t> rdio_scanner_upload_failure_count;
 void rdio_scanner_start();
 void rdio_scanner_shutdown();
 void rdio_scanner_enqueue(rdio_scanner_data* config, const std::string& file_path, const timeval& open_time, int frequency);
