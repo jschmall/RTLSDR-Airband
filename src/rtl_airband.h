@@ -361,6 +361,23 @@ struct channel_t {
     int needs_raw_iq;
     int has_iq_outputs;
     std::atomic<ch_states> state;  // mixer channel state flag
+    // Live-disable flag for the dynamic_reload control socket. Read by the demod/output/
+    // controller threads with no lock, same rationale as axcindicate/freq_idx/state above - but
+    // unlike those, this is only ever WRITTEN by the output thread that owns this channel's
+    // outputs (device channels: the output thread serving that device; a mixer's own embedded
+    // channel: never toggled independently, see mixer_t::pending_enable_request instead), never
+    // directly by the control socket thread. Flipping it from another thread would race
+    // output_thread()'s own concurrent reads/writes to channel->outputs - see
+    // pending_enable_request below for how the control socket actually requests a change.
+    std::atomic<bool> enabled;
+    // Live enable/disable request from the dynamic_reload control socket: -1 = none pending,
+    // 0 = disable requested, 1 = enable requested. The control socket thread only ever stores
+    // into this (O(1), touches nothing else); output_thread() (src/output.cpp) polls and
+    // consumes it once per pass, in the same thread that already owns this channel's `enabled`
+    // flag and `outputs` array, so the actual channel_apply_enable()/channel_apply_disable()
+    // (src/live_reconfig.cpp) - which tear down/re-arm icecast, UDP, and pulse connections -
+    // never race that thread's own concurrent use of the same output_t structs.
+    std::atomic<int> pending_enable_request;
     int output_count;
     output_t* outputs;
     int highpass;  // highpass filter cutoff
@@ -386,6 +403,12 @@ struct device_t {
     pthread_mutex_t tag_queue_lock;
     int row;
     int failed;
+    // Live centerfreq retune request from the dynamic_reload control socket thread. -1 means no
+    // pending request. The demod thread that owns this device (and already exclusively owns
+    // bins/base_bins/dm_dphi for AFC's own in-place adjustments, see the AFC class above) polls
+    // and consumes this once per pass, so the actual bins/base_bins/dm_dphi recompute happens
+    // in-thread with plain assignments - no cross-thread synchronization needed on those fields.
+    std::atomic<int> pending_centerfreq_request;
     enum rec_modes mode;
     size_t output_overrun_count;
 };
@@ -403,6 +426,21 @@ struct mixinput_t {
 struct mixer_t {
     const char* name;
     bool enabled;
+    // Config-file "enabled = false" intent for the dynamic_reload control socket. `enabled`
+    // above is auto-managed by mixer_connect_input()/mixer_disable_input() and always becomes
+    // true as soon as any input connects, so a config-time "start disabled" request has to be
+    // applied as a post-parse step, after all channels' mixer outputs have connected - see
+    // main()'s call to mixer_disable() for every mixer with config_wants_disabled set, right
+    // after parse_devices() returns.
+    bool config_wants_disabled;
+    // Live enable/disable request from the dynamic_reload control socket: -1 = none pending,
+    // 0 = disable requested, 1 = enable requested. Same rationale as
+    // channel_t::pending_enable_request - `enabled`, `inputs_todo`/`input_mask`, and this
+    // mixer's own outputs are all touched by whichever output thread owns this mixer's range
+    // (output_thread(), src/output.cpp), so a mixer_enable()/mixer_disable() call from the
+    // control socket thread itself would race that thread's concurrent use of the same state.
+    // The control socket only ever stores into this; output_thread() polls and consumes it.
+    std::atomic<int> pending_enable_request;
     int interval;
     size_t output_overrun_count;
     int input_count;
@@ -450,6 +488,8 @@ extern bool multiple_output_threads;
 extern char* stats_filepath;
 extern char* stats_http_address;
 extern int stats_http_port;
+extern char* control_socket_path;
+extern char* cfgfile;
 #ifdef WITH_RDIO_SCANNER
 extern int rdio_scanner_queue_depth;
 #endif /* WITH_RDIO_SCANNER */
@@ -484,6 +524,15 @@ float level_to_dBFS(const float& level);
 mixer_t* getmixerbyname(const char* name);
 int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance);
 void mixer_disable_input(mixer_t* mixer, int input_idx);
+void mixer_enable_input(mixer_t* mixer, int input_idx);
+// mixer_disable()/mixer_enable() do the real work behind the dynamic_reload control socket's
+// mixer_disable/mixer_enable commands (and the shutdown-time/auto "all inputs died" path) - only
+// call these from the output thread that owns this mixer's range (output_thread(), output.cpp),
+// never directly from the control socket thread. See mixer_t::pending_enable_request and
+// live_reconfig.h's mixer_request_enable()/mixer_request_disable() for the thread-safe entry
+// point the control socket actually uses.
+void mixer_disable(mixer_t* mixer);
+void mixer_enable(mixer_t* mixer);
 void mixer_put_samples(mixer_t* mixer, int input_idx, const float* samples, bool has_signal, unsigned int len);
 void* mixer_thread(void* params);
 const char* mixer_get_error();

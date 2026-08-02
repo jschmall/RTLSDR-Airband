@@ -26,6 +26,26 @@ that tracks upstream `main` and carries a small delta on top of it:
 - **Assorted stability fixes** — buffer overflow, thread-safety, and error-handling
   fixes not yet merged upstream.
 
+### 🧪 On This Branch Only (`dynamic_reload`, not yet on `main`)
+
+This branch adds a live retune/reconfiguration control socket, so an operator can push
+config changes to a running instance without dropping the feed for a full restart. It's
+still soaking on a test instance before being considered for `main` — see
+[`CLAUDE.md`](CLAUDE.md) (fork-delta item 26) for the full design notes, scope, and known
+limitations.
+
+- **`control_socket_path`** — a same-host-only Unix domain socket (owner-only permissions)
+  that accepts one JSON command per line and returns one JSON response line:
+  `retune`, `set_gain`, `set_bandwidth`, `channel_enable`/`channel_disable`,
+  `mixer_enable`/`mixer_disable`, and `reload_diff` (re-reads the config file on disk and
+  live-applies whatever it safely can, reporting the rest as needing a restart).
+- **New `enabled = true/false` channel/mixer config keyword** — declare a channel or
+  mixer up front (optionally starting disabled) so it can be toggled live via the socket.
+  Adding a channel/mixer/device that wasn't in the original config still requires a
+  restart.
+- SIGHUP-triggered full reload (above) is unaffected and remains the fallback for any
+  change outside this feature's scope (e.g. sample rate, new devices).
+
 ### Metrics Exposed via the Stats Endpoint
 
 `stats_filepath` (and the HTTP metrics endpoint serving it) is written in Prometheus

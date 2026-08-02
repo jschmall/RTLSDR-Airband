@@ -192,6 +192,26 @@ int rtlsdr_set_centerfreq(input_t* const input, int const centerfreq) {
     return 0;
 }
 
+int rtlsdr_set_gain(input_t* const input, float const gain) {
+    rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
+    assert(dev_data->dev != NULL);
+
+    int target_gain = (int)(gain * 10.0f);  // dev_data->gain is tenths of a dB, same as parse_config
+    int nearest_gain = 0;
+    if (rtlsdr_nearest_gain(dev_data->dev, target_gain, &nearest_gain) != true) {
+        log(LOG_ERR, "Failed to read supported gain list for device #%d\n", dev_data->index);
+        return -1;
+    }
+    int r = rtlsdr_set_tuner_gain(dev_data->dev, nearest_gain);
+    if (r < 0) {
+        log(LOG_ERR, "Failed to set gain to %0.2f for device #%d: error %d\n", (float)nearest_gain / 10.f, dev_data->index, r);
+        return -1;
+    }
+    dev_data->gain = nearest_gain;
+    log(LOG_INFO, "Device #%d: gain set to %0.2f dB\n", dev_data->index, (float)nearest_gain / 10.f);
+    return 0;
+}
+
 int rtlsdr_parse_config(input_t* const input, libconfig::Setting& cfg) {
     rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
     if (cfg.exists("serial")) {
@@ -248,10 +268,14 @@ MODULE_EXPORT input_t* rtlsdr_input_new() {
     input->fullscale = (float)SCHAR_MAX - 0.5f;
     input->bytes_per_sample = sizeof(unsigned char);
     input->sample_rate = RTLSDR_DEFAULT_SAMPLE_RATE;
+    input->driver_type = "rtlsdr";
     input->parse_config = &rtlsdr_parse_config;
     input->init = &rtlsdr_init;
     input->run_rx_thread = &rtlsdr_rx_thread;
     input->set_centerfreq = &rtlsdr_set_centerfreq;
+    input->set_gain = &rtlsdr_set_gain;
+    // set_bandwidth intentionally left NULL - this driver has no tuner-bandwidth API call
+    // anywhere; input_set_bandwidth() will correctly report ENOTSUP for rtlsdr devices.
     input->stop = &rtlsdr_stop;
     return input;
 }

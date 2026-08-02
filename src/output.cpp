@@ -52,6 +52,7 @@
 #include "config.h"
 #include "helper_functions.h"
 #include "input-common.h"
+#include "live_reconfig.h"
 #include "rtl_airband.h"
 
 void shout_setup(icecast_data* icecast, mix_modes mixmode) {
@@ -486,11 +487,16 @@ static bool output_file_ready(channel_t* channel, output_t* output) {
         make_dir(output_dir);
     }
 
+    // A mixer's own channel_t has no freqlist (parse_mixers() never sets one - a mixed stream
+    // has no single source frequency), so channel->freqlist is NULL there; guard both uses
+    // below rather than dereferencing it unconditionally.
+    int const channel_frequency = (channel->freqlist != NULL) ? channel->freqlist[channel->freq_idx].frequency : 0;
+
     // use a string stream to build the output filepath
     std::stringstream ss;
     ss << output_dir << '/' << fdata->basename << timestamp;
     if (fdata->include_freq) {
-        ss << '_' << channel->freqlist[channel->freq_idx].frequency;
+        ss << '_' << channel_frequency;
     }
     ss << fdata->suffix;
     fdata->file_path = ss.str();
@@ -499,7 +505,7 @@ static bool output_file_ready(channel_t* channel, output_t* output) {
 
     fdata->open_time = fdata->last_write_time = current_time;
 #ifdef WITH_RDIO_SCANNER
-    fdata->open_frequency = channel->freqlist[channel->freq_idx].frequency;
+    fdata->open_frequency = channel_frequency;
 #endif /* WITH_RDIO_SCANNER */
 
     const int is_audio = output->type == O_RAWFILE ? 0 : 1;
@@ -513,6 +519,9 @@ static bool output_file_ready(channel_t* channel, output_t* output) {
 
 // Create all the output for a particular channel.
 void process_outputs(channel_t* channel, int cur_scan_freq) {
+    if (!channel->enabled) {
+        return;
+    }
     for (int k = 0; k < channel->output_count; k++) {
         if (channel->outputs[k].enabled == false)
             continue;
@@ -1258,6 +1267,16 @@ void* output_thread(void* param) {
     while (!do_exit) {
         output_param->mp3_signal->wait();
         for (int i = output_param->mixer_start; i < output_param->mixer_end; i++) {
+            // Consume any pending dynamic_reload enable/disable request before the enabled
+            // check below - this thread owns mixers[i]'s outputs, so applying the change here
+            // (rather than directly on the control socket thread) is what keeps it from racing
+            // this same thread's concurrent process_outputs() calls on the same output_t structs.
+            int pending = mixers[i].pending_enable_request.exchange(-1, std::memory_order_acq_rel);
+            if (pending == 1) {
+                mixer_enable(&mixers[i]);
+            } else if (pending == 0) {
+                mixer_disable(&mixers[i]);
+            }
             if (mixers[i].enabled == false)
                 continue;
             channel_t* channel = &mixers[i].channel;
@@ -1288,6 +1307,16 @@ void* output_thread(void* param) {
                 }
                 for (int j = 0; j < dev->channel_count; j++) {
                     channel_t* channel = devices[i].channels + j;
+                    // Consume any pending dynamic_reload enable/disable request before
+                    // process_outputs() - this thread owns this channel's outputs, so applying
+                    // the change here (rather than on the control socket thread) is what keeps
+                    // it from racing this same thread's concurrent process_outputs() calls.
+                    int pending = channel->pending_enable_request.exchange(-1, std::memory_order_acq_rel);
+                    if (pending == 1) {
+                        channel_apply_enable(channel);
+                    } else if (pending == 0) {
+                        channel_apply_disable(channel);
+                    }
                     process_outputs(channel, new_freq);
                     memcpy(channel->waveout, channel->waveout + WAVE_BATCH, AGC_EXTRA * sizeof(float));
                 }
@@ -1334,6 +1363,11 @@ void* output_check_thread(void*) {
         for (int i = 0; i < device_count; i++) {
             device_t* dev = devices + i;
             for (int j = 0; j < dev->channel_count; j++) {
+                if (!dev->channels[j].enabled) {
+                    // Live-disabled via the control socket - disable_channel_outputs() already
+                    // tore down its connections; don't reconnect them behind that command's back.
+                    continue;
+                }
                 for (int k = 0; k < dev->channels[j].output_count; k++) {
                     if (dev->channels[j].outputs[k].type == O_ICECAST) {
                         icecast_data* icecast = (icecast_data*)(dev->channels[j].outputs[k].data);

@@ -26,7 +26,8 @@
 #include <cstring>
 #include <iostream>
 #include <libconfig.h++>
-#include "input-common.h"  // input_t
+#include "input-common.h"   // input_t
+#include "live_reconfig.h"  // compute_channel_bin, compute_channel_dm_dphi
 #include "rtl_airband.h"
 
 using namespace std;
@@ -424,6 +425,12 @@ static int parse_channels(libconfig::Setting& chans, device_t* dev, int i) {
         channel->mode = MM_MONO;
         channel->freq_count = 1;
         channel->freq_idx = 0;
+        // "enabled" is distinct from "disable" above: "disable" skips this config entry entirely
+        // at parse time (no array slot allocated). "enabled" still allocates everything below
+        // (bins, dm_dphi, outputs) but starts the channel skipped by the hot loops, so the
+        // dynamic_reload control socket can flip it on live without any array resize.
+        channel->enabled = chans[j].exists("enabled") ? (bool)chans[j]["enabled"] : true;
+        channel->pending_enable_request = -1;
         channel->highpass = chans[j].exists("highpass") ? (int)chans[j]["highpass"] : 100;
         channel->lowpass = chans[j].exists("lowpass") ? (int)chans[j]["lowpass"] : 2500;
 #ifdef NFM
@@ -766,8 +773,7 @@ static int parse_channels(libconfig::Setting& chans, device_t* dev, int i) {
         channel->outputs = (output_t*)XREALLOC(channel->outputs, outputs_enabled * sizeof(struct output_t));
         channel->output_count = outputs_enabled;
 
-        dev->base_bins[jj] = dev->bins[jj] =
-            (size_t)ceil((channel->freqlist[0].frequency + dev->input->sample_rate - dev->input->centerfreq) / (double)(dev->input->sample_rate / fft_size) - 1.0) % fft_size;
+        dev->base_bins[jj] = dev->bins[jj] = compute_channel_bin(channel->freqlist[0].frequency, dev->input->centerfreq, dev->input->sample_rate, fft_size);
         debug_print("bins[%d]: %zu\n", jj, dev->bins[jj]);
 
 #ifdef NFM
@@ -782,35 +788,10 @@ static int parse_channels(libconfig::Setting& chans, device_t* dev, int i) {
         if (channel->needs_raw_iq) {
             // Downmixing is done only for NFM and raw IQ outputs. It's not critical to have some residual
             // freq offset in AM, as it doesn't affect sound quality significantly.
-            double dm_dphi = (double)(channel->freqlist[0].frequency - dev->input->centerfreq);  // downmix freq in Hz
-
-            // In general, sample_rate is not required to be an integer multiple of WAVE_RATE.
-            // However the FFT window may only slide by an integer number of input samples. A non-zero rounding error
-            // introduces additional phase rotation which we have to compensate in order to shift the channel of interest
-            // to the center of the spectrum of the output I/Q stream. This is important for correct NFM demodulation.
-            // The error value (in Hz):
-            // - has an absolute value 0..WAVE_RATE/2
-            // - is linear with the error introduced by rounding the value of sample_rate/WAVE_RATE to the nearest integer
-            //   (range of -0.5..0.5)
-            // - is linear with the distance between center frequency and the channel frequency, normalized to 0..1
-            double decimation_factor = ((double)dev->input->sample_rate / (double)WAVE_RATE);
-            double dm_dphi_correction = (double)WAVE_RATE / 2.0;
-            dm_dphi_correction *= (decimation_factor - round(decimation_factor));
-            dm_dphi_correction *= (double)(channel->freqlist[0].frequency - dev->input->centerfreq) / ((double)dev->input->sample_rate / 2.0);
-
-            debug_print("dev[%d].chan[%d]: dm_dphi: %f Hz dm_dphi_correction: %f Hz\n", i, jj, dm_dphi, dm_dphi_correction);
-            dm_dphi -= dm_dphi_correction;
-            debug_print("dev[%d].chan[%d]: dm_dphi_corrected: %f Hz\n", i, jj, dm_dphi);
-            // Normalize
-            dm_dphi /= (double)WAVE_RATE;
-            // Unalias it, to prevent overflow of int during cast
-            dm_dphi -= trunc(dm_dphi);
-            debug_print("dev[%d].chan[%d]: dm_dphi_normalized=%f\n", i, jj, dm_dphi);
-            // Translate this to uint32_t range 0x00000000-0x00ffffff
-            dm_dphi *= 256.0 * 65536.0;
-            // Cast it to signed int first, because casting negative float to uint is not portable
-            channel->dm_dphi = (uint32_t)((int)dm_dphi);
-            debug_print("dev[%d].chan[%d]: dm_dphi_scaled=%f cast=0x%x\n", i, jj, dm_dphi, channel->dm_dphi);
+            // See compute_channel_dm_dphi() (live_reconfig.cpp) for the derivation - shared with
+            // the live-retune path so both agree by construction.
+            channel->dm_dphi = compute_channel_dm_dphi(channel->freqlist[0].frequency, dev->input->centerfreq, dev->input->sample_rate);
+            debug_print("dev[%d].chan[%d]: dm_dphi=0x%x\n", i, jj, channel->dm_dphi);
             channel->dm_phi = 0.f;
         }
 
@@ -908,6 +889,7 @@ int parse_devices(libconfig::Setting& devs) {
         dev->output_overrun_count = 0;
         dev->waveend = dev->waveavail = dev->row = dev->tq_head = dev->tq_tail = 0;
         dev->last_frequency = -1;
+        dev->pending_centerfreq_request = -1;
 
         libconfig::Setting& chans = devs[i]["channels"];
         if (chans.getLength() < 1) {
@@ -950,6 +932,8 @@ int parse_mixers(libconfig::Setting& mx) {
         mixer_t* mixer = &mixers[mm];
         mixer->name = strdup(name);
         mixer->enabled = false;
+        mixer->config_wants_disabled = mx[i].exists("enabled") ? !(bool)mx[i]["enabled"] : false;
+        mixer->pending_enable_request = -1;
         mixer->interval = MIX_DIVISOR;
         mixer->output_overrun_count = 0;
         mixer->input_count = 0;
@@ -957,6 +941,13 @@ int parse_mixers(libconfig::Setting& mx) {
         mixer->inputs_todo = NULL;
         mixer->input_mask = NULL;
         channel_t* channel = &mixer->channel;
+        // mixer->channel.enabled gates process_outputs() same as any other channel_t (see
+        // output.cpp), but unlike device channels it has no separate config keyword - a mixer's
+        // own output stage is governed entirely by mixer->enabled (already checked before
+        // process_outputs() is called for a mixer, output.cpp:1264), so this just needs to
+        // default true and never gets touched again.
+        channel->enabled = true;
+        channel->pending_enable_request = -1;
         channel->highpass = mx[i].exists("highpass") ? (int)mx[i]["highpass"] : 100;
         channel->lowpass = mx[i].exists("lowpass") ? (int)mx[i]["lowpass"] : 2500;
         channel->mode = MM_MONO;

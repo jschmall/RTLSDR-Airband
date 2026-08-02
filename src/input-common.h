@@ -37,6 +37,11 @@ typedef enum { INPUT_UNKNOWN = 0, INPUT_INITIALIZED, INPUT_RUNNING, INPUT_FAILED
 typedef struct input_t input_t;
 
 struct input_t {
+    // Set once by each driver's own <type>_input_new(), e.g. "rtlsdr"/"soapysdr"/"mirisdr"/
+    // "file" - matches the config file's "type" string. Only consumed by the dynamic_reload
+    // reload_diff path (live_reconfig.cpp) to detect a device's driver type changing across a
+    // config edit, which is out of v1 scope and needs a restart rather than a live apply.
+    const char* driver_type;
     unsigned char* buffer;
     void* dev_data;
     size_t buf_size, bufs, bufe;
@@ -52,6 +57,12 @@ struct input_t {
     int (*init)(input_t* const input);
     void* (*run_rx_thread)(void* input_ptr);  // to be launched via pthread_create()
     int (*set_centerfreq)(input_t* const input, int const centerfreq);
+    // set_gain/set_bandwidth are nullable, unlike set_centerfreq - not every driver has a live
+    // hook for these (e.g. rtlsdr has no tuner bandwidth API at all). input_set_gain()/
+    // input_set_bandwidth() return -1/ENOTSUP when the driver's pointer is NULL, so callers get
+    // a clear "not supported by this driver" result instead of a silent no-op.
+    int (*set_gain)(input_t* const input, float const gain);
+    int (*set_bandwidth)(input_t* const input, int const bandwidth);
     int (*stop)(input_t* const input);
     pthread_t rx_thread;
     pthread_mutex_t buffer_lock;
@@ -62,6 +73,8 @@ int input_init(input_t* const input);
 int input_parse_config(input_t* const input, libconfig::Setting& cfg);
 int input_start(input_t* const input);
 int input_set_centerfreq(input_t* const input, int const centerfreq);
+int input_set_gain(input_t* const input, float const gain);
+int input_set_bandwidth(input_t* const input, int const bandwidth);
 int input_stop(input_t* const input);
 
 #endif /* _INPUT_COMMON_H */

@@ -289,9 +289,11 @@ add_custom_command(
 
 add_library (rtl_airband_base OBJECT
 	config.cpp
+	control_socket.cpp
 	input-common.cpp
 	input-file.cpp
 	input-helpers.cpp
+	live_reconfig.cpp
 	mixer.cpp
 	output.cpp
 	rtl_airband.cpp
@@ -376,6 +378,9 @@ if(BUILD_UNITTESTS)
 		util.cpp
 		mixer.cpp
 		stats_http.cpp
+		live_reconfig.cpp
+		control_socket.cpp
+		input-common.cpp
 	)
 	if(WITH_RDIO_SCANNER)
 		list(APPEND TEST_FILES rdio_scanner.cpp)

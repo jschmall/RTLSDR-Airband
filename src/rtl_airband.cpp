@@ -59,7 +59,9 @@
 #include <ctime>
 #include <iostream>
 #include <libconfig.h++>
+#include "control_socket.h"
 #include "input-common.h"
+#include "live_reconfig.h"
 #include "logging.h"
 #include "rtl_airband.h"
 #include "squelch.h"
@@ -86,6 +88,10 @@ bool log_scan_activity = false;
 char* stats_filepath = NULL;
 char* stats_http_address = NULL;
 int stats_http_port = 0;
+char* control_socket_path = NULL;
+#pragma GCC diagnostic ignored "-Wwrite-strings"
+char* cfgfile = CFGFILE;  // overridden by -c; promoted to global so reload_diff (control_socket.cpp) can re-read the same path
+#pragma GCC diagnostic warning "-Wwrite-strings"
 #ifdef WITH_RDIO_SCANNER
 int rdio_scanner_queue_depth = 64;  // matches the previous hardcoded MAX_QUEUE_DEPTH
 #endif                              /* WITH_RDIO_SCANNER */
@@ -433,6 +439,11 @@ void* demodulate(void* params) {
             continue;
         }
 
+        int pending_retune = dev->pending_centerfreq_request.exchange(-1, std::memory_order_acq_rel);
+        if (pending_retune >= 0) {
+            device_apply_retune(dev, pending_retune);
+        }
+
         // number of input bytes per output wave sample (x 2 for I and Q)
         size_t bps = 2 * dev->input->bytes_per_sample * (size_t)round((double)dev->input->sample_rate / (double)WAVE_RATE);
         if (available < bps * FFT_BATCH + fft_size * dev->input->bytes_per_sample * 2) {
@@ -537,8 +548,11 @@ void* demodulate(void* params) {
 
         if (dev->waveend >= WAVE_BATCH + AGC_EXTRA) {
             for (int i = 0; i < dev->channel_count; i++) {
-                AFC afc(dev, i);
                 channel_t* channel = dev->channels + i;
+                if (!channel->enabled) {
+                    continue;
+                }
+                AFC afc(dev, i);
                 freq_t* fparms = channel->freqlist + channel->freq_idx;
 
                 // set to NO_SIGNAL, will be updated to SIGNAL based on squelch below
@@ -749,7 +763,6 @@ int main(int argc, char* argv[]) {
 #endif /* WITH_PROFILING */
 
 #pragma GCC diagnostic ignored "-Wwrite-strings"
-    char* cfgfile = CFGFILE;
     char* pidfile = PIDFILE;
 #pragma GCC diagnostic warning "-Wwrite-strings"
 
@@ -888,6 +901,9 @@ int main(int argc, char* argv[]) {
                 error();
             }
         }
+        if (root.exists("control_socket_path")) {
+            control_socket_path = strdup(root["control_socket_path"]);
+        }
 #ifdef WITH_RDIO_SCANNER
         if (root.exists("rdio_scanner_queue_depth")) {
             rdio_scanner_queue_depth = (int)root["rdio_scanner_queue_depth"];
@@ -951,6 +967,17 @@ int main(int argc, char* argv[]) {
             error();
         }
         device_count = devs_enabled;
+
+        // mixer_t::enabled is auto-managed by mixer_connect_input() and becomes true as soon as
+        // any channel's mixer output connects, which only happens during the parse_devices()
+        // call above - so a config-time "enabled = false" on the mixer itself can only be
+        // applied now, after every connection has had a chance to happen.
+        for (int m = 0; m < mixer_count; m++) {
+            if (mixers[m].config_wants_disabled && mixers[m].enabled) {
+                mixer_disable(&mixers[m]);
+            }
+        }
+
         debug_print("mixer_count=%d\n", mixer_count);
 #ifdef DEBUG
         for (int z = 0; z < mixer_count; z++) {
@@ -1156,6 +1183,10 @@ int main(int argc, char* argv[]) {
 
     stats_http_start();
 
+    if (control_socket_path) {
+        control_socket_start(control_socket_path);
+    }
+
     sincosf_lut_init();
 
     // Startup the demod threads
@@ -1217,6 +1248,7 @@ int main(int argc, char* argv[]) {
 #endif /* WITH_RDIO_SCANNER */
 
     stats_http_shutdown();
+    control_socket_shutdown();
 
     close_debug();
 #ifdef WITH_PROFILING

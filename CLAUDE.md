@@ -312,6 +312,78 @@ Keep the local delta small and well understood.
     excluded — with it), and re-confirmed the default `RDIO_SCANNER=ON` Debug build still passes
     all 104 tests unaffected.
 
+25. **Mixer file-output NULL-freqlist crash fix** (`src/output.cpp`) — `output_file_ready()`
+    dereferenced `channel->freqlist[channel->freq_idx]` twice (building the filename when
+    `include_freq` is set, and unconditionally under `WITH_RDIO_SCANNER` to populate
+    `fdata->open_frequency`), but a mixer's own `channel_t` (`mixer_t::channel`) has no
+    `freqlist` at all — `parse_mixers()` never sets one, since a mixed stream has no single
+    source frequency — leaving it `NULL` and crashing on the mixer's first file rotation. Never
+    caught before because no automated test exercised a mixer with a `file`-type output
+    (`test_multichannel.py` carried a "TODO: add mixer tests... once mixer support is
+    implemented in the system tests" for exactly this gap); item 26's new mixer system tests are
+    what first hit it. Fixed by computing the frequency once, guarded by
+    `channel->freqlist != NULL`, defaulting to `0` for a mixer's own channel.
+26. **`dynamic_reload`: live retune/reconfiguration via a Unix domain control socket**
+    (`src/control_socket.{cpp,h}`, `src/live_reconfig.{cpp,h}`, new) — the only reload mechanism
+    before this was `SIGHUP` → full clean shutdown → `execvp()` re-exec (item 7), meaning any
+    config change dropped the whole feed for a restart cycle. Adds a same-host-only (`0600`,
+    `SO_PEERCRED`-checked) control socket, gated behind a new top-level `control_socket_path`
+    config option, that accepts one JSON object per line and returns one JSON response line:
+    `retune`, `set_gain`, `set_bandwidth`, `channel_enable`/`channel_disable`,
+    `mixer_enable`/`mixer_disable`, `reload_diff`.
+    - **New `enabled = false/true` channel/mixer config keyword** (`src/config.cpp`), distinct
+      from the pre-existing parse-time-permanent `disable` (which skips the config entry
+      entirely — no array slot allocated). `enabled` still allocates everything (bins, `dm_dphi`,
+      outputs) but starts the channel/mixer skipped by the hot loops, so the control socket can
+      toggle it live with no array resize. True dynamic add/remove of a channel/mixer/device not
+      present at startup is explicitly out of scope — declare it (optionally `enabled = false`)
+      up front, then toggle.
+    - **Live centerfreq retune** only for `R_MULTICHANNEL` devices (`R_SCAN` keeps its existing
+      controller-thread fixed-offset scheme unchanged — see item 2's "Device Modes"). Retuning
+      recomputes every channel's `bins`/`base_bins`/`dm_dphi` for the new center, which — unlike
+      `R_SCAN`'s single fixed-offset — touches state `AFC` (the per-channel automatic
+      frequency-correction class in `rtl_airband.cpp`) also mutates continuously from inside the
+      demod thread. To avoid racing AFC, the control socket only ever posts a request
+      (`device_t::pending_centerfreq_request`, an `int` sentinel `-1`); the demod thread that
+      already exclusively owns `bins`/`base_bins`/`dm_dphi` for that device polls and applies it
+      in-thread (`device_apply_retune()`), so the recompute is always single-writer, same
+      invariant AFC's own adjustments already relied on.
+    - **Channel/mixer enable-disable is a request/apply split for the same reason** —
+      `channel_t`/`mixer_t::pending_enable_request` (sentinel `-1`), posted by the control socket
+      thread, consumed only by the `output_thread()` that owns that channel's/mixer's `outputs`.
+      This split exists because the first implementation called `mixer_disable()` directly from
+      the control socket thread and a system test (item 25's mixer test) reproducibly segfaulted
+      it — a genuine data race against that same output thread's concurrent
+      `process_outputs()`/`close_file()` on the same `output_t` structs. Known remaining gap:
+      the pre-existing "last input died" auto-cascade (`mixer_disable_input()` →
+      `mixer_disable()`, triggered when a device channel's own `O_MIXER` output is disabled) can
+      in principle still run from a *different* output thread than the one owning the target
+      mixer's range when `multiple_output_threads = true` is configured — not hit in the default
+      single-output-thread topology this fork actually deploys, and not fixed here.
+    - **`set_gain`/`set_bandwidth`** added as new *nullable* `input_t` vtable hooks
+      (`src/input-common.h/.cpp`, mirroring the existing `set_centerfreq` hook's shape), returning
+      `ENOTSUP` when a driver leaves the pointer null. `rtlsdr` gets `set_gain` only (no tuner
+      bandwidth API exists in this driver at all); `soapysdr` gets both.
+    - **`reload_diff`** re-reads the same `-c` config file (`cfgfile`, promoted from a `main()`
+      local to a global) into a read-only snapshot (`parse_config_snapshot()` — deliberately not
+      a full mirror of `parse_devices()`/`parse_channels()`/`parse_mixers()`, which can't be
+      safely re-run against already-live state) and applies whatever's in v1 scope through the
+      same primitives a single command would use. Device/channel/mixer count changes,
+      `sample_rate`, driver type, and mode changes are detected and reported under
+      `skipped_requires_restart`, never attempted.
+    - Unit tested in `src/test_live_reconfig.cpp` (bins/`dm_dphi` formulas, request/apply
+      bookkeeping, snapshot parsing, diff computation) and `src/test_control_socket.cpp`
+      (wire-protocol parsing, command validation). System-tested end-to-end in
+      `system_tests/tests/test_control_socket.py` (channel/mixer enable-disable audio gaps,
+      malformed-command handling, socket permissions) using two new helpers,
+      `helpers/control_socket_client.py` and `helpers/interactive_runner.py` (a `Popen`-based
+      runner for tests that need to interact with a running instance mid-stream, unlike
+      `conftest.run_rtl_airband()`'s blocking run-to-completion model). A live-retune system test
+      that specifically confirms retuning one channel doesn't corrupt a sibling channel's bins on
+      the same device — the highest-risk scenario for item 26's centerfreq-retune design — is a
+      documented follow-up, not yet implemented; see `test_control_socket.py`'s module
+      docstring.
+
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
 

@@ -68,6 +68,7 @@ def write_config(
     mixers: list[dict] | None = None,
     mp3_tmp_dir: Path | None = None,
     stats_filepath: Path | None = None,
+    control_socket_path: Path | None = None,
 ) -> None:
     """
     Write a minimal libconfig++-format .conf file for rtl_airband.
@@ -108,6 +109,15 @@ def write_config(
             to find and validate the resulting file.
         stats_filepath: If provided, rtl_airband writes a Prometheus-format stats
             file to this path on shutdown.
+        control_socket_path: If provided, rtl_airband starts the dynamic_reload
+            control socket listener at this path.
+
+        Channel dicts also accept:
+            - enabled (bool): "enabled" keyword (declare-then-toggle for the
+              control socket) - omitted (defaults true) if not given.
+        Mixer dicts also accept:
+            - enabled (bool): same, at mixer level - omitted (defaults true)
+              if not given.
     """
     lines = []
     if fft_size is not None:
@@ -119,6 +129,8 @@ def write_config(
         for mx in mixers:
             lines.append(f"  {mx['name']}:")
             lines.append("  {")
+            if mx.get("enabled") is not None:
+                lines.append(f"    enabled = {'true' if mx['enabled'] else 'false'};")
             lines.append("    outputs:")
             lines.append("    (")
             lines.append("      {")
@@ -171,6 +183,9 @@ def write_config(
         if ch.get("squelch") is not None:
             lines.append(f"      squelch_snr_threshold = {ch['squelch']:.1f};")
 
+        if ch.get("enabled") is not None:
+            lines.append(f"      enabled = {'true' if ch['enabled'] else 'false'};")
+
         lines.extend(_build_output_lines(ch, mp3_tmp_dir))
 
         lines.append("    }" + ("" if is_last else ","))
@@ -180,5 +195,8 @@ def write_config(
 
     if stats_filepath is not None:
         lines.append(f'stats_filepath = "{stats_filepath}";')
+
+    if control_socket_path is not None:
+        lines.append(f'control_socket_path = "{control_socket_path}";')
 
     config_path.write_text("\n".join(lines) + "\n")

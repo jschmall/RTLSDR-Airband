@@ -129,3 +129,39 @@ int input_set_centerfreq(input_t* const input, int const centerfreq) {
     input->centerfreq = centerfreq;
     return 0;
 }
+
+int input_set_gain(input_t* const input, float const gain) {
+    assert(input != NULL);
+    assert(input->dev_data != NULL);
+    if (input->set_gain == NULL) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    if (input->state != INPUT_RUNNING) {
+        return -1;
+    }
+    int ret = input->set_gain(input, gain);
+    if (ret != 0) {
+        input->state = INPUT_FAILED;
+        return -1;
+    }
+    return 0;
+}
+
+int input_set_bandwidth(input_t* const input, int const bandwidth) {
+    assert(input != NULL);
+    assert(input->dev_data != NULL);
+    if (input->set_bandwidth == NULL) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    if (input->state != INPUT_RUNNING) {
+        return -1;
+    }
+    int ret = input->set_bandwidth(input, bandwidth);
+    if (ret != 0) {
+        input->state = INPUT_FAILED;
+        return -1;
+    }
+    return 0;
+}

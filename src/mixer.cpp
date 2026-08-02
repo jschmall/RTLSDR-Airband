@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "config.h"
+#include "live_reconfig.h"  // reconnect_channel_outputs
 #include "rtl_airband.h"
 
 static char* err;
@@ -52,6 +53,20 @@ mixer_t* getmixerbyname(const char* name) {
 void mixer_disable(mixer_t* mixer) {
     mixer->enabled = false;
     disable_channel_outputs(&mixer->channel);
+}
+
+// Live-reenable counterpart to mixer_disable(), for the dynamic_reload control socket. Resets
+// every input's mask (undoing mixer_disable_input()'s bookkeeping - without this, the very next
+// normal squelch-close on any single input would immediately misfire the "all inputs died"
+// auto-disable in mixer_disable_input() below) and re-arms the mixer's own outputs, then flips
+// mixer->enabled last so no other thread observes a half-armed mixer as enabled.
+void mixer_enable(mixer_t* mixer) {
+    for (int i = 0; i < mixer->input_count; i++) {
+        mixer->input_mask[i] = true;
+        mixer->inputs_todo[i] = true;
+    }
+    reconnect_channel_outputs(&mixer->channel);
+    mixer->enabled = true;
 }
 
 int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance) {
@@ -109,6 +124,12 @@ void mixer_disable_input(mixer_t* mixer, int input_idx) {
     // all inputs are false so disable the mixer
     log(LOG_NOTICE, "Disabling mixer '%s' - all inputs died\n", mixer->name);
     mixer_disable(mixer);
+}
+
+void mixer_enable_input(mixer_t* mixer, int input_idx) {
+    assert(mixer);
+    assert(input_idx < mixer->input_count);
+    mixer->input_mask[input_idx] = true;
 }
 
 void mixer_put_samples(mixer_t* mixer, int input_idx, const float* samples, bool has_signal, unsigned int len) {
