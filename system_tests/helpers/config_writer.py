@@ -68,6 +68,7 @@ def write_config(
     mixers: list[dict] | None = None,
     mp3_tmp_dir: Path | None = None,
     stats_filepath: Path | None = None,
+    shout_metadata_delay: int | None = None,
 ) -> None:
     """
     Write a minimal libconfig++-format .conf file for rtl_airband.
@@ -88,6 +89,8 @@ def write_config(
               (used only when mp3_tmp_dir is provided).
             - mixer_output (dict|None): {"name": str, "balance": float}, omitted if None.
             - scan_freqs_hz (list[int]): Scan mode only — list of frequencies in Hz.
+            - label (str|None): Channel label (send_scan_freq_tags/send_tx_tags/
+              rdio_scanner metadata content), omitted if None.
             - extra_output_blocks (list[str]): Fully-formed "{ ... }" output
               config entries appended verbatim after the file/mixer outputs,
               for output types (icecast, rdio_scanner) this helper doesn't
@@ -100,6 +103,9 @@ def write_config(
         mixers: List of mixer dicts with keys:
             - name (str): Mixer name referenced by channel mixer_output entries.
             - label (str): Filename template for the mixer's MP3 output.
+            - extra_output_blocks (list[str]): Fully-formed "{ ... }" output
+              config entries appended after the mixer's file output, same
+              purpose as the channel-level key of the same name.
             Output files are written to output_dir.
         mp3_tmp_dir: If provided, each channel gets a "file" (MP3) output
             written to this directory using output_filename_template. The
@@ -108,6 +114,8 @@ def write_config(
             to find and validate the resulting file.
         stats_filepath: If provided, rtl_airband writes a Prometheus-format stats
             file to this path on shutdown.
+        shout_metadata_delay: If provided, overrides the default (3s) real-time delay
+            send_scan_freq_tags/send_tx_tags wait before applying a metadata update.
     """
     lines = []
     if fft_size is not None:
@@ -121,12 +129,22 @@ def write_config(
             lines.append("  {")
             lines.append("    outputs:")
             lines.append("    (")
-            lines.append("      {")
-            lines.append('        type = "file";')
-            lines.append(f'        directory = "{output_dir}";')
-            lines.append(f'        filename_template = "{mx["label"]}";')
-            lines.append("        continuous = false;")
-            lines.append("      }")
+            mixer_output_entries: list[str] = [
+                "\n".join(
+                    [
+                        "      {",
+                        '        type = "file";',
+                        f'        directory = "{output_dir}";',
+                        f'        filename_template = "{mx["label"]}";',
+                        "        continuous = false;",
+                        "      }",
+                    ]
+                )
+            ]
+            mixer_output_entries.extend(mx.get("extra_output_blocks", []))
+            for k, entry in enumerate(mixer_output_entries):
+                is_last_entry = k == len(mixer_output_entries) - 1
+                lines.append(entry + ("" if is_last_entry else ","))
             lines.append("    );")
             lines.append("  };")
         lines.append("};")
@@ -159,6 +177,9 @@ def write_config(
         if ch.get("modulation") is not None:
             lines.append(f'      modulation = "{ch["modulation"]}";')
 
+        if ch.get("label") is not None:
+            lines.append(f'      label = "{ch["label"]}";')
+
         if ch.get("ctcss") is not None:
             lines.append(f"      ctcss = {ch['ctcss']:.1f};")
 
@@ -180,5 +201,8 @@ def write_config(
 
     if stats_filepath is not None:
         lines.append(f'stats_filepath = "{stats_filepath}";')
+
+    if shout_metadata_delay is not None:
+        lines.append(f"shout_metadata_delay = {shout_metadata_delay};")
 
     config_path.write_text("\n".join(lines) + "\n")

@@ -21,6 +21,7 @@
 
 #include <cstring>
 #include "helper_functions.h"
+#include "rtl_airband.h"
 
 using namespace std;
 
@@ -183,6 +184,111 @@ TEST_F(HelperFunctionsTest, rusage_cpu_seconds_zero) {
     memset(&ru, 0, sizeof(ru));
 
     EXPECT_DOUBLE_EQ(rusage_cpu_seconds(ru), 0.0);
+}
+
+TEST_F(HelperFunctionsTest, compute_tx_tag_content_no_signal_is_empty) {
+    EXPECT_EQ(compute_tx_tag_content(false, "Fire Dispatch", 154265000), "");
+}
+
+TEST_F(HelperFunctionsTest, compute_tx_tag_content_uses_label) {
+    EXPECT_EQ(compute_tx_tag_content(true, "Fire Dispatch", 154265000), "Fire Dispatch");
+}
+
+TEST_F(HelperFunctionsTest, compute_tx_tag_content_falls_back_to_frequency_without_label) {
+    EXPECT_EQ(compute_tx_tag_content(true, NULL, 154265000), "154.265 MHz");
+}
+
+namespace {
+struct timeval make_tv(long sec) {
+    struct timeval tv;
+    tv.tv_sec = sec;
+    tv.tv_usec = 0;
+    return tv;
+}
+}  // namespace
+
+TEST_F(HelperFunctionsTest, icecast_tx_tag_step_noop_when_already_matches_applied) {
+    icecast_tx_tag_state state;
+    string out;
+    EXPECT_FALSE(icecast_tx_tag_step(&state, "", make_tv(100), 3, &out));
+    EXPECT_FALSE(state.pending);
+    EXPECT_EQ(state.applied, "");
+}
+
+TEST_F(HelperFunctionsTest, icecast_tx_tag_step_defers_first_change_until_deadline) {
+    icecast_tx_tag_state state;
+    string out;
+
+    // transmission starts - change is queued but not applied yet
+    EXPECT_FALSE(icecast_tx_tag_step(&state, "Fire Dispatch", make_tv(100), 3, &out));
+    EXPECT_TRUE(state.pending);
+    EXPECT_EQ(state.applied, "");
+
+    // deadline not reached yet
+    EXPECT_FALSE(icecast_tx_tag_step(&state, "Fire Dispatch", make_tv(102), 3, &out));
+    EXPECT_EQ(state.applied, "");
+
+    // deadline reached - applies now
+    EXPECT_TRUE(icecast_tx_tag_step(&state, "Fire Dispatch", make_tv(103), 3, &out));
+    EXPECT_EQ(out, "Fire Dispatch");
+    EXPECT_EQ(state.applied, "Fire Dispatch");
+    EXPECT_FALSE(state.pending);
+}
+
+TEST_F(HelperFunctionsTest, icecast_tx_tag_step_zero_delay_applies_immediately) {
+    icecast_tx_tag_state state;
+    string out;
+    EXPECT_TRUE(icecast_tx_tag_step(&state, "Fire Dispatch", make_tv(100), 0, &out));
+    EXPECT_EQ(out, "Fire Dispatch");
+    EXPECT_EQ(state.applied, "Fire Dispatch");
+}
+
+TEST_F(HelperFunctionsTest, icecast_tx_tag_step_change_while_pending_updates_value_not_deadline) {
+    icecast_tx_tag_state state;
+    string out;
+
+    // first change starts a 3s deferred window
+    EXPECT_FALSE(icecast_tx_tag_step(&state, "A", make_tv(100), 3, &out));
+
+    // a second, different desired value arrives before the deadline - updates the pending
+    // value but must not push the deadline back
+    EXPECT_FALSE(icecast_tx_tag_step(&state, "B", make_tv(101), 3, &out));
+    EXPECT_EQ(state.pending_value, "B");
+
+    // original deadline (100+3=103) still governs, not a new one relative to t=101
+    EXPECT_FALSE(icecast_tx_tag_step(&state, "B", make_tv(102), 3, &out));
+    EXPECT_TRUE(icecast_tx_tag_step(&state, "B", make_tv(103), 3, &out));
+    EXPECT_EQ(out, "B");
+    EXPECT_EQ(state.applied, "B");
+}
+
+TEST_F(HelperFunctionsTest, icecast_tx_tag_step_revert_to_applied_while_pending_cancels) {
+    icecast_tx_tag_state state;
+    string out;
+
+    // squelch opens...
+    EXPECT_FALSE(icecast_tx_tag_step(&state, "A", make_tv(100), 3, &out));
+    EXPECT_TRUE(state.pending);
+
+    // ...and closes again before the deferred window elapses - reverting to the
+    // already-applied value ("") must cancel the pending change outright
+    EXPECT_FALSE(icecast_tx_tag_step(&state, "", make_tv(101), 3, &out));
+    EXPECT_FALSE(state.pending);
+
+    // confirm no delayed firing past the original deadline
+    EXPECT_FALSE(icecast_tx_tag_step(&state, "", make_tv(104), 3, &out));
+    EXPECT_EQ(state.applied, "");
+}
+
+TEST_F(HelperFunctionsTest, icecast_tx_tag_step_steady_state_repeats_are_noops) {
+    icecast_tx_tag_state state;
+    string out;
+
+    EXPECT_TRUE(icecast_tx_tag_step(&state, "A", make_tv(100), 0, &out));
+    EXPECT_EQ(state.applied, "A");
+
+    EXPECT_FALSE(icecast_tx_tag_step(&state, "A", make_tv(105), 0, &out));
+    EXPECT_EQ(state.applied, "A");
 }
 
 TEST_F(HelperFunctionsTest, make_dated_subdirs_some_exist) {
