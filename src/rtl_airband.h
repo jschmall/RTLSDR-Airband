@@ -125,6 +125,17 @@ enum output_type {
 #endif /* WITH_PULSEAUDIO */
 };
 
+// Tracks the deferred-apply state machine for send_tx_tags (see icecast_tx_tag_step() in
+// helper_functions.cpp). Once a change is pending, further changes update pending_value but
+// do not push pending_deadline back - this bounds worst-case tag-update latency to one
+// shout_metadata_delay window even if the source keeps flapping.
+struct icecast_tx_tag_state {
+    std::string applied;  // last value actually sent to Icecast ("" means cleared)
+    bool pending = false;
+    std::string pending_value;
+    struct timeval pending_deadline;
+};
+
 struct icecast_data {
     const char* hostname;
     int port;
@@ -138,6 +149,12 @@ struct icecast_data {
     const char* genre;
     const char* description;
     bool send_scan_freq_tags;
+    // send an on-air metadata tag (the channel's/mixer input's configured label) when a
+    // transmission starts, cleared to an empty string when it ends. Independent of
+    // send_scan_freq_tags - rejected at config parse time on R_SCAN channels, where
+    // send_scan_freq_tags already covers frequency-change tagging.
+    bool send_tx_tags;
+    icecast_tx_tag_state tx_tag_state;
     shout_t* shout;
     // number of times this stream's connection was lost (network error or the
     // owning device failing) and had to be torn down for output_check_thread to reconnect
@@ -146,6 +163,8 @@ struct icecast_data {
     // a subset of disconnect_count, called out separately since it means the local
     // encode rate outpaced what Icecast could drain, not a network-level failure
     size_t backlog_exceeded_count;
+    // number of times a send_tx_tags metadata update was successfully applied
+    size_t tx_tag_update_count;
 };
 
 #ifdef WITH_RDIO_SCANNER
@@ -395,9 +414,22 @@ struct mixinput_t {
     float ampfactor;
     float ampl, ampr;
     bool ready;
-    bool has_signal;
+    // written by mixer_put_samples() (device output thread), read by mixer_thread() under
+    // mutex and also by process_outputs() for send_tx_tags (a third reader, on a possibly
+    // different output thread when multiple_output_threads=true) - atomic for the same
+    // reason channel_t::axcindicate is, see the comment there.
+    std::atomic<bool> has_signal;
     pthread_mutex_t mutex;
     size_t input_overrun_count;
+    // index into devices[]/devices[].channels[] this input was configured from, set to -1 by
+    // mixer_connect_input() and resolved by config.cpp's parse_outputs() right after; read
+    // live by process_outputs() to look up the source channel's current label/freq_idx for
+    // send_tx_tags on a mixer's icecast output. mixer->inputs is XCALLOC/XREALLOC'd (not
+    // placement-new'd), so these are set explicitly in mixer_connect_input() rather than via
+    // an in-class initializer - the same reason has_signal is set there too instead of relying
+    // on XCALLOC's zero-init.
+    int source_device_idx;
+    int source_channel_idx;
 };
 
 struct mixer_t {
@@ -489,6 +521,9 @@ void* mixer_thread(void* params);
 const char* mixer_get_error();
 // pure - no I/O or global state - so it can be unit tested directly
 void mix_waveforms(float* sum, const float* in, float mult, int size);
+// pure - lowest-index input with has_signal true, or -1 if none; used by send_tx_tags to
+// pick a single tag when several mixer inputs are transmitting simultaneously
+int mixer_select_active_tag_input(const mixinput_t* inputs, int input_count);
 
 // config.cpp
 int parse_devices(libconfig::Setting& devs);

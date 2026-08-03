@@ -81,3 +81,27 @@ TEST_F(MixerTest, successive_calls_accumulate_multiple_inputs) {
     EXPECT_FLOAT_EQ(sum[0], 2.0f);  // 1*1.0 + 2*0.5
     EXPECT_FLOAT_EQ(sum[1], 2.0f);
 }
+
+TEST_F(MixerTest, select_active_tag_input_none_active) {
+    mixinput_t inputs[3] = {};
+    EXPECT_EQ(mixer_select_active_tag_input(inputs, 3), -1);
+}
+
+TEST_F(MixerTest, select_active_tag_input_single_active) {
+    mixinput_t inputs[3] = {};
+    inputs[1].has_signal = true;
+    EXPECT_EQ(mixer_select_active_tag_input(inputs, 3), 1);
+}
+
+TEST_F(MixerTest, select_active_tag_input_lowest_index_wins) {
+    mixinput_t inputs[4] = {};
+    inputs[2].has_signal = true;
+    inputs[3].has_signal = true;
+    EXPECT_EQ(mixer_select_active_tag_input(inputs, 4), 2);
+}
+
+TEST_F(MixerTest, select_active_tag_input_zero_input_count) {
+    mixinput_t inputs[1] = {};
+    inputs[0].has_signal = true;
+    EXPECT_EQ(mixer_select_active_tag_input(inputs, 0), -1);
+}

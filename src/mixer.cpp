@@ -86,6 +86,8 @@ int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance) {
     mixer->inputs[i].ready = false;
     mixer->inputs[i].has_signal = false;
     mixer->inputs[i].input_overrun_count = 0;
+    mixer->inputs[i].source_device_idx = -1;
+    mixer->inputs[i].source_channel_idx = -1;
     mixer->input_mask[i] = true;
     mixer->inputs_todo[i] = true;
     mixer->enabled = true;
@@ -137,6 +139,15 @@ void mix_waveforms(float* sum, const float* in, float mult, int size) {
     for (int s = 0; s < size; s++) {
         sum[s] += in[s] * mult;
     }
+}
+
+int mixer_select_active_tag_input(const mixinput_t* inputs, int input_count) {
+    for (int i = 0; i < input_count; i++) {
+        if (inputs[i].has_signal) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 /* Samples are delivered to mixer inputs in batches of WAVE_BATCH size (default 1000, ie. 1/8 secs

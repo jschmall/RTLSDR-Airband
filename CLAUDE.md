@@ -311,6 +311,58 @@ Keep the local delta small and well understood.
     5 fewer than the `ON` build's 104, consistent with rdio_scanner-specific tests being
     excluded — with it), and re-confirmed the default `RDIO_SCANNER=ON` Debug build still passes
     all 104 tests unaffected.
+25. **Mixer file-output NULL-freqlist crash fix** (`src/output.cpp`) — `output_file_ready()`
+    unconditionally dereferenced `channel->freqlist[channel->freq_idx]` under
+    `#ifdef WITH_RDIO_SCANNER` to populate `fdata->open_frequency`, but a mixer's own
+    `channel_t` (`mixer_t::channel`) has no `freqlist` at all — `parse_mixers()` never sets
+    one, since a mixed stream has no single source frequency — leaving it `NULL` and crashing
+    on the mixer's first file rotation. Never caught before because no automated test exercised
+    a mixer with a `file`-type output that actually received signal; item 26's new mixer system
+    test is what first hit it. Fixed by computing the frequency once, guarded by
+    `channel->freqlist != NULL`, defaulting to `0` for a mixer's own channel.
+26. **`send_tx_tags`: per-transmission Icecast metadata for non-scanning channels/mixers**
+    (`src/rtl_airband.h`, `src/config.cpp`, `src/output.cpp`, `src/mixer.cpp`,
+    `src/helper_functions.{h,cpp}`) — the pre-existing `send_scan_freq_tags` only tags Icecast
+    metadata when an `R_SCAN` device's `controller_thread` hops frequency; plain
+    `R_MULTICHANNEL` channels and mixers had no way to surface an on-air indicator. Adds a new,
+    independent `send_tx_tags` boolean on an icecast output block: pushes the channel's
+    configured `label` as the "song" tag when a transmission starts (squelch opens) and clears
+    it to an empty string when it ends (squelch closes). Rejected at config parse time on
+    `R_SCAN` channels (`send_scan_freq_tags` already owns that case). Unlike
+    `send_scan_freq_tags`'s device-scoped `tag_queue` ring buffer (needed because its tag event
+    originates in a separate controller thread), `send_tx_tags` is self-contained inside
+    `process_outputs()` (the output thread already safely reads `channel->axcindicate`, an
+    `std::atomic`): `icecast_tx_tag_step()` (`helper_functions.cpp`) detects the on/off edge
+    itself each tick and replicates just the `shout_metadata_delay` buffering-compensation
+    behavior via a per-output deferred-apply state machine (`icecast_tx_tag_state`, embedded in
+    `icecast_data` — which switched from `XCALLOC` to `new icecast_data()` since it now holds
+    `std::string` members that calloc'd memory would never construct, matching the existing
+    `file_data`/`rdio_scanner_data` precedent). A further signal flap while a change is pending
+    updates the pending value but does not push the deadline back (bounds worst-case latency to
+    one delay window); a revert to the already-applied value while pending cancels the change
+    outright. For mixers, `mixinput_t` gained `source_device_idx`/`source_channel_idx` (resolved
+    at config-parse time in the existing `"mixer"` output branch, stored as indices rather than
+    a `channel_t*` since `dev->channels` is `XREALLOC`'d after parsing completes — the
+    compaction index computed during parsing stays valid across that realloc, unlike a raw
+    pointer) so a mixer's icecast output can look up whichever source channel is currently
+    talking; `mixer_select_active_tag_input()` (`mixer.cpp`) breaks ties between simultaneously
+    active inputs by lowest index. `mixinput_t::has_signal` changed `bool` → `std::atomic<bool>`
+    since this feature adds a third reader (`process_outputs()`, potentially on a different
+    output thread than `mixer_thread()` under `multiple_output_threads = true`) alongside the
+    two that already existed. New `icecast_tx_tag_update_count` Prometheus counter, same
+    `write_stats_file()` pattern as `icecast_disconnect_count`. Pure logic
+    (`compute_tx_tag_content()`, `icecast_tx_tag_step()`, `mixer_select_active_tag_input()`) is
+    unit tested (`test_helper_functions.cpp`, `test_mixer.cpp`); end-to-end wiring is system
+    tested (`system_tests/tests/test_icecast_tx_tags.py`, one case for a plain channel and one
+    for a mixer with two source channels) against an extended `fake_icecast_server.py` — real
+    Icecast metadata updates are a *separate* `GET /admin/metadata?...` HTTP request per update
+    (confirmed against the installed `libshout.so.3`'s strings output), not inline frames on the
+    already-open SOURCE connection, so the fixture now accepts multiple concurrent connections
+    (one thread per connection) instead of the single blocking `accept()` it used before this
+    feature needed it to observe a second, independent connection type. The system tests force
+    `shout_metadata_delay = 0` to keep assertions independent of the real/simulated-time
+    interaction between that (wall-clock) delay and `speedup_factor` (which only accelerates IQ
+    replay, not `gettimeofday()`).
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
