@@ -381,6 +381,7 @@ if(BUILD_UNITTESTS)
 		live_reconfig.cpp
 		control_socket.cpp
 		input-common.cpp
+		config.cpp
 	)
 	if(WITH_RDIO_SCANNER)
 		list(APPEND TEST_FILES rdio_scanner.cpp)

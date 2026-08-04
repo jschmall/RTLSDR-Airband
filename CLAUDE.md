@@ -335,9 +335,9 @@ Keep the local delta small and well understood.
       from the pre-existing parse-time-permanent `disable` (which skips the config entry
       entirely — no array slot allocated). `enabled` still allocates everything (bins, `dm_dphi`,
       outputs) but starts the channel/mixer skipped by the hot loops, so the control socket can
-      toggle it live with no array resize. True dynamic add/remove of a channel/mixer/device not
-      present at startup is explicitly out of scope — declare it (optionally `enabled = false`)
-      up front, then toggle.
+      toggle it live with no array resize. Mixer/device add/remove is explicitly out of scope —
+      declare a mixer up front (optionally `enabled = false`), then toggle. True dynamic *channel*
+      add (a channel not present at startup at all) is supported — see item 27.
     - **Live centerfreq retune** only for `R_MULTICHANNEL` devices (`R_SCAN` keeps its existing
       controller-thread fixed-offset scheme unchanged — see item 2's "Device Modes"). Retuning
       recomputes every channel's `bins`/`base_bins`/`dm_dphi` for the new center, which — unlike
@@ -383,6 +383,62 @@ Keep the local delta small and well understood.
       the same device — the highest-risk scenario for item 26's centerfreq-retune design — is a
       documented follow-up, not yet implemented; see `test_control_socket.py`'s module
       docstring.
+27. **Dynamic channel add via `reload_diff`** (`src/config.cpp`, `src/live_reconfig.{cpp,h}`,
+    `src/rtl_airband.h`, `src/logging.{h,cpp}`) — closes item 26's channel-add gap. The config
+    file stays the single source of truth for a channel's definition: an operator adds a channel
+    block to a device's `channels` list in the file and sends the existing `reload_diff` command
+    (no new wire command); `compute_and_apply_diff()` detects the device's channel count grew as a
+    pure tail append and applies it live. Only a *pure append* is handled — any other
+    `channel_count` change (decrease, reorder, or an existing channel's fields changing) still
+    falls into `skipped_requires_restart` exactly as before.
+    - **`reserve_channels`** (new device-level config int, default `0`) — `dev->channels`/`bins`/
+      `base_bins` are `XCALLOC`'d with this much extra headroom at startup and never resized
+      again; `dev->channel_count` (now `std::atomic<int>`) can grow up to the new
+      `dev->channel_capacity` field by writing into an already-allocated, already-zeroed slot and
+      then publishing the new count. Deliberately not real runtime array growth (`realloc`-ing
+      live while the demod and output threads are both mid-iteration through the old pointer was
+      rejected as an unjustified hazard for two independent reader threads) — an operator must set
+      `reserve_channels` on a device once (one restart) before dynamic add works on it, the same
+      "declare capacity up front" idea item 26 already uses for `enabled = false`. Rejected at
+      parse time on `R_SCAN` devices (a scan device always has exactly one channel; "add a
+      frequency to its `freqlist`" is a different, unimplemented feature).
+    - **`parse_channel()`** (`config.cpp`) — the per-channel body of the startup `parse_channels()`
+      loop, extracted into its own function so the startup path and the live-append path share one
+      implementation (including `parse_outputs()`, so a newly appended channel supports the exact
+      same `outputs: (...)` block — any number/type — as a config-file channel always has). Returns
+      `false` (silently not counted, matching pre-existing behavior) for two latent quirks found
+      during the extraction: the legacy single-value forms of `squelch_snr_threshold == -1` and
+      `bandwidth == 0` `continue`d out of the *entire* per-channel loop in the original code, not
+      just the enclosing `if` — never fixed here, only preserved, since it's pre-existing behavior
+      unrelated to this feature.
+    - **`init_output()`** (`rtl_airband.cpp`) — declared in `rtl_airband.h` so the live-append path
+      can call it too. A freshly appended channel's `output_t` structs are allocated by
+      `parse_outputs()` but have no LAME encoder or open connection until `init_output()` runs;
+      missing this call was caught by the system test below (the appended channel's MP3 file was
+      created but stayed empty) rather than by the C++ unit tests, which stub `init_output()` to
+      isolate the append/publish logic from real LAME/icecast/udp setup.
+    - **Recoverable `error()`** (`logging.{h,cpp}`) — `config.cpp`'s ~50 `error()` call sites call
+      `_Exit(1)`, correct for startup but fatal to a *running* process if reused verbatim for a
+      malformed appended channel. A `thread_local` gate (`config_error_is_recoverable`) makes
+      `error()` throw `ConfigApplyError` instead when set; the live-append path sets it, redirects
+      `cerr` to capture the human-readable message each call site already prints, and catches
+      `std::exception` broadly — not just `ConfigApplyError` — since some required-but-missing
+      config keys (e.g. an absent `outputs` block) are indexed directly (`chan_setting["outputs"]`)
+      without an `error()`-guarded `.exists()` check first and throw a raw
+      `libconfig::SettingNotFoundException`; missing this case in the first pass crashed the whole
+      process on exactly the malformed-channel test case it was meant to guard against. A batch of
+      newly appended channels is all-or-nothing: `dev->channel_count` is only published after every
+      new channel parses and connects successfully; a channel that individually succeeded earlier
+      in a failed batch is leaked (its `strdup`'d labels / `XCALLOC`'d outputs are never freed)
+      rather than unwound — acceptable for a rare, operator-triggered failure path.
+    - Unit tested in `src/test_live_reconfig.cpp`'s `ChannelAppendTest` fixture (append one/many
+      within capacity, capacity-exceeded, malformed-channel-doesn't-crash, `R_SCAN` guard,
+      count-decrease still requires restart) with `init_output()` stubbed to isolate the
+      append/publish logic. System-tested end-to-end in `system_tests/tests/test_channel_add.py`
+      (a channel absent at startup captures real audio after a config edit + `reload_diff`,
+      confirmed alongside its already-running sibling channel being unaffected; appending beyond
+      `reserve_channels` is rejected without disrupting the existing channel) using a new
+      `reserve_channels` parameter on `helpers/config_writer.write_config()`.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

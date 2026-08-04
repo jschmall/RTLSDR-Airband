@@ -69,6 +69,7 @@ def write_config(
     mp3_tmp_dir: Path | None = None,
     stats_filepath: Path | None = None,
     control_socket_path: Path | None = None,
+    reserve_channels: int | None = None,
 ) -> None:
     """
     Write a minimal libconfig++-format .conf file for rtl_airband.
@@ -111,6 +112,10 @@ def write_config(
             file to this path on shutdown.
         control_socket_path: If provided, rtl_airband starts the dynamic_reload
             control socket listener at this path.
+        reserve_channels: If provided, reserves this many extra (unused at
+            startup) channel array slots on the device, letting a later
+            reload_diff append up to that many new channels live without a
+            restart - see rtl_airband.h's device_t::channel_capacity comment.
 
         Channel dicts also accept:
             - enabled (bool): "enabled" keyword (declare-then-toggle for the
@@ -150,6 +155,8 @@ def write_config(
     lines.append(f"  sample_rate = {sample_rate};")
     lines.append(f"  centerfreq = {centerfreq_hz};")
     lines.append(f"  speedup_factor = {speedup_factor:.6f};")
+    if reserve_channels is not None:
+        lines.append(f"  reserve_channels = {reserve_channels};")
     if mode == "scan":
         lines.append('  mode = "scan";')
     lines.append("  channels:")

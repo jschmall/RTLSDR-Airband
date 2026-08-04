@@ -35,6 +35,23 @@ int pulse_setup(pulse_data*, mix_modes) {
     return 0;
 }
 #endif /* WITH_PULSEAUDIO */
+#ifdef NFM
+// config.cpp's parse_devices() references this as extern under NFM; normally defined in
+// rtl_airband.cpp, which can't be linked here for the same reasons documented above. None of the
+// tests below call parse_devices() itself (only parse_channel()/compute_and_apply_diff(), which
+// don't need it) - only needed to satisfy the linker.
+float alpha = 0.0f;
+#endif /* NFM */
+// try_append_channels() (via this file) calls this as the "make a freshly appended channel's
+// outputs actually ready to encode/send" step; normally defined in rtl_airband.cpp (calls
+// airlame_init() from output.cpp), neither of which can be linked here for the same reasons
+// documented above. The ChannelAppendTest cases below test the append/publish logic itself, not
+// real LAME/icecast/udp connection setup - that's exercised by system_tests/tests/
+// test_channel_add.py against a real binary instead. Always "succeeds" here so the append logic
+// under test isn't gated on something this stub can't meaningfully do.
+bool init_output(channel_t*, output_t*) {
+    return true;
+}
 
 class LiveReconfigTest : public TestBaseClass {};
 
@@ -652,4 +669,295 @@ TEST_F(DiffApplyTest, mixer_enabled_diff_calls_mixer_enable_disable) {
     EXPECT_FALSE(mixer.enabled);
     ASSERT_EQ(result.applied.size(), 1u);
     EXPECT_NE(result.applied[0].find("mix1"), std::string::npos);
+}
+
+// Dynamic channel add: compute_and_apply_diff() detecting/applying a config file's channel count
+// growing for a device (a pure tail append, within dev->channel_capacity's pre-reserved
+// headroom - see rtl_airband.h's comment on channel_capacity). Unlike the other DiffApplyTest
+// cases above, these need a real raw_channels_setting/raw_channel_indices, which only
+// parse_config_snapshot() populates from an actual file - hence write_config() here too.
+class ChannelAppendTest : public DiffApplyTest {
+   protected:
+    std::string write_config(const std::string& contents) {
+        std::string path = temp_dir + "/test.conf";
+        FILE* f = fopen(path.c_str(), "w");
+        fwrite(contents.data(), 1, contents.size(), f);
+        fclose(f);
+        return path;
+    }
+};
+
+TEST_F(ChannelAppendTest, appends_one_new_channel_within_capacity) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    // index 0 is the already-live channel; index 1 is pre-reserved (zeroed) capacity, exactly as
+    // parse_devices() would leave it after sizing for reserve_channels = 1.
+    channel_t chans[2] = {};
+    chans[0].enabled = true;
+    size_t bins[2] = {0, 0};
+    size_t base_bins[2] = {0, 0};
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 1;
+    dev.channel_capacity = 2;
+    dev.channels = chans;
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    std::string path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); },
+    { freq = 120050000; label = "new-chan"; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "y"; } ); }
+  );
+});
+)");
+    ConfigSnapshot snapshot;
+    std::string parse_error;
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(dev.channel_count.load(), 2);
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+    ASSERT_EQ(result.applied.size(), 1u);
+    EXPECT_NE(result.applied[0].find("added 1 channel"), std::string::npos);
+    ASSERT_EQ(chans[1].freq_count, 1);
+    EXPECT_EQ(chans[1].freqlist[0].frequency, 120050000);
+    EXPECT_STREQ(chans[1].freqlist[0].label, "new-chan");
+    EXPECT_EQ(chans[1].output_count, 1);
+    // The existing (index 0) channel must be untouched.
+    EXPECT_EQ(chans[0].output_count, 0);
+}
+
+TEST_F(ChannelAppendTest, appends_multiple_new_channels_within_capacity) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    channel_t chans[3] = {};
+    size_t bins[3] = {0, 0, 0};
+    size_t base_bins[3] = {0, 0, 0};
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 0;
+    dev.channel_capacity = 3;
+    dev.channels = chans;
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    std::string path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "a"; } ); },
+    { freq = 120050000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "b"; } ); },
+    { freq = 120100000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "c"; } ); }
+  );
+});
+)");
+    ConfigSnapshot snapshot;
+    std::string parse_error;
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(dev.channel_count.load(), 3);
+    ASSERT_EQ(result.applied.size(), 1u);
+    EXPECT_NE(result.applied[0].find("added 3 channel"), std::string::npos);
+    EXPECT_EQ(chans[0].freqlist[0].frequency, 120000000);
+    EXPECT_EQ(chans[1].freqlist[0].frequency, 120050000);
+    EXPECT_EQ(chans[2].freqlist[0].frequency, 120100000);
+}
+
+TEST_F(ChannelAppendTest, exceeding_reserved_capacity_is_requires_restart_and_applies_nothing) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    channel_t chans[1] = {};
+    chans[0].enabled = true;
+    size_t bins[1] = {0};
+    size_t base_bins[1] = {0};
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 1;
+    dev.channel_capacity = 1;  // no reserve_channels headroom
+    dev.channels = chans;
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    std::string path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); },
+    { freq = 120050000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "y"; } ); }
+  );
+});
+)");
+    ConfigSnapshot snapshot;
+    std::string parse_error;
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(dev.channel_count.load(), 1);  // unchanged
+    EXPECT_TRUE(result.applied.empty());
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("reserve_channels"), std::string::npos);
+}
+
+TEST_F(ChannelAppendTest, malformed_new_channel_is_reported_and_does_not_crash_or_partially_apply) {
+    // The critical safety-net test for the recoverable-error mechanism (logging.h/.cpp): a
+    // startup-time config error here would call error() -> _Exit(1), taking the whole test
+    // binary (and, in production, the whole running instance) down. This new channel has no
+    // "outputs" block at all, which parse_channel() rejects the same way it always has.
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    channel_t chans[2] = {};
+    chans[0].enabled = true;
+    size_t bins[2] = {0, 0};
+    size_t base_bins[2] = {0, 0};
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 1;
+    dev.channel_capacity = 2;
+    dev.channels = chans;
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    std::string path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); },
+    { freq = 120050000; }
+  );
+});
+)");
+    ConfigSnapshot snapshot;
+    std::string parse_error;
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    // Still running, count untouched, failure surfaced instead of a crash.
+    EXPECT_EQ(dev.channel_count.load(), 1);
+    EXPECT_TRUE(result.applied.empty());
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("failed to parse"), std::string::npos);
+    EXPECT_NE(result.skipped_requires_restart[0].find("no restart needed"), std::string::npos);
+    // config_error_is_recoverable and cerr must both be restored, not left in the "diverted"
+    // state, so a later real error() call (e.g. from a subsequent test) behaves normally.
+    EXPECT_FALSE(config_error_is_recoverable);
+}
+
+TEST_F(ChannelAppendTest, r_scan_channel_count_change_is_requires_restart_not_append) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+
+    channel_t chans[1] = {};
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_SCAN;
+    dev.channel_count = 1;
+    dev.channel_capacity = 1;
+    dev.channels = chans;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_SCAN;
+    dsnap.channel_count = 2;  // shouldn't be reachable for a real R_SCAN config, but guarded anyway
+    dsnap.sample_rate = 2000000;
+    dsnap.has_gain = false;
+    snapshot.devices.push_back(dsnap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(dev.channel_count.load(), 1);
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("R_SCAN"), std::string::npos);
+}
+
+TEST_F(ChannelAppendTest, channel_count_decrease_is_still_requires_restart) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+
+    channel_t chans[2] = {};
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 2;
+    dev.channel_capacity = 2;
+    dev.channels = chans;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 1;  // decreased
+    dsnap.sample_rate = 2000000;
+    dsnap.has_gain = false;
+    snapshot.devices.push_back(dsnap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(dev.channel_count.load(), 2);  // unchanged - decrease is never attempted live
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("channel count changed"), std::string::npos);
 }

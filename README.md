@@ -31,8 +31,8 @@ that tracks upstream `main` and carries a small delta on top of it:
 This branch adds a live retune/reconfiguration control socket, so an operator can push
 config changes to a running instance without dropping the feed for a full restart. It's
 still soaking on a test instance before being considered for `main` — see
-[`CLAUDE.md`](CLAUDE.md) (fork-delta item 26) for the full design notes, scope, and known
-limitations.
+[`CLAUDE.md`](CLAUDE.md) (fork-delta items 26-27) for the full design notes, scope, and
+known limitations.
 
 - **`control_socket_path`** — a same-host-only Unix domain socket (owner-only permissions)
   that accepts one JSON command per line and returns one JSON response line:
@@ -41,10 +41,15 @@ limitations.
   live-applies whatever it safely can, reporting the rest as needing a restart).
 - **New `enabled = true/false` channel/mixer config keyword** — declare a channel or
   mixer up front (optionally starting disabled) so it can be toggled live via the socket.
-  Adding a channel/mixer/device that wasn't in the original config still requires a
-  restart.
+  Adding a mixer or device that wasn't in the original config still requires a restart.
+- **`reserve_channels`** — reserve extra, unused-at-startup channel slots on a device so a
+  channel that *wasn't* in the original config can be appended later, live: add it to the
+  config file and send `reload_diff`, no restart needed. Requires setting
+  `reserve_channels` up front on that device (one restart to opt in); an
+  `R_SCAN`-mode device, or exceeding the reserved headroom, still falls back to reporting
+  that a restart is needed.
 - SIGHUP-triggered full reload (above) is unaffected and remains the fallback for any
-  change outside this feature's scope (e.g. sample rate, new devices).
+  change outside this feature's scope (e.g. sample rate, mixer/device add).
 
 ### Metrics Exposed via the Stats Endpoint
 

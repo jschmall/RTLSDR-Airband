@@ -21,8 +21,9 @@
 #ifndef _LOGGING_H
 #define _LOGGING_H 1
 
-#include <syslog.h>  // LOG_ERR
-#include <cstdio>    // FILE
+#include <syslog.h>   // LOG_ERR
+#include <cstdio>     // FILE
+#include <stdexcept>  // std::runtime_error
 #include <string>
 
 #define nop() \
@@ -50,6 +51,24 @@ enum LogDestination { SYSLOG, STDERR, NONE };
 extern LogDestination log_destination;
 extern bool log_json_format;
 extern FILE* debugf;
+
+// Set (only) by the dynamic_reload live channel-append path in live_reconfig.cpp around a
+// synchronous call into config.cpp's per-channel parsing code, which calls error() on ~50 sites
+// for a malformed config value. Startup parsing must still exit hard on a bad config, but a bad
+// value in a channel appended to an already-running process must not be allowed to take the
+// whole process down - see error()'s definition (logging.cpp). thread_local because it's set and
+// cleared entirely within the control-socket thread's handling of a single command; every other
+// thread (startup's main thread included) must always see it false.
+extern thread_local bool config_error_is_recoverable;
+
+// Thrown by error() instead of calling _Exit(1) when config_error_is_recoverable is set. The
+// caller that set the flag is expected to catch this - the human-readable error text is not
+// carried on the exception itself (call sites print it to cerr immediately before calling
+// error()); the catching code is expected to have redirected cerr to capture that text. See
+// live_reconfig.cpp's live channel-append path.
+struct ConfigApplyError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 void error();
 void init_debug(const char* file);

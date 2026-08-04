@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 #include "rtl_airband.h"
@@ -87,6 +88,16 @@ struct DeviceConfigSnapshot {
     bool has_gain;  // false if "gain" is absent, or present as a non-numeric (per-element) form
     float gain;
     std::vector<bool> channel_enabled;  // size == channel_count
+
+    // Together, let compute_and_apply_diff() locate a newly-appended channel's full raw
+    // definition (freq/label/modulation/outputs/...) when channel_count grows, without
+    // re-deriving the disable=true skip logic a second time: raw_channel_indices[k] is this
+    // device's compacted channel k's position within *raw_channels_setting (same size/order as
+    // channel_enabled). raw_channels_setting is NULL when this device has no raw "channels"
+    // setting at all (channel_count is then 0 too). Only valid as long as the ConfigSnapshot's
+    // own raw_config below is kept alive - these are raw pointers into that Config's tree.
+    std::vector<int> raw_channel_indices;
+    libconfig::Setting* raw_channels_setting = nullptr;
 };
 
 struct MixerConfigSnapshot {
@@ -97,6 +108,13 @@ struct MixerConfigSnapshot {
 struct ConfigSnapshot {
     std::vector<DeviceConfigSnapshot> devices;
     std::vector<MixerConfigSnapshot> mixers;
+
+    // Keeps the freshly re-read config file's parsed tree alive past parse_config_snapshot()
+    // returning, since DeviceConfigSnapshot::raw_channels_setting points into it - libconfig
+    // Setting references/pointers are only valid while their owning Config is alive. Everything
+    // else in this struct is copied out by value and doesn't need this; only the live
+    // channel-append path in compute_and_apply_diff() dereferences it.
+    std::shared_ptr<libconfig::Config> raw_config;
 };
 
 // Re-reads cfgfile from disk into a snapshot. Returns false and sets *error on a file/parse

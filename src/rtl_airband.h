@@ -390,7 +390,19 @@ struct device_t {
 #ifdef NFM
     float alpha;
 #endif /* NFM */
-    int channel_count;
+    // Number of live channels. Grown at runtime (dynamic channel add via reload_diff) up to
+    // channel_capacity by writing a new channel into an already-allocated, already-zeroed slot
+    // and then publishing this count - see compute_and_apply_diff() (live_reconfig.cpp). Every
+    // existing "for (int j = 0; j < dev->channel_count; j++)" loop re-reads this fresh each pass
+    // (never caches it across passes), so the implicit atomic->int conversion means no call site
+    // needs to change.
+    std::atomic<int> channel_count;
+    // Allocated size of channels/bins/base_bins - channel_count plus the device's configured
+    // reserve_channels headroom (config.cpp). Fixed once at startup in parse_devices() and never
+    // changed again; channel_count can grow up to this value without ever reallocating the
+    // arrays below, which is what makes runtime growth safe with no lock: a demod/output thread
+    // reading through channels/bins/base_bins never sees the block move.
+    int channel_capacity;
     size_t *base_bins, *bins;
     channel_t* channels;
     // FIXME: size_t
@@ -500,6 +512,14 @@ extern volatile int do_exit, device_opened;
 extern float alpha;
 extern device_t* devices;
 extern mixer_t* mixers;
+// Allocates output->lame/lamebuf and connects output->type-specific state (shout_setup()/
+// udp_stream_init()/pulse_setup()) - the "make this output actually ready to encode/send" step
+// that's otherwise only ever run once, at startup, right after parse_devices()/parse_mixers().
+// Shared with the dynamic_reload live channel-append path (live_reconfig.cpp), which must run
+// this for a brand-new channel's outputs before publishing it - unlike channel_apply_enable()'s
+// reconnect_channel_outputs() (live_reconfig.h), which assumes lame/lamebuf already exist from
+// this call and only redoes the connection.
+bool init_output(channel_t* channel, output_t* output);
 
 // util.cpp
 int atomic_inc(volatile int* pv);
@@ -542,6 +562,10 @@ void mix_waveforms(float* sum, const float* in, float mult, int size);
 // config.cpp
 int parse_devices(libconfig::Setting& devs);
 int parse_mixers(libconfig::Setting& mx);
+// Shared by parse_devices()'s startup path and dynamic_reload's live channel-append path
+// (live_reconfig.cpp) - see parse_channel()'s definition in config.cpp for the full contract,
+// including why it returns false for two pre-existing legacy-value quirks.
+bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx, int chan_idx, channel_t* channel);
 
 // udp_stream.cpp
 bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len);

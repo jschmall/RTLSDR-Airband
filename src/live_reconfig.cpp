@@ -21,8 +21,11 @@
 #include <cerrno>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 #include <libconfig.h++>
+#include <sstream>
 #include "input-common.h"
+#include "logging.h"  // ConfigApplyError, config_error_is_recoverable
 #include "rtl_airband.h"
 
 using namespace std;
@@ -186,10 +189,78 @@ bool snapshot_get_numeric_gain(libconfig::Setting& dev_setting, float* gain) {
     return false;
 }
 
+// Attempts to parse and append snap.channel_count - dev->channel_count new channels (the caller
+// has already confirmed this fits within dev->channel_capacity) from their raw config Settings.
+// All-or-nothing: on any single new channel's parse failure, nothing is published - dev's
+// channel_count is only ever advanced on full success, and until then nothing at index >=
+// dev->channel_count is visible to any other thread (demod/output), so there's nothing to unwind
+// there. A channel that individually parsed fine earlier in a batch that later fails is simply
+// leaked (its heap allocations - strdup'd labels, XCALLOC'd outputs - are never freed) rather
+// than unwound: this is a rare, operator-triggered path (editing a config file and retrying), so
+// a few hundred bytes of leak on a failed attempt is an acceptable tradeoff against a real
+// rollback's complexity. On failure, *error_text carries the best available diagnostic text.
+bool try_append_channels(device_t* dev, int dev_idx, const DeviceConfigSnapshot& snap, string* error_text) {
+    int old_count = dev->channel_count;
+    int new_count = old_count;
+
+    config_error_is_recoverable = true;
+    ostringstream captured;
+    std::streambuf* old_cerr_buf = std::cerr.rdbuf(captured.rdbuf());
+    bool ok = true;
+    string exception_text;
+    try {
+        for (int k = old_count; k < snap.channel_count; k++) {
+            libconfig::Setting& chan_setting = (*snap.raw_channels_setting)[snap.raw_channel_indices[k]];
+            channel_t* channel = dev->channels + k;
+            if (!parse_channel(chan_setting, dev, dev_idx, k, channel)) {
+                // parse_channel() returning false here is the same pre-existing legacy-value
+                // quirk documented on parse_channel() itself (config.cpp) - this one channel is
+                // silently not counted, matching startup behavior for the same input. Nothing to
+                // connect for it.
+                continue;
+            }
+            // Mirrors main()'s startup call to init_output() for every output right after
+            // parse_devices() returns (rtl_airband.cpp): a freshly parsed channel_t's output_t
+            // structs are allocated by parse_outputs() (inside parse_channel() above), but none
+            // of them have a LAME encoder or an open connection until this runs - unlike
+            // re-enabling an already-live channel (channel_apply_enable() -> reconnect_channel_
+            // outputs()), which can assume that part already happened once at startup.
+            for (int o = 0; o < channel->output_count; o++) {
+                if (!init_output(channel, channel->outputs + o)) {
+                    throw std::runtime_error("failed to initialize output " + to_string(o) + " for appended channel " + to_string(k));
+                }
+            }
+            new_count = k + 1;
+        }
+    } catch (const std::exception& e) {
+        // Catches both ConfigApplyError (what recoverable-mode error() throws - config.cpp's
+        // call sites print a human-readable message to cerr immediately before calling error(),
+        // captured above) and any raw libconfig::ConfigException (e.g. SettingNotFoundException
+        // from indexing a required-but-missing key like chan_setting["outputs"] - config.cpp's
+        // parser assumes many required keys exist rather than calling error() for every one of
+        // them, exactly as a startup config missing the same key would already fail today).
+        // Either way the process must survive; e.what() is the fallback when nothing was ever
+        // written to cerr on this particular failure path.
+        ok = false;
+        exception_text = e.what();
+    }
+    std::cerr.rdbuf(old_cerr_buf);
+    config_error_is_recoverable = false;
+
+    if (!ok) {
+        string captured_text = captured.str();
+        *error_text = captured_text.empty() ? exception_text : captured_text;
+        return false;
+    }
+    dev->channel_count.store(new_count, std::memory_order_release);
+    return true;
+}
+
 }  // namespace
 
 bool parse_config_snapshot(const string& config_path, ConfigSnapshot* out, string* error) {
-    libconfig::Config cfg;
+    out->raw_config = std::make_shared<libconfig::Config>();
+    libconfig::Config& cfg = *out->raw_config;
     try {
         cfg.readFile(config_path.c_str());
     } catch (const libconfig::FileIOException&) {
@@ -238,13 +309,17 @@ bool parse_config_snapshot(const string& config_path, ConfigSnapshot* out, strin
         dev.has_gain = snapshot_get_numeric_gain(devs[i], &dev.gain);
 
         dev.channel_enabled.clear();
+        dev.raw_channel_indices.clear();
+        dev.raw_channels_setting = nullptr;
         if (devs[i].exists("channels")) {
             libconfig::Setting& chans = devs[i]["channels"];
+            dev.raw_channels_setting = &chans;
             for (int j = 0; j < chans.getLength(); j++) {
                 if (chans[j].exists("disable") && (bool)chans[j]["disable"] == true) {
                     continue;
                 }
                 dev.channel_enabled.push_back(chans[j].exists("enabled") ? (bool)chans[j]["enabled"] : true);
+                dev.raw_channel_indices.push_back(j);
             }
         }
         dev.channel_count = (int)dev.channel_enabled.size();
@@ -277,7 +352,30 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
                 result.skipped_requires_restart.push_back(label + ": sample_rate changed");
             }
 
-            if (snap.channel_count != dev->channel_count) {
+            if (snap.channel_count > dev->channel_count) {
+                int to_add = snap.channel_count - dev->channel_count;
+                if (dev->mode != R_MULTICHANNEL) {
+                    // Structurally shouldn't happen - an R_SCAN device is validated at parse time
+                    // to always have exactly one channel - but kept as an explicit, cheap guard
+                    // matching the documented non-goal (R_SCAN channels don't support live add;
+                    // "add a frequency to the existing channel's freqlist" is a different,
+                    // unimplemented feature).
+                    result.skipped_requires_restart.push_back(label + ": channel count changed (R_SCAN devices don't support live channel add)");
+                } else if (dev->channel_count + to_add > dev->channel_capacity) {
+                    result.skipped_requires_restart.push_back(label + ": " + to_string(to_add) + " new channel(s) declared but only " + to_string(dev->channel_capacity - dev->channel_count) +
+                                                              " reserve_channels slot(s) available");
+                } else {
+                    int added_from = dev->channel_count;
+                    string apply_error;
+                    if (try_append_channels(dev, i, snap, &apply_error)) {
+                        result.applied.push_back(label + ": added " + to_string(dev->channel_count - added_from) + " channel(s) (index " + to_string(added_from) + "-" +
+                                                 to_string(dev->channel_count - 1) + ")");
+                    } else {
+                        result.skipped_requires_restart.push_back(label + ": " + to_string(to_add) + " new channel(s) failed to parse and were not added: " + apply_error +
+                                                                  " (fix the config and retry reload_diff - no restart needed)");
+                    }
+                }
+            } else if (snap.channel_count != dev->channel_count) {
                 result.skipped_requires_restart.push_back(label + ": channel count changed");
             } else {
                 for (int j = 0; j < dev->channel_count; j++) {
