@@ -330,7 +330,10 @@ Keep the local delta small and well understood.
     `SO_PEERCRED`-checked) control socket, gated behind a new top-level `control_socket_path`
     config option, that accepts one JSON object per line and returns one JSON response line:
     `retune`, `set_gain`, `set_bandwidth`, `channel_enable`/`channel_disable`,
-    `mixer_enable`/`mixer_disable`, `reload_diff`.
+    `mixer_enable`/`mixer_disable`, `reload_diff`. The `SO_PEERCRED` check requires an exact UID
+    match against the daemon's own `getuid()`, so a systemd unit that leaves `User=`/`Group=`
+    unset (running as root) locks out any non-root control-socket client — discovered while
+    testing this branch. The example unit (`init.d/rtl_airband.service`) now documents this.
     - **New `enabled = false/true` channel/mixer config keyword** (`src/config.cpp`), distinct
       from the pre-existing parse-time-permanent `disable` (which skips the config entry
       entirely — no array slot allocated). `enabled` still allocates everything (bins, `dm_dphi`,
@@ -728,3 +731,7 @@ send-side pacing code; confirm with a wire capture first.
   feeding Broadcastify. Same VLAN as the SDR host, direct L2, no firewall in the path.
 - Per-instance channel configs live outside this repo and are not committed. Paste them into a
   session when they are relevant rather than adding them here.
+- Once an instance's config sets `control_socket_path` (`dynamic_reload`, item 26), its systemd
+  unit must set `User=`/`Group=` to a non-root service account — the control socket's
+  `SO_PEERCRED` check rejects any client whose UID doesn't match the daemon's own, so a
+  root-run daemon can only be controlled by root-run tooling.
