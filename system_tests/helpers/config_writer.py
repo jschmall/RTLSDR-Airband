@@ -102,6 +102,12 @@ def write_config(
         mixers: List of mixer dicts with keys:
             - name (str): Mixer name referenced by channel mixer_output entries.
             - label (str): Filename template for the mixer's MP3 output.
+            - reserve_inputs (int|None): If provided, reserves this many extra
+              (unused at startup) input array slots on the mixer, letting a
+              later reload_diff-appended channel's mixer output connect live
+              without a restart - see rtl_airband.h's mixer_t::input_capacity
+              comment. Omitted (defaults to 0, no live-append headroom) if
+              not given.
             Output files are written to output_dir.
         mp3_tmp_dir: If provided, each channel gets a "file" (MP3) output
             written to this directory using output_filename_template. The
@@ -136,6 +142,8 @@ def write_config(
             lines.append("  {")
             if mx.get("enabled") is not None:
                 lines.append(f"    enabled = {'true' if mx['enabled'] else 'false'};")
+            if mx.get("reserve_inputs") is not None:
+                lines.append(f"    reserve_inputs = {mx['reserve_inputs']};")
             lines.append("    outputs:")
             lines.append("    (")
             lines.append("      {")

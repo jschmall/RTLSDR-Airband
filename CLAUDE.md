@@ -442,6 +442,72 @@ Keep the local delta small and well understood.
       confirmed alongside its already-running sibling channel being unaffected; appending beyond
       `reserve_channels` is rejected without disrupting the existing channel) using a new
       `reserve_channels` parameter on `helpers/config_writer.write_config()`.
+28. **Mixer-input live-append data race fix** (`src/mixer.cpp`, `src/rtl_airband.{cpp,h}`,
+    `src/config.cpp`) — closes a gap flagged but not fixed while item 27 was built: a dynamically
+    appended channel whose config declares a `type = "mixer"` output *did* reach
+    `mixer_connect_input()` (`mixer.cpp`) on the live-append path, and that function grew
+    `mixer_t::inputs`/`inputs_todo`/`input_mask` via an unconditional `XREALLOC` with a comment
+    claiming it was "only run at startup" — no longer true once threads (`mixer_thread()`, the
+    output thread's `mixer_put_samples()`/`mixer_disable_input()`/`mixer_enable_input()`) are
+    already running and reading that pointer/count with no synchronization of their own. A real
+    use-after-free, not theoretical.
+    - Mirrors item 27's own fix for `device_t::channels`: a new `reserve_inputs` mixer-level
+      config int (default `0`) sizes extra headroom, added on top of however many inputs actually
+      connected during startup by a one-time `mixer_finalize_capacity()` (`mixer.cpp`), called
+      from `main()` right after `parse_devices()` returns and before any thread is created — the
+      same single-threaded window item 27 relies on. `mixer_t::input_count` is now
+      `std::atomic<int>`; a new `input_capacity` field (plain `int`, write-once before
+      finalization) mirrors `channel_capacity`. Unlike device channels, a mixer's eventual input
+      count isn't known upfront (`parse_mixers()` runs *before* `parse_devices()`, and inputs are
+      discovered incrementally as channel outputs connect to it) — so, unlike `reserve_channels`,
+      the pre-reserved headroom can only be finalized once, after startup connections are done,
+      not sized upfront.
+    - `mixer_connect_input()` now branches on `mixer_capacity_finalized` (a plain global, not a
+      `mixer.cpp` file-static — the unit test binary links every `test_*.cpp` into one process, and
+      a file-static would leak `true` across unrelated tests in link/registration order): before
+      finalization it grows exactly as before (still single-threaded, still safe); after
+      finalization, exceeding `input_capacity` is rejected with a clear `mixer_get_error()` message
+      instead of reallocating — which, via the same `config_error_is_recoverable` mechanism item 27
+      already built, surfaces as an ordinary `skipped_requires_restart` entry for a live append,
+      with no changes needed in `live_reconfig.cpp` at all.
+    - Two adjacent bugs surfaced by the new system tests below, both fixed alongside the race
+      itself:
+      - A mixer declared with zero startup-connected inputs (the intended shape for a
+        `reserve_inputs`-only, live-append-only mixer) never had its own output initialized —
+        `main()`'s startup loop skipped `init_output()` for any mixer whose `enabled` was still
+        `false` at that point ("no inputs connected = no need to initialize output"), correct
+        before dynamic_reload (a zero-input mixer could never gain one) but not after. Fixed by
+        always initializing a mixer's own outputs at startup regardless of `enabled`, matching how
+        device channels already behave (no such skip exists for them). This incidentally also
+        fixes a second, pre-existing latent instance of the same gap: a mixer declared with its own
+        config-level `enabled = false` that *does* have startup-connected inputs was left with its
+        outputs uninitialized too, since `mixer_disable()` (called for `config_wants_disabled`
+        mixers right after `parse_devices()`) ran before the output-init loop and left `enabled`
+        false by the time that loop checked it.
+      - `control_socket.cpp`'s `json_escape()` didn't escape control characters, only `"` and `\`.
+        Nearly every `error_response()` message is built from a captured `cerr` string that ends in
+        `"\n"` (every `config.cpp` parse-error printout does), and the control socket's wire
+        protocol is one JSON object per line — an unescaped, embedded newline in a response
+        silently truncates it before the closing brace on every client, a latent bug for *any*
+        config-parse error during a live append, not just this one. Only ever exercised by a real
+        socket round-trip, not the pre-existing unit tests (which check `compute_and_apply_diff()`'s
+        returned C++ string directly, never JSON-serialized) — this fork's first system test that
+        actually reaches this path (the capacity-exceeded case below) is what surfaced it. Fixed by
+        escaping `\n`/`\r`/`\t` and other control characters properly.
+    - Unit tested in `src/test_mixer.cpp` (pre/post-finalize growth, headroom sizing, pointer
+      stability across a post-finalize append, capacity-exceeded rejection, the zero-input
+      finalize edge cases — `XREALLOC(ptr, 0)` can return `NULL`, which `xrealloc()` treats as
+      fatal OOM, so finalizing a mixer with zero inputs and zero reserve must skip the realloc
+      entirely), `src/test_live_reconfig.cpp` (a live-appended channel's `type = "mixer"` output
+      connecting within/beyond `reserve_inputs`), and `src/test_control_socket.cpp` (a response
+      never contains a raw newline). System-tested end-to-end in
+      `system_tests/tests/test_channel_add.py` using a new `reserve_inputs` parameter on
+      `helpers/config_writer.write_config()`'s mixer dicts: an appended channel's mixer output
+      produces real audio through the mixer within its reserved headroom, and exceeding it is
+      rejected while the mixer's already-connected input keeps producing correct, undisturbed
+      audio throughout — the closest a system test (no sanitizer) can get to proving the original
+      race is actually closed. Full unit test pass across Debug, Debug+NFM, and
+      `-DRDIO_SCANNER=OFF` builds, plus the full system test suite.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

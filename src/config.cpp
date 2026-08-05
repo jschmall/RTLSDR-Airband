@@ -984,9 +984,20 @@ int parse_mixers(libconfig::Setting& mx) {
         mixer->interval = MIX_DIVISOR;
         mixer->output_overrun_count = 0;
         mixer->input_count = 0;
+        mixer->input_capacity = 0;
         mixer->inputs = NULL;
         mixer->inputs_todo = NULL;
         mixer->input_mask = NULL;
+        // Extra input array capacity reserved (by mixer_finalize_capacity(), mixer.cpp, called
+        // from main() after parse_devices() returns) so an input can be connected live later
+        // (dynamic_reload's reload_diff, when an appended channel's output is `type = "mixer"`)
+        // without ever reallocating inputs/inputs_todo/input_mask - see mixer_t::input_capacity's
+        // comment (rtl_airband.h) for why that matters.
+        mixer->reserve_inputs = mx[i].exists("reserve_inputs") ? (int)mx[i]["reserve_inputs"] : 0;
+        if (mixer->reserve_inputs < 0) {
+            cerr << "Configuration error: mixers.[" << i << "]: reserve_inputs must not be negative\n";
+            error();
+        }
         channel_t* channel = &mixer->channel;
         // mixer->channel.enabled gates process_outputs() same as any other channel_t (see
         // output.cpp), but unlike device channels it has no separate config keyword - a mixer's

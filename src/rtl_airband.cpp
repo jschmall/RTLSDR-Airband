@@ -978,11 +978,18 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Must run after every startup channel's mixer output has had a chance to connect
+        // (parse_devices() above) and before any thread is created (first pthread_create() is
+        // further below) - reserves each mixer's configured reserve_inputs headroom and stops
+        // mixer_connect_input() from ever reallocating again, which is what makes a later live
+        // append (dynamic_reload reload_diff) safe. See mixer_finalize_capacity() (mixer.cpp).
+        mixer_finalize_capacity();
+
         debug_print("mixer_count=%d\n", mixer_count);
 #ifdef DEBUG
         for (int z = 0; z < mixer_count; z++) {
             mixer_t* m = &mixers[z];
-            debug_print("mixer[%d]: name=%s, input_count=%d, output_count=%d\n", z, m->name, m->input_count, m->channel.output_count);
+            debug_print("mixer[%d]: name=%s, input_count=%d, output_count=%d\n", z, m->name, (int)m->input_count, m->channel.output_count);
         }
 #endif /* DEBUG */
     } catch (const FileIOException& e) {
@@ -1046,9 +1053,18 @@ int main(int argc, char* argv[]) {
     }
 
     for (int i = 0; i < mixer_count; i++) {
-        if (mixers[i].enabled == false) {
-            continue;  // no inputs connected = no need to initialize output
-        }
+        // Previously skipped when mixers[i].enabled was false ("no inputs connected = no need to
+        // initialize output"), which was safe before dynamic_reload: a mixer with zero startup
+        // inputs could never gain any, so its own output was genuinely never going to be used.
+        // That's no longer true - a mixer declared with reserve_inputs headroom (rtl_airband.h's
+        // mixer_t::input_capacity comment) can start with zero inputs and gain its first one live
+        // later (mixer_connect_input() then flips enabled to true, mixer.cpp), at which point its
+        // own output must already be initialized for mixer_thread()/the output thread to have
+        // anything to write through. Always initializing here also happens to fix the same gap
+        // for a mixer with `enabled = false` in its own config block that has startup-connected
+        // inputs - see the mixer_disable() loop right above, which otherwise leaves the mixer
+        // disabled by the time this loop used to check it, permanently skipping init. Matches
+        // device channels below, which have never had this skip.
         channel_t* channel = &mixers[i].channel;
         for (int k = 0; k < channel->output_count; k++) {
             output_t* output = channel->outputs + k;

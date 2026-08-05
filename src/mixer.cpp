@@ -31,6 +31,8 @@
 
 static char* err;
 
+bool mixer_capacity_finalized = false;
+
 static inline void mixer_set_error(const char* msg) {
     err = strdup(msg);
 }
@@ -76,16 +78,28 @@ int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance) {
     }
     int i = mixer->input_count;
 
-    // allocate new mixer - this could be more efficient by pre-allocating but this
-    // is only run at startup so not a big deal
-    if (mixer->inputs == NULL) {
-        mixer->inputs = (mixinput_t*)XCALLOC(i + 1, sizeof(struct mixinput_t));
-        mixer->inputs_todo = (bool*)XCALLOC(i + 1, sizeof(bool));
-        mixer->input_mask = (bool*)XCALLOC(i + 1, sizeof(bool));
-    } else {
-        mixer->inputs = (mixinput_t*)XREALLOC(mixer->inputs, (i + 1) * sizeof(struct mixinput_t));
-        mixer->inputs_todo = (bool*)XREALLOC(mixer->inputs_todo, (i + 1) * sizeof(bool));
-        mixer->input_mask = (bool*)XREALLOC(mixer->input_mask, (i + 1) * sizeof(bool));
+    if (i >= mixer->input_capacity) {
+        if (mixer_capacity_finalized) {
+            // Past the single-threaded startup window (mixer_finalize_capacity() already ran) -
+            // mixer_thread()/mixer_put_samples() may be reading inputs/input_count right now, so
+            // growing via realloc here would be a use-after-free. This is a live append
+            // (dynamic_reload reload_diff) with insufficient reserve_inputs headroom - reject it
+            // instead, same shape as device_t::channel_capacity being exceeded.
+            mixer_set_error("mixer input capacity exceeded - increase reserve_inputs for this mixer");
+            return (-1);
+        }
+        // Still startup (parse_devices() hasn't finished / mixer_finalize_capacity() hasn't run
+        // yet) - no other thread exists yet, so growing here is safe, same as before this fix.
+        if (mixer->inputs == NULL) {
+            mixer->inputs = (mixinput_t*)XCALLOC(i + 1, sizeof(struct mixinput_t));
+            mixer->inputs_todo = (bool*)XCALLOC(i + 1, sizeof(bool));
+            mixer->input_mask = (bool*)XCALLOC(i + 1, sizeof(bool));
+        } else {
+            mixer->inputs = (mixinput_t*)XREALLOC(mixer->inputs, (i + 1) * sizeof(struct mixinput_t));
+            mixer->inputs_todo = (bool*)XREALLOC(mixer->inputs_todo, (i + 1) * sizeof(bool));
+            mixer->input_mask = (bool*)XREALLOC(mixer->input_mask, (i + 1) * sizeof(bool));
+        }
+        mixer->input_capacity = i + 1;
     }
 
     mixer->inputs[i].wavein = (float*)XCALLOC(WAVE_LEN, sizeof(float));
@@ -105,7 +119,42 @@ int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance) {
     mixer->inputs_todo[i] = true;
     mixer->enabled = true;
     debug_print("ampfactor=%.1f ampl=%.1f ampr=%.1f\n", mixer->inputs[i].ampfactor, mixer->inputs[i].ampl, mixer->inputs[i].ampr);
-    return (mixer->input_count++);
+    mixer->input_count.store(i + 1, std::memory_order_release);
+    return i;
+}
+
+// Called once from main(), after parse_devices() returns (so every startup channel's mixer
+// output has had a chance to connect) and before any thread is created. Reserves reserve_inputs
+// extra headroom on top of whatever connected during startup and locks inputs/inputs_todo/
+// input_mask in place for good - after this, mixer_connect_input() never reallocates, which is
+// what makes a later live append (dynamic_reload reload_diff) safe with no lock.
+void mixer_finalize_capacity() {
+    for (int m = 0; m < mixer_count; m++) {
+        mixer_t* mixer = &mixers[m];
+        int old_count = mixer->input_count;
+        int new_capacity = old_count + mixer->reserve_inputs;
+        if (new_capacity == 0) {
+            // No inputs connected at startup and no headroom reserved - leave everything NULL.
+            // realloc(ptr, 0) can return NULL, which xrealloc() treats as fatal OOM; skip it.
+            mixer->input_capacity = 0;
+        } else if (mixer->inputs == NULL) {
+            // A live-append-only mixer: zero inputs connected at startup, but reserve_inputs > 0.
+            mixer->inputs = (mixinput_t*)XCALLOC(new_capacity, sizeof(struct mixinput_t));
+            mixer->inputs_todo = (bool*)XCALLOC(new_capacity, sizeof(bool));
+            mixer->input_mask = (bool*)XCALLOC(new_capacity, sizeof(bool));
+            mixer->input_capacity = new_capacity;
+        } else if (new_capacity > mixer->input_capacity) {
+            mixer->inputs = (mixinput_t*)XREALLOC(mixer->inputs, new_capacity * sizeof(struct mixinput_t));
+            mixer->inputs_todo = (bool*)XREALLOC(mixer->inputs_todo, new_capacity * sizeof(bool));
+            mixer->input_mask = (bool*)XREALLOC(mixer->input_mask, new_capacity * sizeof(bool));
+            // XREALLOC, unlike XCALLOC, does not zero the newly grown tail.
+            memset(mixer->inputs + old_count, 0, mixer->reserve_inputs * sizeof(struct mixinput_t));
+            memset(mixer->inputs_todo + old_count, 0, mixer->reserve_inputs * sizeof(bool));
+            memset(mixer->input_mask + old_count, 0, mixer->reserve_inputs * sizeof(bool));
+            mixer->input_capacity = new_capacity;
+        }
+    }
+    mixer_capacity_finalized = true;
 }
 
 void mixer_disable_input(mixer_t* mixer, int input_idx) {

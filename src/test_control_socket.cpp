@@ -173,3 +173,19 @@ TEST_F(ControlSocketDispatchTest, dispatch_command_line_reports_parse_errors) {
     EXPECT_NE(response.find("\"ok\":false"), string::npos);
     EXPECT_NE(response.find("parse error"), string::npos);
 }
+
+// The wire protocol is one JSON response per line (control_socket_read_thread(), control_socket.
+// cpp) - a raw, unescaped newline embedded in a response string breaks every client's framing,
+// truncating the message before its closing brace. Nearly every error_response() message is
+// built from a captured cerr message that ends in "\n" (e.g. config.cpp's parse-error printouts
+// during a dynamic_reload live channel append - see config_error_is_recoverable, logging.h), so
+// this isn't a hypothetical: it's the normal shape of an append-failure error message. Using an
+// embedded raw newline in the "cmd" field here (rather than a config-parse error, which would
+// need a much heavier live_reconfig fixture) exercises the same json_escape() path with the
+// same class of un-sanitized, attacker/config-controlled text.
+TEST_F(ControlSocketDispatchTest, dispatch_command_line_response_never_contains_a_raw_newline) {
+    string response = control_socket_dispatch_command_line("{\"cmd\":\"bogus\ncmd\"}");
+    EXPECT_NE(response.find("\"ok\":false"), string::npos);
+    EXPECT_EQ(response.find('\n'), string::npos) << "response: " << response;
+    EXPECT_NE(response.find("bogus\\ncmd"), string::npos) << "response: " << response;
+}

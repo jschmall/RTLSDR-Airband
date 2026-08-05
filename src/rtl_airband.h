@@ -455,7 +455,25 @@ struct mixer_t {
     std::atomic<int> pending_enable_request;
     int interval;
     size_t output_overrun_count;
-    int input_count;
+    // Number of connected inputs. Grown at runtime (dynamic channel add via reload_diff, when an
+    // appended channel's output is `type = "mixer"`) up to input_capacity by writing into an
+    // already-allocated, already-zeroed slot and then publishing this count - see
+    // mixer_connect_input() (mixer.cpp) and device_t::channel_count's comment above for the same
+    // pattern applied to device channels. Every existing "for (j=0;j<mixer->input_count;j++)"
+    // loop re-reads this fresh each pass, so the implicit atomic->int conversion means no call
+    // site needs to change.
+    std::atomic<int> input_count;
+    // Allocated size of inputs/inputs_todo/input_mask - input_count plus this mixer's configured
+    // reserve_inputs headroom. Unlike device_t::channel_capacity (sized upfront from a known
+    // config list length), a mixer's inputs are discovered incrementally as parse_devices() walks
+    // every device channel's outputs, so this is only fixed once, by mixer_finalize_capacity()
+    // (mixer.cpp), called from main() after parse_devices() returns and before any thread starts.
+    // From that point on, input_count can grow up to this value without ever reallocating the
+    // arrays below, which is what makes runtime growth safe with no lock.
+    int input_capacity;
+    // reserve_inputs from this mixer's config block (default 0), set once by parse_mixers() and
+    // consumed once by mixer_finalize_capacity() - not read again after that.
+    int reserve_inputs;
     mixinput_t* inputs;
     bool* inputs_todo;
     bool* input_mask;
@@ -541,6 +559,15 @@ float dBFS_to_level(const float& dBFS);
 float level_to_dBFS(const float& level);
 
 // mixer.cpp
+// Set once by mixer_finalize_capacity(), called from main() after parse_devices() returns and
+// before any thread starts. Before this point, mixer_connect_input() may still grow
+// inputs/inputs_todo/input_mask via realloc (safe - single-threaded startup); after this point it
+// never does, so a live-append attempt that would require growing past input_capacity is rejected
+// instead. A plain global (not a mixer.cpp file-static) so unit tests can reset it explicitly -
+// the unittests binary links every test_*.cpp into one process, and a file-static would leak
+// `true` across unrelated tests in link/registration order.
+extern bool mixer_capacity_finalized;
+void mixer_finalize_capacity();
 mixer_t* getmixerbyname(const char* name);
 int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance);
 void mixer_disable_input(mixer_t* mixer, int input_idx);

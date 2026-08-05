@@ -31,6 +31,7 @@
 #include <cctype>
 #include <cerrno>
 #include <csignal>  // sig_atomic_t
+#include <cstdio>   // snprintf
 #include <cstdlib>
 #include <cstring>
 #include "input-common.h"
@@ -51,10 +52,37 @@ string json_escape(const string& s) {
     string out;
     out.reserve(s.size());
     for (char c : s) {
-        if (c == '"' || c == '\\') {
-            out += '\\';
+        switch (c) {
+            case '"':
+                out += "\\\"";
+                break;
+            case '\\':
+                out += "\\\\";
+                break;
+            case '\n':
+                // Not just JSON-invalid without this - the wire protocol is one JSON object per
+                // line (control_socket_read_thread(), below), so a raw, unescaped newline in an
+                // error message (nearly all of them are built from a captured cerr message
+                // ending in "\n", e.g. config.cpp's parse-error printouts - see
+                // config_error_is_recoverable, logging.h) truncates the response line before its
+                // closing brace, breaking every client's parser.
+                out += "\\n";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            default:
+                if ((unsigned char)c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
         }
-        out += c;
     }
     return out;
 }

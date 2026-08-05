@@ -357,6 +357,10 @@ class DiffApplyTest : public LiveReconfigTest {
         device_count = 0;
         mixers = nullptr;
         mixer_count = 0;
+        // A single process-wide flag (see its declaration in rtl_airband.h) - must be reset per
+        // test or a mixer capacity test earlier in the binary leaks "finalized" into an unrelated
+        // later test that expects startup-style (pre-finalize) mixer_connect_input() growth.
+        mixer_capacity_finalized = false;
     }
 };
 
@@ -839,6 +843,152 @@ devices:
     EXPECT_TRUE(result.applied.empty());
     ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
     EXPECT_NE(result.skipped_requires_restart[0].find("reserve_channels"), std::string::npos);
+}
+
+// A dynamically-appended channel can itself declare a `type = "mixer"` output pointing at an
+// already-running mixer - this is what previously reached the unguarded XREALLOC growth in
+// mixer_connect_input() (see mixer_t::input_capacity's comment, rtl_airband.h). mixer_finalize_
+// capacity() is called explicitly here to simulate the post-parse_devices()/pre-thread-start state
+// main() would have left the mixer in, the same way this fixture already hand-builds device_t as
+// parse_devices() would have left it rather than calling parse_devices() itself.
+TEST_F(ChannelAppendTest, appends_channel_with_mixer_output_within_reserve_inputs) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    channel_t chans[2] = {};
+    chans[0].enabled = true;
+    size_t bins[2] = {0, 0};
+    size_t base_bins[2] = {0, 0};
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 1;
+    dev.channel_capacity = 2;
+    dev.channels = chans;
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    mixer_t mixer = {};
+    mixer.name = "mix1";
+    mixer.enabled = true;  // already running - avoid a spurious "enabled -> true" diff entry
+    mixer.channel.enabled = true;
+    mixer.channel.output_count = 0;
+    mixer.pending_enable_request = -1;
+    mixer.input_count = 0;
+    mixer.input_capacity = 0;
+    mixer.reserve_inputs = 1;  // headroom for exactly one live-appended input
+    mixers = &mixer;
+    mixer_count = 1;
+    mixer_finalize_capacity();
+
+    std::string path = write_config(R"(
+mixers: {
+  mix1: {
+    outputs: ( { type = "file"; directory = "/tmp"; filename_template = "mix"; } );
+  };
+};
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); },
+    { freq = 120050000; label = "new-chan"; outputs: ( { type = "mixer"; name = "mix1"; } ); }
+  );
+});
+)");
+    ConfigSnapshot snapshot;
+    std::string parse_error;
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+
+    mixinput_t* inputs_before = mixer.inputs;
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(dev.channel_count.load(), 2);
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+    ASSERT_EQ(result.applied.size(), 1u);
+    EXPECT_EQ(mixer.input_count.load(), 1);
+    EXPECT_EQ(mixer.inputs, inputs_before);  // no realloc - proves the reserved slot was reused
+    ASSERT_EQ(chans[1].output_count, 1);
+    mixer_data* mdata = (mixer_data*)chans[1].outputs[0].data;
+    EXPECT_EQ(mdata->mixer, &mixer);
+    EXPECT_EQ(mdata->input, 0);
+}
+
+TEST_F(ChannelAppendTest, appends_channel_with_mixer_output_exceeding_reserve_inputs_is_requires_restart) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    channel_t chans[2] = {};
+    chans[0].enabled = true;
+    size_t bins[2] = {0, 0};
+    size_t base_bins[2] = {0, 0};
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 1;
+    dev.channel_capacity = 2;
+    dev.channels = chans;
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    mixer_t mixer = {};
+    mixer.name = "mix1";
+    mixer.enabled = true;  // already running - avoid a spurious "enabled -> true" diff entry
+    mixer.channel.enabled = true;
+    mixer.channel.output_count = 0;
+    mixer.pending_enable_request = -1;
+    mixer.input_count = 0;
+    mixer.input_capacity = 0;
+    mixer.reserve_inputs = 0;  // no headroom - the live append below must be rejected, not crash
+    mixers = &mixer;
+    mixer_count = 1;
+    mixer_finalize_capacity();
+
+    std::string path = write_config(R"(
+mixers: {
+  mix1: {
+    outputs: ( { type = "file"; directory = "/tmp"; filename_template = "mix"; } );
+  };
+};
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); },
+    { freq = 120050000; outputs: ( { type = "mixer"; name = "mix1"; } ); }
+  );
+});
+)");
+    ConfigSnapshot snapshot;
+    std::string parse_error;
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(dev.channel_count.load(), 1);  // unchanged - the whole batch is rejected
+    EXPECT_TRUE(result.applied.empty());
+    EXPECT_EQ(mixer.input_count.load(), 0);  // mixer itself untouched
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("capacity"), std::string::npos);
 }
 
 TEST_F(ChannelAppendTest, malformed_new_channel_is_reported_and_does_not_crash_or_partially_apply) {
