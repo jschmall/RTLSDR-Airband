@@ -1307,6 +1307,19 @@ void* output_thread(void* param) {
                 }
                 for (int j = 0; j < dev->channel_count; j++) {
                     channel_t* channel = devices[i].channels + j;
+                    // Checked before the enable/disable request below, and - unlike that one -
+                    // not consumed via exchange(): channel_teardown_for_removal() frees this
+                    // channel's LAME encoder, and the caller waiting on this request
+                    // (try_remove_channels(), live_reconfig.cpp) decrements dev->channel_count as
+                    // soon as it observes completion, so the field must not signal "done" until
+                    // the teardown genuinely is - see channel_t::pending_remove_request's comment
+                    // (rtl_airband.h). Skips straight to the next channel: this one's outputs are
+                    // being torn down, not processed, for the rest of this pass.
+                    if (channel->pending_remove_request.load(std::memory_order_acquire) == 1) {
+                        channel_teardown_for_removal(channel);
+                        channel->pending_remove_request.store(-1, std::memory_order_release);
+                        continue;
+                    }
                     // Consume any pending dynamic_reload enable/disable request before
                     // process_outputs() - this thread owns this channel's outputs, so applying
                     // the change here (rather than on the control socket thread) is what keeps

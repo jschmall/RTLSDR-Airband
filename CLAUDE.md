@@ -508,6 +508,71 @@ Keep the local delta small and well understood.
       audio throughout — the closest a system test (no sanitizer) can get to proving the original
       race is actually closed. Full unit test pass across Debug, Debug+NFM, and
       `-DRDIO_SCANNER=OFF` builds, plus the full system test suite.
+29. **Live channel removal via `reload_diff`** (`src/live_reconfig.{cpp,h}`, `src/config.cpp`,
+    `src/output.cpp`, `src/rtl_airband.h`) — the inverse of item 27's live channel add: deleting a
+    channel from a device's config and calling `reload_diff` tears it down live instead of always
+    falling into `skipped_requires_restart`. No new config option or control-socket command —
+    same "the config file stays the source of truth, `reload_diff` just picks up the diff"
+    contract as append. Easier than the item 28 mixer race fix in one respect (`dev->channels`/
+    `bins`/`base_bins` never shrink or reallocate — array-slot safety was already solved by item
+    27's `reserve_channels`/`channel_capacity`, and `dev->channel_count` was already atomic and
+    already re-read fresh everywhere), but adds two problems append never had, both because
+    removal is destructive rather than additive:
+    - **Which channel did the operator actually mean to delete?** Position-based diffing only
+      sees "N fewer channels than before" — it can't tell "the last channel was deleted" apart
+      from "some other channel was deleted, and the last one just happens to be one shorter" by
+      count alone. Guessing wrong and tearing down the currently-last channel instead of the one
+      actually removed would kill the wrong live audio feed — append has no equivalent risk
+      (a wrong guess there can only fail to add something new). Closed by a new
+      `DeviceConfigSnapshot::channel_freq_hz` (per-channel freq, captured in
+      `parse_config_snapshot()` alongside the existing `channel_enabled`) that
+      `compute_and_apply_diff()`'s new decrease branch checks against every surviving channel's
+      live `freqlist[0].frequency` before touching anything; any mismatch — i.e. anything other
+      than a pure tail deletion — falls into `skipped_requires_restart` with no attempt made.
+      Only `R_MULTICHANNEL` is supported (same structural non-goal as append: `R_SCAN` always has
+      exactly one channel).
+    - **The confirmation-then-decrement handshake needs a stronger guarantee than item 26's
+      existing enable/disable pattern provides.** Enable/disable's `output_thread()` consumption
+      (`exchange(-1, ...)` then apply) lets a waiter observe "consumed" *before* the apply
+      function finishes — harmless there (nothing is freed), but wrong for removal: the caller
+      (`try_remove_channels()`, `src/live_reconfig.cpp`) decrements `dev->channel_count` the
+      moment it sees confirmation, and other threads that gate on that count (notably
+      `output_check_thread()`, which has no synchronization with `output_thread()` beyond
+      checking `channel->enabled`) would need that gate to already reflect a fully-torn-down
+      channel, not one still mid-teardown. `channel_t::pending_remove_request` is a new, separate
+      atomic field from `pending_enable_request` for exactly this reason: `output_thread()`
+      (`src/output.cpp`) only resets it to `-1` *after* `channel_teardown_for_removal()`
+      (`src/live_reconfig.cpp`) fully completes, not at the moment the request is observed.
+    - **Deliberately narrower than a full free.** `channel_teardown_for_removal()` sets
+      `enabled = false` first (same reason `channel_apply_disable()` does — it's what keeps
+      `output_check_thread()`'s already-existing `!enabled` skip from reaching in during
+      teardown), calls the existing `disable_channel_outputs()`, then additionally closes and
+      frees each output's LAME encoder (`lame_close()` + `free(lamebuf)`) — the one resource that
+      scales meaningfully with channel count and was never freed anywhere except whole-process
+      shutdown (see item 21's `LAMEBUF_SIZE`). `channel->outputs`/`freqlist` and each output's own
+      `data` struct are deliberately left allocated (leaked) rather than freed: freeing those
+      would touch memory `output_check_thread()` reads with no synchronization beyond the same
+      `enabled` check, and they're comparatively small (a few hundred bytes to low KB per
+      channel) — the same "leaked, not unwound" tradeoff item 27 already accepts for a batch-
+      append failure, just applied here to every removal rather than only a rare failure path.
+    - **Not all-or-nothing, unlike append.** `try_remove_channels()` decrements
+      `dev->channel_count` by one immediately after each individual channel's teardown is
+      confirmed, rather than batching the count update to the end — so a mid-batch timeout (the
+      output thread stuck or unusually slow) leaves a valid, still-tail-consistent smaller count
+      instead of either an inconsistent one or losing an already-confirmed removal.
+    - Unit tested in `src/test_live_reconfig.cpp` (`ChannelRemoveTest`: successful tail removal
+      with a background thread standing in for `output_thread()`, mismatched-prefix rejection,
+      timeout leaves a valid partial count; plus an `R_SCAN`-decrease guard alongside the
+      existing append guard). One incidental discovery while writing these: constructing a real
+      `freq_t` in a test (needed here to give channels a real freq to prefix-match against) runs
+      `Squelch`'s constructor, which unconditionally calls `debug_print()` — fine in production,
+      but segfaults in the unit test binary under a `-DDEBUG` build, since `debugf`
+      (`src/logging.cpp`) is only ever `fopen()`'d by the real startup path. Existing tests never
+      hit this because `mk_freqlist()` (`src/config.cpp`) allocates via `XCALLOC`, not a real C++
+      construction — worked around in the test the same way, not fixed at the source. System-
+      tested end-to-end in `system_tests/tests/test_channel_remove.py` (a channel deleted from the
+      tail stops capturing while its sibling channel keeps running the whole time; deleting a
+      non-tail channel is rejected without disrupting either channel).
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

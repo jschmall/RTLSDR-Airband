@@ -58,6 +58,22 @@ bool channel_request_disable(channel_t* channel, int timeout_us = 500000);
 void channel_apply_enable(channel_t* channel);
 void channel_apply_disable(channel_t* channel);
 
+// Channel removal (tail-only - see compute_and_apply_diff()'s decrease branch), same request/
+// apply split as enable/disable above, but with a stronger completion guarantee - see
+// channel_t::pending_remove_request's comment (rtl_airband.h). channel_request_remove() is safe
+// to call from the control socket thread; channel_teardown_for_removal() must only run inside the
+// output thread that owns this channel. Deliberately narrower than a full free: closes
+// connections (disable_channel_outputs()) and frees each output's LAME encoder/lamebuf - the one
+// resource that scales meaningfully with channel count (see LAMEBUF_SIZE) - but leaves
+// channel->outputs/freqlist and each output's own `data` struct allocated. Freeing those would
+// touch memory output_check_thread() (src/output.cpp) reads with no synchronization beyond the
+// same `enabled` check this teardown already sets first, and they're comparatively small (a few
+// hundred bytes to low KB per channel) - the same "leaked, not unwound" tradeoff item 27 already
+// accepts for a batch-append failure, applied here to every removal rather than only a rare
+// failure path.
+bool channel_request_remove(channel_t* channel, int timeout_us = 500000);
+void channel_teardown_for_removal(channel_t* channel);
+
 // Connection-establishing half of init_output() (rtl_airband.cpp), redone for every output on an
 // already-initialized channel (lame/lamebuf already allocated once at startup, not touched again
 // here). Shared by channel_apply_enable() and mixer_enable() (mixer.cpp) - a mixer's own outputs
@@ -88,6 +104,15 @@ struct DeviceConfigSnapshot {
     bool has_gain;  // false if "gain" is absent, or present as a non-numeric (per-element) form
     float gain;
     std::vector<bool> channel_enabled;  // size == channel_count
+    // Per-channel freq (Hz, R_MULTICHANNEL "freq" only - 0 for an R_SCAN channel's "freqs" list,
+    // never read there since decrease is rejected on R_SCAN). Lets compute_and_apply_diff()'s
+    // decrease branch verify the surviving prefix [0, channel_count) is actually the same set of
+    // channels already live at those indices, not a config edit that removed a channel from the
+    // middle of the list (which position-based tail-removal has no way to distinguish from a pure
+    // tail removal by count alone) - see that branch's comment for why silently guessing wrong
+    // here would be worse than append's equivalent gap (append can only ever add something new;
+    // a wrong guess here would tear down and free the WRONG channel's live audio feed).
+    std::vector<int> channel_freq_hz;  // size == channel_count
 
     // Together, let compute_and_apply_diff() locate a newly-appended channel's full raw
     // definition (freq/label/modulation/outputs/...) when channel_count grows, without

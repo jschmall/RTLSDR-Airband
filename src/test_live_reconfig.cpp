@@ -1080,17 +1080,173 @@ TEST_F(ChannelAppendTest, r_scan_channel_count_change_is_requires_restart_not_ap
     EXPECT_NE(result.skipped_requires_restart[0].find("R_SCAN"), std::string::npos);
 }
 
-TEST_F(ChannelAppendTest, channel_count_decrease_is_still_requires_restart) {
+// Fixture for the channel-decrease tests below: builds a 2-channel device with real freqlist
+// entries (needed for compute_and_apply_diff()'s decrease branch to validate the surviving
+// prefix - see DeviceConfigSnapshot::channel_freq_hz's comment) and a background consumer thread
+// standing in for output_thread(), mirroring DiffApplyTest's mixer_enabled_diff_calls_mixer_
+// enable_disable test's pattern (a real consumer thread is needed since channel_request_remove()
+// blocks polling for a response, and nothing services that in a unit test otherwise).
+class ChannelRemoveTest : public ChannelAppendTest {
+   protected:
+    input_t input = {};
+    // freq_t embeds a Squelch, which - unlike this fixture's other plain-struct members - has a
+    // real constructor that unconditionally calls debug_print() (Squelch::Squelch() ->
+    // set_squelch_snr_threshold(), squelch.cpp). In a Debug build (-DDEBUG) that macro expands to
+    // an fprintf(debugf, ...) - and debugf (logging.cpp) is only ever fopen()'d by the real
+    // startup path, so it's NULL in the unittests binary, and constructing a freq_t normally here
+    // segfaults. Production code sidesteps this the same way mk_freqlist() (config.cpp) does:
+    // XCALLOC/calloc, not a real C++ construction - so it never runs Squelch's constructor at
+    // all. Mirrored here rather than fixed at the source, since a raw-allocated, never-truly-
+    // constructed Squelch is exactly what every existing channel_t in this file already relies on
+    // too (channel_t chans[N] = {} never constructs a freq_t - freqlist starts NULL).
+    freq_t* freq0 = nullptr;
+    freq_t* freq1 = nullptr;
+    channel_t chans[2] = {};
+    device_t dev = {};
+
+    void SetUp() override {
+        ChannelAppendTest::SetUp();
+        input.driver_type = "rtlsdr";
+        input.sample_rate = 2000000;
+        input.centerfreq = 120000000;
+
+        freq0 = (freq_t*)calloc(1, sizeof(freq_t));
+        freq1 = (freq_t*)calloc(1, sizeof(freq_t));
+        freq0->frequency = 120000000;
+        freq1->frequency = 120050000;
+
+        chans[0].enabled = true;
+        chans[0].pending_remove_request = -1;
+        chans[0].freqlist = freq0;
+        chans[0].freq_count = 1;
+        chans[1].enabled = true;
+        chans[1].pending_remove_request = -1;
+        chans[1].freqlist = freq1;
+        chans[1].freq_count = 1;
+
+        dev.input = &input;
+        dev.mode = R_MULTICHANNEL;
+        dev.channel_count = 2;
+        dev.channel_capacity = 2;
+        dev.channels = chans;
+        dev.pending_centerfreq_request = -1;
+        devices = &dev;
+        device_count = 1;
+    }
+
+    void TearDown() override {
+        free(freq0);
+        free(freq1);
+        ChannelAppendTest::TearDown();
+    }
+
+    // Services pending_remove_request for every channel in `chans`, same shape as the real
+    // output_thread() consumption added in output.cpp - runs until stop_consumer is set.
+    std::thread start_consumer(std::atomic<bool>* stop_consumer) {
+        return std::thread([this, stop_consumer]() {
+            while (!stop_consumer->load()) {
+                for (channel_t& channel : chans) {
+                    if (channel.pending_remove_request.load(std::memory_order_acquire) == 1) {
+                        channel_teardown_for_removal(&channel);
+                        channel.pending_remove_request.store(-1, std::memory_order_release);
+                    }
+                }
+                std::this_thread::yield();
+            }
+        });
+    }
+};
+
+TEST_F(ChannelRemoveTest, removes_one_channel_from_the_tail_when_prefix_matches) {
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 1;
+    dsnap.centerfreq = 120000000;  // unchanged - no retune expected
+    dsnap.sample_rate = 2000000;
+    dsnap.has_gain = false;
+    dsnap.channel_enabled = {true};
+    dsnap.channel_freq_hz = {120000000};  // matches chans[0] - chans[1] is the one being removed
+    snapshot.devices.push_back(dsnap);
+
+    std::atomic<bool> stop_consumer{false};
+    std::thread consumer = start_consumer(&stop_consumer);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+    stop_consumer.store(true);
+    consumer.join();
+
+    EXPECT_EQ(dev.channel_count.load(), 1);
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+    ASSERT_EQ(result.applied.size(), 1u);
+    EXPECT_NE(result.applied[0].find("removed 1 channel"), std::string::npos);
+    EXPECT_FALSE(chans[1].enabled.load());  // torn down
+    EXPECT_TRUE(chans[0].enabled.load());   // untouched
+}
+
+TEST_F(ChannelRemoveTest, mismatched_prefix_is_requires_restart_and_removes_nothing) {
+    // Simulates removing a channel from the MIDDLE of the config file rather than the end: the
+    // snapshot's one surviving channel is chans[1]'s freq, not chans[0]'s - position-based
+    // removal can't tell this apart from a pure tail removal by count alone, so it must refuse
+    // rather than guess and tear down the wrong (currently-last) channel.
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 1;
+    dsnap.centerfreq = 120000000;  // unchanged - no retune expected
+    dsnap.sample_rate = 2000000;
+    dsnap.has_gain = false;
+    dsnap.channel_enabled = {true};
+    dsnap.channel_freq_hz = {120050000};  // chans[1]'s freq, not chans[0]'s
+    snapshot.devices.push_back(dsnap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(dev.channel_count.load(), 2);  // unchanged
+    EXPECT_TRUE(result.applied.empty());
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("pure tail removal"), std::string::npos);
+    EXPECT_TRUE(chans[0].enabled.load());
+    EXPECT_TRUE(chans[1].enabled.load());
+}
+
+TEST_F(ChannelRemoveTest, removal_timeout_leaves_a_valid_partially_reduced_count) {
+    // No consumer thread running - channel_request_remove() must time out (this fixture's default
+    // 500ms timeout makes this test slow but deterministic) rather than hang forever, and
+    // dev->channel_count must be left at whatever was actually confirmed removed (here: nothing).
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 0;
+    dsnap.centerfreq = 120000000;  // unchanged - no retune expected
+    dsnap.sample_rate = 2000000;
+    dsnap.has_gain = false;
+    dsnap.channel_enabled = {};
+    dsnap.channel_freq_hz = {};
+    snapshot.devices.push_back(dsnap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(dev.channel_count.load(), 2);  // nothing was ever confirmed removed
+    EXPECT_TRUE(result.applied.empty());
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("timed out"), std::string::npos);
+}
+
+TEST_F(ChannelAppendTest, r_scan_channel_count_decrease_is_requires_restart) {
     input_t input = {};
     input.driver_type = "rtlsdr";
     input.sample_rate = 2000000;
 
-    channel_t chans[2] = {};
+    channel_t chans[1] = {};
     device_t dev = {};
     dev.input = &input;
-    dev.mode = R_MULTICHANNEL;
-    dev.channel_count = 2;
-    dev.channel_capacity = 2;
+    dev.mode = R_SCAN;
+    dev.channel_count = 1;
+    dev.channel_capacity = 1;
     dev.channels = chans;
     dev.pending_centerfreq_request = -1;
     devices = &dev;
@@ -1099,15 +1255,15 @@ TEST_F(ChannelAppendTest, channel_count_decrease_is_still_requires_restart) {
     ConfigSnapshot snapshot;
     DeviceConfigSnapshot dsnap;
     dsnap.type = "rtlsdr";
-    dsnap.mode = R_MULTICHANNEL;
-    dsnap.channel_count = 1;  // decreased
+    dsnap.mode = R_SCAN;
+    dsnap.channel_count = 0;  // shouldn't be reachable for a real R_SCAN config, but guarded anyway
     dsnap.sample_rate = 2000000;
     dsnap.has_gain = false;
     snapshot.devices.push_back(dsnap);
 
     DiffResult result = compute_and_apply_diff(snapshot);
 
-    EXPECT_EQ(dev.channel_count.load(), 2);  // unchanged - decrease is never attempted live
+    EXPECT_EQ(dev.channel_count.load(), 1);
     ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
-    EXPECT_NE(result.skipped_requires_restart[0].find("channel count changed"), std::string::npos);
+    EXPECT_NE(result.skipped_requires_restart[0].find("R_SCAN"), std::string::npos);
 }

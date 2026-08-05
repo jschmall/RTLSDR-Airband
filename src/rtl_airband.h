@@ -378,6 +378,18 @@ struct channel_t {
     // (src/live_reconfig.cpp) - which tear down/re-arm icecast, UDP, and pulse connections -
     // never race that thread's own concurrent use of the same output_t structs.
     std::atomic<int> pending_enable_request;
+    // Live removal request from the dynamic_reload control socket, posted only via reload_diff
+    // detecting a pure tail decrease in a device's channel count (see compute_and_apply_diff(),
+    // live_reconfig.cpp): -1 = none pending, 1 = removal requested. Same request/apply split and
+    // single-owning-thread rationale as pending_enable_request above, but with one deliberate
+    // difference: unlike enable/disable (which only flips a flag and reconnects/closes network
+    // handles the output thread already exclusively owns), removal frees this channel's LAME
+    // encoder. output_thread() (src/output.cpp) does NOT reset this to -1 the moment it observes
+    // the request - only after channel_teardown_for_removal() (live_reconfig.cpp) has fully
+    // finished, since a caller (try_remove_channels(), live_reconfig.cpp) that decrements
+    // dev->channel_count as soon as it sees an early completion signal would be doing so while
+    // frees are potentially still in flight.
+    std::atomic<int> pending_remove_request;
     int output_count;
     output_t* outputs;
     int highpass;  // highpass filter cutoff

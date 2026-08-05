@@ -438,6 +438,7 @@ bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx,
     // dynamic_reload control socket can flip it on live without any array resize.
     channel->enabled = chan_setting.exists("enabled") ? (bool)chan_setting["enabled"] : true;
     channel->pending_enable_request = -1;
+    channel->pending_remove_request = -1;
     channel->highpass = chan_setting.exists("highpass") ? (int)chan_setting["highpass"] : 100;
     channel->lowpass = chan_setting.exists("lowpass") ? (int)chan_setting["lowpass"] : 2500;
 #ifdef NFM
@@ -1006,6 +1007,10 @@ int parse_mixers(libconfig::Setting& mx) {
         // default true and never gets touched again.
         channel->enabled = true;
         channel->pending_enable_request = -1;
+        // A mixer's own embedded channel is never itself removable (only device channels are, via
+        // reload_diff's tail-decrease detection) - initialized only for the same "-1 sentinel,
+        // never a stray value" hygiene as pending_enable_request above.
+        channel->pending_remove_request = -1;
         channel->highpass = mx[i].exists("highpass") ? (int)mx[i]["highpass"] : 100;
         channel->lowpass = mx[i].exists("lowpass") ? (int)mx[i]["lowpass"] : 2500;
         channel->mode = MM_MONO;

@@ -101,6 +101,29 @@ void channel_apply_disable(channel_t* channel) {
     disable_channel_outputs(channel);
 }
 
+// See channel_t::pending_remove_request's comment (rtl_airband.h) and channel_request_remove()'s
+// declaration (live_reconfig.h) for the full rationale of what this does and does not free.
+// `enabled = false` is set first (before anything is touched or freed) for the same reason
+// channel_apply_disable() sets it first: output_check_thread() (src/output.cpp) gates its own
+// per-channel output access on this flag - setting it first is what keeps that thread from
+// reaching in while this teardown runs, same protection the pre-existing disable feature already
+// relies on.
+void channel_teardown_for_removal(channel_t* channel) {
+    channel->enabled = false;
+    disable_channel_outputs(channel);
+    for (int k = 0; k < channel->output_count; k++) {
+        output_t* output = channel->outputs + k;
+        if (output->lame) {
+            lame_close(output->lame);
+            output->lame = NULL;
+        }
+        if (output->lamebuf) {
+            free(output->lamebuf);
+            output->lamebuf = NULL;
+        }
+    }
+}
+
 namespace {
 
 // Shared by every request-side function below: posts value into *request, then polls until the
@@ -126,6 +149,10 @@ bool channel_request_enable(channel_t* channel, int timeout_us) {
 
 bool channel_request_disable(channel_t* channel, int timeout_us) {
     return post_request_and_wait(&channel->pending_enable_request, 0, timeout_us);
+}
+
+bool channel_request_remove(channel_t* channel, int timeout_us) {
+    return post_request_and_wait(&channel->pending_remove_request, 1, timeout_us);
 }
 
 bool mixer_request_enable(mixer_t* mixer, int timeout_us) {
@@ -256,6 +283,29 @@ bool try_append_channels(device_t* dev, int dev_idx, const DeviceConfigSnapshot&
     return true;
 }
 
+// Attempts to remove dev->channel_count - snap.channel_count channels from the tail (the caller
+// has already confirmed the surviving prefix matches - see compute_and_apply_diff()'s decrease
+// branch). Unlike try_append_channels(), this is NOT all-or-nothing: dev->channel_count is
+// decremented by one immediately after each individual channel's teardown is confirmed complete,
+// so a mid-batch failure (channel_request_remove() timing out - e.g. the output thread is stuck
+// or unusually slow) leaves dev->channel_count at a valid, still-tail-consistent smaller value
+// rather than either an inconsistent one or losing an already-confirmed removal. Returns the
+// number of channels actually removed; on a partial result (< old_count - snap.channel_count),
+// *error_text explains why the remainder was left in place.
+int try_remove_channels(device_t* dev, const DeviceConfigSnapshot& snap, string* error_text) {
+    int removed = 0;
+    for (int k = dev->channel_count - 1; k >= snap.channel_count; k--) {
+        channel_t* channel = dev->channels + k;
+        if (!channel_request_remove(channel)) {
+            *error_text = "channel " + to_string(k) + " removal request timed out waiting for the output thread";
+            return removed;
+        }
+        dev->channel_count.store(k, std::memory_order_release);
+        removed++;
+    }
+    return removed;
+}
+
 }  // namespace
 
 bool parse_config_snapshot(const string& config_path, ConfigSnapshot* out, string* error) {
@@ -309,6 +359,7 @@ bool parse_config_snapshot(const string& config_path, ConfigSnapshot* out, strin
         dev.has_gain = snapshot_get_numeric_gain(devs[i], &dev.gain);
 
         dev.channel_enabled.clear();
+        dev.channel_freq_hz.clear();
         dev.raw_channel_indices.clear();
         dev.raw_channels_setting = nullptr;
         if (devs[i].exists("channels")) {
@@ -319,6 +370,7 @@ bool parse_config_snapshot(const string& config_path, ConfigSnapshot* out, strin
                     continue;
                 }
                 dev.channel_enabled.push_back(chans[j].exists("enabled") ? (bool)chans[j]["enabled"] : true);
+                dev.channel_freq_hz.push_back(chans[j].exists("freq") ? snapshot_parse_anynum2int(chans[j]["freq"]) : 0);
                 dev.raw_channel_indices.push_back(j);
             }
         }
@@ -375,8 +427,44 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
                                                                   " (fix the config and retry reload_diff - no restart needed)");
                     }
                 }
-            } else if (snap.channel_count != dev->channel_count) {
-                result.skipped_requires_restart.push_back(label + ": channel count changed");
+            } else if (snap.channel_count < dev->channel_count) {
+                int to_remove = dev->channel_count - snap.channel_count;
+                if (dev->mode != R_MULTICHANNEL) {
+                    // Same structural non-goal as the R_SCAN guard on the append side above.
+                    result.skipped_requires_restart.push_back(label + ": channel count changed (R_SCAN devices don't support live channel removal)");
+                } else {
+                    // Tail-removal-by-count has no way to know WHICH channel the operator meant
+                    // to delete from their config file - only that the file now has N fewer
+                    // channels than are live. Verify the surviving prefix [0, snap.channel_count)
+                    // is actually the same channels already live at those indices (by freq) before
+                    // touching anything: if a channel was removed from the middle of the list
+                    // instead of the end, position-based removal would tear down and free the
+                    // WRONG (currently-last) channel's live audio feed instead of the one the
+                    // operator actually deleted - see DeviceConfigSnapshot::channel_freq_hz's
+                    // comment for why this check exists (append has no equivalent, since a wrong
+                    // guess there can only fail to add something new, never destroy something
+                    // live).
+                    bool prefix_matches = true;
+                    for (int j = 0; j < snap.channel_count && prefix_matches; j++) {
+                        channel_t* channel = dev->channels + j;
+                        if (channel->freq_count < 1 || channel->freqlist[0].frequency != snap.channel_freq_hz[j]) {
+                            prefix_matches = false;
+                        }
+                    }
+                    if (!prefix_matches) {
+                        result.skipped_requires_restart.push_back(label + ": channel count changed (removed channel(s) are not a pure tail removal - only removing " +
+                                                                  "from the end of the channels list is supported live)");
+                    } else {
+                        string apply_error;
+                        int removed = try_remove_channels(dev, snap, &apply_error);
+                        if (removed > 0) {
+                            result.applied.push_back(label + ": removed " + to_string(removed) + " channel(s) from the tail");
+                        }
+                        if (removed < to_remove) {
+                            result.skipped_requires_restart.push_back(label + ": " + to_string(to_remove - removed) + " channel(s) could not be removed: " + apply_error);
+                        }
+                    }
+                }
             } else {
                 for (int j = 0; j < dev->channel_count; j++) {
                     channel_t* channel = dev->channels + j;
