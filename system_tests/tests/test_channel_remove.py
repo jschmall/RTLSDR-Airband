@@ -6,14 +6,15 @@ from a device's config, live, via reload_diff - tearing down that channel's outp
 connections and freeing its LAME encoder, live_reconfig.cpp's channel_teardown_for_removal())
 while an already-running sibling channel is unaffected.
 
-Only a pure TAIL removal (deleting from the end of the config's channels list) is supported.
-compute_and_apply_diff()'s decrease branch validates the surviving prefix by frequency before
-touching anything - see DeviceConfigSnapshot::channel_freq_hz's comment (live_reconfig.h) for why:
-position-based removal has no way to tell "the operator deleted the last channel" apart from "the
-operator deleted a different channel, coincidentally leaving the same final count" without that
-check, and guessing wrong would tear down and free the WRONG channel's live audio feed. Unlike
-test_channel_add.py, no reserve_channels headroom is needed here - shrinking dev->channel_count
-never touches the (fixed-size, never-reallocated) channels/bins/base_bins arrays.
+Deleting from the end of the config's channels list tears down just that one channel. Deleting a
+NON-tail channel (item 30's generalization) rebuilds everything from the point of divergence
+instead of being rejected outright - see compute_and_apply_diff()'s common-prefix comparison
+(live_reconfig.cpp) and DeviceConfigSnapshot::channel_signature's comment (live_reconfig.h): a
+channel whose signature no longer matches what's live at that index is torn down and replaced,
+which for a non-tail deletion means an unrelated sibling channel gets a brief interruption (not
+data loss) as a side effect of correctly removing the deleted one. Unlike test_channel_add.py, no
+reserve_channels headroom is needed here - shrinking dev->channel_count never touches the
+(fixed-size, never-reallocated) channels/bins/base_bins arrays.
 
 Uses the same Popen-based interactive runner and fixed speedup_factor=1.0 as test_channel_add.py,
 for the same reason: a reliable wall-clock window to rewrite the config file and call reload_diff
@@ -137,14 +138,18 @@ def test_removed_channel_stops_capturing_after_reload_diff(
     )
 
 
-def test_non_tail_removal_is_rejected_without_disrupting_existing_channels(
+def test_non_tail_removal_rebuilds_from_the_point_of_divergence(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
     short_socket_dir: Path,
 ) -> None:
-    """Deleting a channel from the start of the config (rather than the tail) is reported, not
-    applied - both channels keep running, undisturbed, since reload_diff can't safely guess which
-    one the operator actually meant to remove from a count change alone."""
+    """Deleting a channel from the start of the config (rather than the tail) used to be flatly
+    rejected - item 30 generalized the position-based check into a signature-based common-prefix
+    comparison (see compute_and_apply_diff(), live_reconfig.cpp), which instead rebuilds
+    everything from the first point of divergence. Deleting channel A here leaves channel B's
+    (unchanged) definition alone at the new index 0: from the diff's perspective that's
+    indistinguishable from an edit, so B is torn down and reconnected too - a brief interruption,
+    not data loss - as a side effect of correctly removing A."""
     iq_file = iq_generator.get_or_generate_multichannel(
         offset_a_hz=CHANNEL_A_OFFSET_HZ,
         offset_b_hz=CHANNEL_B_OFFSET_HZ,
@@ -156,8 +161,8 @@ def test_non_tail_removal_is_rejected_without_disrupting_existing_channels(
     socket_path = short_socket_dir / "control.sock"
     freq_a_hz = CENTERFREQ_HZ + CHANNEL_A_OFFSET_HZ
     freq_b_hz = CENTERFREQ_HZ + CHANNEL_B_OFFSET_HZ
-    template_a = "ch_remove_reject_a"
-    template_b = "ch_remove_reject_b"
+    template_a = "ch_remove_nontail_a"
+    template_b = "ch_remove_nontail_b"
 
     def write(channels: list[dict]) -> None:
         config_writer.write_config(
@@ -187,27 +192,22 @@ def test_non_tail_removal_is_rejected_without_disrupting_existing_channels(
         time.sleep(REMOVE_AT_S)
 
         # Delete channel A (the FIRST entry) instead of the tail - channel B's definition is now
-        # alone at index 0, so a naive count-only removal would incorrectly tear down channel B
-        # (currently the last live channel) instead of channel A, which is what was actually
-        # deleted from the file.
+        # alone at index 0.
         write([{"freq_hz": freq_b_hz, "output_filename_template": template_b}])
         resp = send_command(socket_path, {"cmd": "reload_diff"})
         assert resp["ok"] is True, resp
-        assert not resp["applied"], resp
-        assert any(
-            "pure tail removal" in entry for entry in resp["skipped_requires_restart"]
-        ), resp
-
-        # The instance must still be fully functional after the rejected removal.
-        resp = send_command(socket_path, {"cmd": "reload_diff"})
-        assert resp["ok"] is True, resp
+        assert not resp["skipped_requires_restart"], resp
+        assert any("removed 2 channel" in entry for entry in resp["applied"]), resp
+        assert any("added 1 channel" in entry for entry in resp["applied"]), resp
 
         time.sleep(TOTAL_IQ_DURATION_S)
 
-    # Both channels must have kept running the whole time, undisturbed by the rejected removal.
+    # Channel A stopped when it was deleted - only captured audio up to the edit.
     output_validator.validate_mp3_range(
-        test_output_dir, template_a, min_duration_s=8.0, max_duration_s=DURATION_S + 1.0
+        test_output_dir, template_a, min_duration_s=1.0, max_duration_s=6.0
     )
+    # Channel B kept running (with a brief gap from the rebuild) - it was never deleted from the
+    # file, just torn down and reconnected as a side effect of removing A.
     output_validator.validate_mp3_range(
-        test_output_dir, template_b, min_duration_s=8.0, max_duration_s=DURATION_S + 1.0
+        test_output_dir, template_b, min_duration_s=5.0, max_duration_s=DURATION_S + 1.0
     )

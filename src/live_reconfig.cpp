@@ -283,18 +283,22 @@ bool try_append_channels(device_t* dev, int dev_idx, const DeviceConfigSnapshot&
     return true;
 }
 
-// Attempts to remove dev->channel_count - snap.channel_count channels from the tail (the caller
-// has already confirmed the surviving prefix matches - see compute_and_apply_diff()'s decrease
-// branch). Unlike try_append_channels(), this is NOT all-or-nothing: dev->channel_count is
-// decremented by one immediately after each individual channel's teardown is confirmed complete,
-// so a mid-batch failure (channel_request_remove() timing out - e.g. the output thread is stuck
-// or unusually slow) leaves dev->channel_count at a valid, still-tail-consistent smaller value
-// rather than either an inconsistent one or losing an already-confirmed removal. Returns the
-// number of channels actually removed; on a partial result (< old_count - snap.channel_count),
-// *error_text explains why the remainder was left in place.
-int try_remove_channels(device_t* dev, const DeviceConfigSnapshot& snap, string* error_text) {
+// Attempts to remove dev->channel_count - target_count channels from the tail (the caller has
+// already confirmed the surviving prefix [0, target_count) matches - see compute_and_apply_diff()
+// 's replace/decrease handling). target_count is an explicit parameter rather than derived from
+// a DeviceConfigSnapshot because a tail *replace* (not just a pure decrease) needs to remove down
+// to the common-prefix length, which can be less than the snapshot's own final channel_count when
+// channels are also being appended afterward in the same call. Unlike try_append_channels(), this
+// is NOT all-or-nothing: dev->channel_count is decremented by one immediately after each
+// individual channel's teardown is confirmed complete, so a mid-batch failure
+// (channel_request_remove() timing out - e.g. the output thread is stuck or unusually slow)
+// leaves dev->channel_count at a valid, still-tail-consistent smaller value rather than either an
+// inconsistent one or losing an already-confirmed removal. Returns the number of channels
+// actually removed; on a partial result (< old dev->channel_count - target_count), *error_text
+// explains why the remainder was left in place.
+int try_remove_channels(device_t* dev, int target_count, string* error_text) {
     int removed = 0;
-    for (int k = dev->channel_count - 1; k >= snap.channel_count; k--) {
+    for (int k = dev->channel_count - 1; k >= target_count; k--) {
         channel_t* channel = dev->channels + k;
         if (!channel_request_remove(channel)) {
             *error_text = "channel " + to_string(k) + " removal request timed out waiting for the output thread";
@@ -359,7 +363,7 @@ bool parse_config_snapshot(const string& config_path, ConfigSnapshot* out, strin
         dev.has_gain = snapshot_get_numeric_gain(devs[i], &dev.gain);
 
         dev.channel_enabled.clear();
-        dev.channel_freq_hz.clear();
+        dev.channel_signature.clear();
         dev.raw_channel_indices.clear();
         dev.raw_channels_setting = nullptr;
         if (devs[i].exists("channels")) {
@@ -370,7 +374,7 @@ bool parse_config_snapshot(const string& config_path, ConfigSnapshot* out, strin
                     continue;
                 }
                 dev.channel_enabled.push_back(chans[j].exists("enabled") ? (bool)chans[j]["enabled"] : true);
-                dev.channel_freq_hz.push_back(chans[j].exists("freq") ? snapshot_parse_anynum2int(chans[j]["freq"]) : 0);
+                dev.channel_signature.push_back(build_channel_identity_signature(chans[j]));
                 dev.raw_channel_indices.push_back(j);
             }
         }
@@ -404,76 +408,72 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
                 result.skipped_requires_restart.push_back(label + ": sample_rate changed");
             }
 
-            if (snap.channel_count > dev->channel_count) {
-                int to_add = snap.channel_count - dev->channel_count;
-                if (dev->mode != R_MULTICHANNEL) {
-                    // Structurally shouldn't happen - an R_SCAN device is validated at parse time
-                    // to always have exactly one channel - but kept as an explicit, cheap guard
-                    // matching the documented non-goal (R_SCAN channels don't support live add;
-                    // "add a frequency to the existing channel's freqlist" is a different,
-                    // unimplemented feature).
-                    result.skipped_requires_restart.push_back(label + ": channel count changed (R_SCAN devices don't support live channel add)");
-                } else if (dev->channel_count + to_add > dev->channel_capacity) {
-                    result.skipped_requires_restart.push_back(label + ": " + to_string(to_add) + " new channel(s) declared but only " + to_string(dev->channel_capacity - dev->channel_count) +
-                                                              " reserve_channels slot(s) available");
-                } else {
-                    int added_from = dev->channel_count;
+            // Longest common prefix, by raw config signature (build_channel_identity_signature(),
+            // config.cpp), between what's live and what the file now says - see DeviceConfig
+            // Snapshot::channel_signature's comment. Channels from L onward differ in SOME way
+            // (a pure count change, a reordering, or an in-place field edit - freq/modulation/
+            // bandwidth/squelch/notch/ctcss/outputs - all look the same at this level: "the
+            // channel that used to be at this index isn't there anymore").
+            int compare_limit = min((int)dev->channel_count, snap.channel_count);
+            int common_prefix = 0;
+            while (common_prefix < compare_limit && dev->channels[common_prefix].config_signature != nullptr &&
+                   snap.channel_signature[common_prefix] == dev->channels[common_prefix].config_signature) {
+                common_prefix++;
+            }
+            bool tail_diverges = common_prefix < dev->channel_count || common_prefix < snap.channel_count;
+
+            if (tail_diverges && dev->mode != R_MULTICHANNEL) {
+                // Structurally shouldn't happen for a real R_SCAN config (validated at parse time
+                // to always have exactly one channel) - but kept as an explicit, cheap guard
+                // matching the documented non-goal: R_SCAN's single channel holds a "freqs" list
+                // and its own controller-thread fixed-offset retune scheme (see item 2's "Device
+                // Modes"), neither of which this tail-replace mechanism (or item 27/29's add/
+                // remove it's built from) has ever supported.
+                result.skipped_requires_restart.push_back(label + ": channel count or definition changed (R_SCAN devices don't support live channel changes)");
+            } else if (tail_diverges) {
+                bool ok = true;
+                if (common_prefix < dev->channel_count) {
+                    int to_remove = dev->channel_count - common_prefix;
                     string apply_error;
-                    if (try_append_channels(dev, i, snap, &apply_error)) {
-                        result.applied.push_back(label + ": added " + to_string(dev->channel_count - added_from) + " channel(s) (index " + to_string(added_from) + "-" +
-                                                 to_string(dev->channel_count - 1) + ")");
-                    } else {
-                        result.skipped_requires_restart.push_back(label + ": " + to_string(to_add) + " new channel(s) failed to parse and were not added: " + apply_error +
-                                                                  " (fix the config and retry reload_diff - no restart needed)");
+                    int removed = try_remove_channels(dev, common_prefix, &apply_error);
+                    if (removed > 0) {
+                        result.applied.push_back(label + ": removed " + to_string(removed) + " channel(s) from the tail" + (common_prefix < snap.channel_count ? " (replacing)" : ""));
+                    }
+                    if (removed < to_remove) {
+                        result.skipped_requires_restart.push_back(label + ": " + to_string(to_remove - removed) + " channel(s) could not be removed: " + apply_error);
+                        ok = false;
                     }
                 }
-            } else if (snap.channel_count < dev->channel_count) {
-                int to_remove = dev->channel_count - snap.channel_count;
-                if (dev->mode != R_MULTICHANNEL) {
-                    // Same structural non-goal as the R_SCAN guard on the append side above.
-                    result.skipped_requires_restart.push_back(label + ": channel count changed (R_SCAN devices don't support live channel removal)");
-                } else {
-                    // Tail-removal-by-count has no way to know WHICH channel the operator meant
-                    // to delete from their config file - only that the file now has N fewer
-                    // channels than are live. Verify the surviving prefix [0, snap.channel_count)
-                    // is actually the same channels already live at those indices (by freq) before
-                    // touching anything: if a channel was removed from the middle of the list
-                    // instead of the end, position-based removal would tear down and free the
-                    // WRONG (currently-last) channel's live audio feed instead of the one the
-                    // operator actually deleted - see DeviceConfigSnapshot::channel_freq_hz's
-                    // comment for why this check exists (append has no equivalent, since a wrong
-                    // guess there can only fail to add something new, never destroy something
-                    // live).
-                    bool prefix_matches = true;
-                    for (int j = 0; j < snap.channel_count && prefix_matches; j++) {
-                        channel_t* channel = dev->channels + j;
-                        if (channel->freq_count < 1 || channel->freqlist[0].frequency != snap.channel_freq_hz[j]) {
-                            prefix_matches = false;
-                        }
-                    }
-                    if (!prefix_matches) {
-                        result.skipped_requires_restart.push_back(label + ": channel count changed (removed channel(s) are not a pure tail removal - only removing " +
-                                                                  "from the end of the channels list is supported live)");
+                if (ok && dev->channel_count < snap.channel_count) {
+                    int to_add = snap.channel_count - dev->channel_count;
+                    if (dev->channel_count + to_add > dev->channel_capacity) {
+                        result.skipped_requires_restart.push_back(label + ": " + to_string(to_add) + " new/replacement channel(s) declared but only " +
+                                                                  to_string(dev->channel_capacity - dev->channel_count) + " reserve_channels slot(s) available");
                     } else {
+                        int added_from = dev->channel_count;
                         string apply_error;
-                        int removed = try_remove_channels(dev, snap, &apply_error);
-                        if (removed > 0) {
-                            result.applied.push_back(label + ": removed " + to_string(removed) + " channel(s) from the tail");
-                        }
-                        if (removed < to_remove) {
-                            result.skipped_requires_restart.push_back(label + ": " + to_string(to_remove - removed) + " channel(s) could not be removed: " + apply_error);
+                        if (try_append_channels(dev, i, snap, &apply_error)) {
+                            result.applied.push_back(label + ": added " + to_string(dev->channel_count - added_from) + " channel(s) (index " + to_string(added_from) + "-" +
+                                                     to_string(dev->channel_count - 1) + ")");
+                        } else {
+                            result.skipped_requires_restart.push_back(label + ": " + to_string(to_add) + " new/replacement channel(s) failed to parse and were not added: " + apply_error +
+                                                                      " (fix the config and retry reload_diff - no restart needed)");
                         }
                     }
                 }
-            } else {
-                for (int j = 0; j < dev->channel_count; j++) {
-                    channel_t* channel = dev->channels + j;
-                    bool live_enabled = channel->enabled.load();
-                    if (snap.channel_enabled[j] != live_enabled) {
-                        bool confirmed = snap.channel_enabled[j] ? channel_request_enable(channel) : channel_request_disable(channel);
-                        result.applied.push_back(label + " channel[" + to_string(j) + "]: enabled -> " + (snap.channel_enabled[j] ? "true" : "false") +
-                                                 (confirmed ? "" : " (request posted, not yet confirmed applied)"));
-                    }
+            }
+
+            // Untouched common-prefix channels can still have had just "enabled" toggled - the
+            // one field intentionally excluded from the signature above, so it never forces a
+            // tear-down/replace of its own. Runs regardless of whether a tail replace also
+            // happened above.
+            for (int j = 0; j < common_prefix; j++) {
+                channel_t* channel = dev->channels + j;
+                bool live_enabled = channel->enabled.load();
+                if (snap.channel_enabled[j] != live_enabled) {
+                    bool confirmed = snap.channel_enabled[j] ? channel_request_enable(channel) : channel_request_disable(channel);
+                    result.applied.push_back(label + " channel[" + to_string(j) + "]: enabled -> " + (snap.channel_enabled[j] ? "true" : "false") +
+                                             (confirmed ? "" : " (request posted, not yet confirmed applied)"));
                 }
             }
 

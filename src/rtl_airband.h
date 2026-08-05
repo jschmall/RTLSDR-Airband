@@ -394,6 +394,15 @@ struct channel_t {
     output_t* outputs;
     int highpass;  // highpass filter cutoff
     int lowpass;   // lowpass filter cutoff
+    // Canonical serialization of this channel's raw config block (everything except "enabled",
+    // which is diffed/applied separately - see build_channel_identity_signature()'s comment,
+    // config.cpp), set once by parse_channel() (shared by startup and dynamic_reload's live
+    // append/replace path). compute_and_apply_diff() (live_reconfig.cpp) compares this against a
+    // freshly re-read config's own signature for the same index to detect ANY change to an
+    // existing channel - not just a count change - and replace (tear down + re-append) exactly
+    // the channels that actually differ. NULL only for a mixer's own embedded channel (mixer->
+    // channel never goes through parse_channel(), and is never itself replaceable this way).
+    char* config_signature;
 };
 
 enum rec_modes { R_MULTICHANNEL, R_SCAN };
@@ -605,6 +614,14 @@ int parse_mixers(libconfig::Setting& mx);
 // (live_reconfig.cpp) - see parse_channel()'s definition in config.cpp for the full contract,
 // including why it returns false for two pre-existing legacy-value quirks.
 bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx, int chan_idx, channel_t* channel);
+// Recursively serializes chan_setting's raw config fields (skipping "enabled" at the top level)
+// into a canonical string - see channel_t::config_signature's comment for why a whole-subtree
+// signature, rather than a hand-maintained list of individually-diffed fields, is what backs
+// dynamic_reload's live channel-replace detection: it captures every field a channel config can
+// have (freq, modulation, bandwidth, squelch, notch, ctcss, highpass/lowpass, outputs - including
+// arbitrarily nested output-type-specific blocks) with no risk of a future config option being
+// silently left out of the comparison.
+std::string build_channel_identity_signature(const libconfig::Setting& chan_setting);
 
 // udp_stream.cpp
 bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len);

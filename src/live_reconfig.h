@@ -104,15 +104,17 @@ struct DeviceConfigSnapshot {
     bool has_gain;  // false if "gain" is absent, or present as a non-numeric (per-element) form
     float gain;
     std::vector<bool> channel_enabled;  // size == channel_count
-    // Per-channel freq (Hz, R_MULTICHANNEL "freq" only - 0 for an R_SCAN channel's "freqs" list,
-    // never read there since decrease is rejected on R_SCAN). Lets compute_and_apply_diff()'s
-    // decrease branch verify the surviving prefix [0, channel_count) is actually the same set of
-    // channels already live at those indices, not a config edit that removed a channel from the
-    // middle of the list (which position-based tail-removal has no way to distinguish from a pure
-    // tail removal by count alone) - see that branch's comment for why silently guessing wrong
-    // here would be worse than append's equivalent gap (append can only ever add something new;
-    // a wrong guess here would tear down and free the WRONG channel's live audio feed).
-    std::vector<int> channel_freq_hz;  // size == channel_count
+    // Per-channel canonical config signature (build_channel_identity_signature(), config.cpp),
+    // built from the same raw Setting parse_channel() itself would see. compute_and_apply_diff()
+    // compares this against each live channel's own channel_t::config_signature to find the
+    // longest common prefix between what's live and what the file now says - channels past that
+    // point are torn down (if live) and/or freshly parsed and appended (if in the file), which is
+    // how an edit to an EXISTING channel's freq/modulation/bandwidth/squelch/notch/ctcss/outputs
+    // gets picked up live, not just a pure count change - see that function's comment for why a
+    // wrong guess about "is this the same channel" is worse here than on the append side (a wrong
+    // guess there can only fail to add something new; here it could tear down and free the WRONG
+    // channel's live audio feed).
+    std::vector<std::string> channel_signature;  // size == channel_count
 
     // Together, let compute_and_apply_diff() locate a newly-appended channel's full raw
     // definition (freq/label/modulation/outputs/...) when channel_count grows, without

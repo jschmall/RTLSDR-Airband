@@ -26,6 +26,7 @@
 #include <cstring>
 #include <iostream>
 #include <libconfig.h++>
+#include <sstream>
 #include "input-common.h"   // input_t
 #include "live_reconfig.h"  // compute_channel_bin, compute_channel_dm_dphi
 #include "rtl_airband.h"
@@ -423,6 +424,68 @@ static int parse_anynum2int(libconfig::Setting& f) {
 // below): the caller must NOT count this channel (channel_count/jj isn't advanced) if this
 // returns false, matching that pre-existing behavior byte-for-byte. Not something introduced or
 // fixed by this refactor - flagged separately, since it looks like a genuine latent bug.
+// Recursively renders an arbitrary libconfig::Setting subtree (scalar, group, list, or array)
+// into a canonical, order-preserving string. Used only by build_channel_identity_signature()
+// below - kept file-local since nothing else needs a generic config-subtree serializer.
+static string serialize_setting(const libconfig::Setting& s) {
+    switch (s.getType()) {
+        case libconfig::Setting::TypeInt:
+            return to_string((int)s);
+        case libconfig::Setting::TypeInt64:
+            return to_string((long long)s);
+        case libconfig::Setting::TypeFloat: {
+            ostringstream o;
+            o << (double)s;
+            return o.str();
+        }
+        case libconfig::Setting::TypeString:
+            return string("\"") + (const char*)s + "\"";
+        case libconfig::Setting::TypeBoolean:
+            return (bool)s ? "true" : "false";
+        case libconfig::Setting::TypeGroup:
+        case libconfig::Setting::TypeArray:
+        case libconfig::Setting::TypeList: {
+            string out = "{";
+            for (int i = 0; i < s.getLength(); i++) {
+                const libconfig::Setting& child = s[i];
+                const char* name = child.getName();
+                if (name != nullptr) {
+                    out += name;
+                    out += "=";
+                }
+                out += serialize_setting(child);
+                out += ";";
+            }
+            out += "}";
+            return out;
+        }
+        default:
+            return "?";
+    }
+}
+
+string build_channel_identity_signature(const libconfig::Setting& chan_setting) {
+    string out = "{";
+    for (int i = 0; i < chan_setting.getLength(); i++) {
+        const libconfig::Setting& child = chan_setting[i];
+        const char* name = child.getName();
+        // Diffed/applied separately via a cheap flag flip (channel_request_enable/disable,
+        // live_reconfig.cpp) with no teardown - excluded here so toggling just "enabled" stays on
+        // that fast path instead of spuriously triggering a full tear-down-and-replace.
+        if (name != nullptr && !strcmp(name, "enabled")) {
+            continue;
+        }
+        if (name != nullptr) {
+            out += name;
+            out += "=";
+        }
+        out += serialize_setting(child);
+        out += ";";
+    }
+    out += "}";
+    return out;
+}
+
 bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx, int chan_idx, channel_t* channel) {
     for (int k = 0; k < AGC_EXTRA; k++) {
         channel->wavein[k] = 20;
@@ -818,6 +881,7 @@ bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx,
         channel->freqlist[f].squelch.set_debug_file(tmp_filepath);
     }
 #endif /* DEBUG_SQUELCH */
+    channel->config_signature = strdup(build_channel_identity_signature(chan_setting).c_str());
     return true;
 }
 

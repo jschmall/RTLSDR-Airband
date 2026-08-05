@@ -530,7 +530,10 @@ Keep the local delta small and well understood.
       live `freqlist[0].frequency` before touching anything; any mismatch — i.e. anything other
       than a pure tail deletion — falls into `skipped_requires_restart` with no attempt made.
       Only `R_MULTICHANNEL` is supported (same structural non-goal as append: `R_SCAN` always has
-      exactly one channel).
+      exactly one channel). **Superseded by item 30**: `channel_freq_hz` was replaced by a general
+      `channel_signature` field, and a signature mismatch is no longer flatly rejected — see below
+      for why that turned out to be an unnecessary restriction once the underlying mechanism was
+      generalized.
     - **The confirmation-then-decrement handshake needs a stronger guarantee than item 26's
       existing enable/disable pattern provides.** Enable/disable's `output_thread()` consumption
       (`exchange(-1, ...)` then apply) lets a waiter observe "consumed" *before* the apply
@@ -561,18 +564,100 @@ Keep the local delta small and well understood.
       output thread stuck or unusually slow) leaves a valid, still-tail-consistent smaller count
       instead of either an inconsistent one or losing an already-confirmed removal.
     - Unit tested in `src/test_live_reconfig.cpp` (`ChannelRemoveTest`: successful tail removal
-      with a background thread standing in for `output_thread()`, mismatched-prefix rejection,
-      timeout leaves a valid partial count; plus an `R_SCAN`-decrease guard alongside the
-      existing append guard). One incidental discovery while writing these: constructing a real
-      `freq_t` in a test (needed here to give channels a real freq to prefix-match against) runs
-      `Squelch`'s constructor, which unconditionally calls `debug_print()` — fine in production,
-      but segfaults in the unit test binary under a `-DDEBUG` build, since `debugf`
-      (`src/logging.cpp`) is only ever `fopen()`'d by the real startup path. Existing tests never
-      hit this because `mk_freqlist()` (`src/config.cpp`) allocates via `XCALLOC`, not a real C++
-      construction — worked around in the test the same way, not fixed at the source. System-
-      tested end-to-end in `system_tests/tests/test_channel_remove.py` (a channel deleted from the
-      tail stops capturing while its sibling channel keeps running the whole time; deleting a
-      non-tail channel is rejected without disrupting either channel).
+      with a background thread standing in for `output_thread()`, timeout leaves a valid partial
+      count; plus an `R_SCAN`-decrease guard alongside the existing append guard — the original
+      mismatched-prefix-is-rejected test was superseded by item 30's rebuild-from-divergence
+      behavior and replaced accordingly). One incidental discovery while writing these:
+      constructing a real `freq_t` in a test (needed here to give channels a real freq to
+      prefix-match against) runs `Squelch`'s constructor, which unconditionally calls
+      `debug_print()` — fine in production, but segfaults in the unit test binary under a
+      `-DDEBUG` build, since `debugf` (`src/logging.cpp`) is only ever `fopen()`'d by the real
+      startup path. Existing tests never hit this because `mk_freqlist()` (`src/config.cpp`)
+      allocates via `XCALLOC`, not a real C++ construction — worked around in the test the same
+      way, not fixed at the source. System-tested end-to-end in
+      `system_tests/tests/test_channel_remove.py` (a channel deleted from the tail stops
+      capturing while its sibling channel keeps running the whole time).
+30. **Live channel edit via `reload_diff` (tail-replace generalization)** (`src/config.cpp`,
+    `src/live_reconfig.{cpp,h}`, `src/rtl_airband.h`) — items 27 and 29 could add or remove a
+    channel live, but not edit one: changing an existing channel's `freq`/`modulation`/
+    `bandwidth`/`squelch_snr_threshold`/`notch`/`ctcss`/`highpass`/`lowpass`/`outputs` was
+    silently ignored by `reload_diff` — not even reported, since nothing compared those fields
+    against what was live. Turned out to need no new mechanism: item 29's removal and item 27's
+    append, run back to back on the same channel index, already *is* an edit — a channel is torn
+    down and a freshly parsed replacement takes its place.
+    - **Detecting *that* something changed, without hand-enumerating *what*.** Rather than adding
+      a parallel snapshot field per config key (unbounded, and silently stale the next time a new
+      channel option is added and someone forgets to wire up its diff), `channel_t` gains a
+      `config_signature` field: a canonical string serialization of the channel's entire raw
+      config block, computed once by a new `build_channel_identity_signature()`
+      (`src/config.cpp`) and set unconditionally at the end of `parse_channel()` — so both the
+      startup path and the live-append/replace path always have one. `serialize_setting()`
+      recursively walks an arbitrary `libconfig::Setting` (scalar, group, list, or array), so
+      nested structure — `outputs`, including per-output-type fields like a mixer connection's
+      `balance` — is captured with no per-field knowledge needed, the same way a new output type
+      or channel option added in the future is automatically covered without touching this code
+      at all. `enabled` is deliberately excluded (see below). `DeviceConfigSnapshot::
+      channel_freq_hz` (item 29) is retired in favor of the more general `DeviceConfigSnapshot::
+      channel_signature`, built the same way from the freshly re-read config.
+    - **The diff itself becomes "find the longest common prefix, replace the rest."**
+      `compute_and_apply_diff()` no longer branches on `snap.channel_count > / < / ==
+      dev->channel_count`; it computes `common_prefix` — the largest index such that every
+      channel `[0, common_prefix)` has an identical signature on both sides — then removes
+      whatever's live past that point (`try_remove_channels()`, now taking an explicit
+      `target_count` parameter rather than deriving it from the snapshot, since a replace's
+      target is the common-prefix length, not necessarily the snapshot's final count) and appends
+      whatever the snapshot has past that point (`try_append_channels()`, unchanged — it already
+      starts from `dev->channel_count`, which is `common_prefix` by the time it runs). A pure
+      count increase or decrease is just the special case where one side of that gap is empty;
+      `R_MULTICHANNEL`-only and the `reserve_channels`-capacity check apply exactly as before.
+    - **Why `enabled` is excluded from the signature.** It already has a cheap, non-destructive
+      live-apply path (`channel_request_enable`/`channel_request_disable`, item 26) that just
+      flips a flag — folding it into the signature would make toggling it alone spuriously
+      trigger a full tear-down/reconnect. The untouched common-prefix channels still get their
+      `enabled` diffed and applied via that existing path, every `reload_diff` call, regardless of
+      whether a tail-replace also happened.
+    - **A deliberate, documented behavior change, not just a refactor**: item 29's removal
+      shipped with a hard rule — a non-tail deletion (removing a channel from the middle of the
+      list) was flatly rejected, because position-based diffing had no way to distinguish "the
+      last channel was deleted" from "a different channel was deleted, coincidentally leaving the
+      same count." The signature-based common-prefix approach doesn't have that ambiguity — it
+      finds *where* the file and live state first disagree, by content, not just by count — so a
+      non-tail deletion now succeeds: the deleted channel is removed, and any sibling channel
+      after it in the array gets torn down and reconnected too (a brief interruption, not data
+      loss) purely as a side effect of everything past the divergence point being rebuilt. This is
+      a strictly better outcome than the old flat rejection (which demanded a full restart for the
+      same edit), at the cost of the rebuilt sibling's brief interruption — considered an
+      acceptable, documented tradeoff rather than something worth a more precise (and
+      considerably more complex) reordering-aware diff. **Known limitation**: the comparison is a
+      positional common *prefix*, not a set match — reordering two unchanged channels in the
+      config file causes both to be rebuilt, since the mechanism can't tell "reordered" apart from
+      "replaced" any more finely than that.
+    - **A pre-existing gap this surfaces, not fixed here**: `mixer_disable_input()` (`src/
+      mixer.cpp`) only masks a mixer input slot off (`input_mask[idx] = false`); it never releases
+      it back to `input_capacity`. Editing an already-live channel whose output is `type =
+      "mixer"` therefore burns one more `reserve_inputs` slot on every edit, permanently — an
+      operator who expects to repeatedly tweak a mixer-connected channel's `balance` needs to size
+      `reserve_inputs` for the number of edits they expect to make, not just the number of
+      channels. Flagged, not fixed, matching this fork's existing practice of documenting a
+      discovered-but-out-of-scope gap rather than silently expanding scope to cover it.
+    - Unit tested directly (`ChannelIdentitySignatureTest`, `src/test_live_reconfig.cpp`: identical
+      configs produce identical signatures, a changed scalar field or a changed nested output
+      field produces a different one, `enabled` alone does not) and end-to-end through
+      `compute_and_apply_diff()` (`replaces_tail_channel_when_its_definition_changes`: a bandwidth
+      edit on an existing channel is picked up, the untouched sibling is provably untouched;
+      `replaces_tail_channel_with_edited_mixer_output`: a mixer `balance` edit reconnects into a
+      fresh `reserve_inputs` slot, demonstrating the capacity-consumption caveat above concretely;
+      `deleting_a_non_tail_channel_rebuilds_from_the_point_of_divergence`: the new non-tail
+      behavior, replacing item 29's old rejection test). Every existing hand-built
+      `ChannelAppendTest`/`DiffApplyTest` case that keeps an "already-live, unchanged" channel at
+      index 0 needed one added line (`chans[0].config_signature = strdup(...)`, mirroring what
+      `parse_channel()` would have set at real parse time) — without it, the new common-prefix
+      check has no signature to compare and correctly treats an untouched channel as diverged too,
+      which is a good reason this field is required, not nullable-and-skipped, everywhere except a
+      mixer's own non-replaceable embedded channel. System-tested end-to-end in
+      `system_tests/tests/test_channel_edit.py` (a squelch-threshold edit on a live channel is
+      picked up, with a brief gap around the edit, while an untouched sibling channel is
+      unaffected the whole time) and `test_channel_remove.py`'s rewritten non-tail-deletion test.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

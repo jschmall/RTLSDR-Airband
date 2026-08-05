@@ -389,7 +389,9 @@ TEST_F(DiffApplyTest, channel_enabled_diff_calls_channel_enable_disable) {
     // than copy-initializing from locals.
     channel_t chans[2] = {};
     chans[0].enabled = true;
+    chans[0].config_signature = strdup("chan0-signature");
     chans[1].enabled = false;
+    chans[1].config_signature = strdup("chan1-signature");
 
     device_t dev = {};
     dev.input = &input;
@@ -409,6 +411,10 @@ TEST_F(DiffApplyTest, channel_enabled_diff_calls_channel_enable_disable) {
     dsnap.sample_rate = 2000000;
     dsnap.has_gain = false;
     dsnap.channel_enabled = {false, true};  // flip both
+    // Definitions unchanged - only "enabled" differs (excluded from the signature, see
+    // build_channel_identity_signature()'s comment, config.cpp), so this must stay on the cheap
+    // enable/disable path below rather than triggering a tear-down/replace.
+    dsnap.channel_signature = {"chan0-signature", "chan1-signature"};
     snapshot.devices.push_back(dsnap);
 
     // compute_and_apply_diff() only posts requests (see live_reconfig.h's comment on why - the
@@ -732,6 +738,11 @@ devices:
     ConfigSnapshot snapshot;
     std::string parse_error;
     ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+    // Channel 0's definition is unchanged between "what's live" and "what the file now says" -
+    // give it the signature parse_channel() would have set at its own (real) parse time, so
+    // compute_and_apply_diff()'s common-prefix check correctly treats it as untouched rather than
+    // (having no signature to compare at all) assuming it diverged too.
+    chans[0].config_signature = strdup(snapshot.devices[0].channel_signature[0].c_str());
 
     DiffResult result = compute_and_apply_diff(snapshot);
 
@@ -836,6 +847,7 @@ devices:
     ConfigSnapshot snapshot;
     std::string parse_error;
     ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+    chans[0].config_signature = strdup(snapshot.devices[0].channel_signature[0].c_str());
 
     DiffResult result = compute_and_apply_diff(snapshot);
 
@@ -908,6 +920,7 @@ devices:
     ConfigSnapshot snapshot;
     std::string parse_error;
     ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+    chans[0].config_signature = strdup(snapshot.devices[0].channel_signature[0].c_str());
 
     mixinput_t* inputs_before = mixer.inputs;
 
@@ -981,6 +994,7 @@ devices:
     ConfigSnapshot snapshot;
     std::string parse_error;
     ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+    chans[0].config_signature = strdup(snapshot.devices[0].channel_signature[0].c_str());
 
     DiffResult result = compute_and_apply_diff(snapshot);
 
@@ -1034,6 +1048,7 @@ devices:
     ConfigSnapshot snapshot;
     std::string parse_error;
     ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+    chans[0].config_signature = strdup(snapshot.devices[0].channel_signature[0].c_str());
 
     DiffResult result = compute_and_apply_diff(snapshot);
 
@@ -1081,8 +1096,9 @@ TEST_F(ChannelAppendTest, r_scan_channel_count_change_is_requires_restart_not_ap
 }
 
 // Fixture for the channel-decrease tests below: builds a 2-channel device with real freqlist
-// entries (needed for compute_and_apply_diff()'s decrease branch to validate the surviving
-// prefix - see DeviceConfigSnapshot::channel_freq_hz's comment) and a background consumer thread
+// entries and hand-assigned config_signature strings (needed for compute_and_apply_diff()'s
+// common-prefix check - see DeviceConfigSnapshot::channel_signature's comment) and a background
+// consumer thread
 // standing in for output_thread(), mirroring DiffApplyTest's mixer_enabled_diff_calls_mixer_
 // enable_disable test's pattern (a real consumer thread is needed since channel_request_remove()
 // blocks polling for a response, and nothing services that in a unit test otherwise).
@@ -1119,10 +1135,12 @@ class ChannelRemoveTest : public ChannelAppendTest {
         chans[0].pending_remove_request = -1;
         chans[0].freqlist = freq0;
         chans[0].freq_count = 1;
+        chans[0].config_signature = strdup("chan0-signature");
         chans[1].enabled = true;
         chans[1].pending_remove_request = -1;
         chans[1].freqlist = freq1;
         chans[1].freq_count = 1;
+        chans[1].config_signature = strdup("chan1-signature");
 
         dev.input = &input;
         dev.mode = R_MULTICHANNEL;
@@ -1137,6 +1155,8 @@ class ChannelRemoveTest : public ChannelAppendTest {
     void TearDown() override {
         free(freq0);
         free(freq1);
+        free(chans[0].config_signature);
+        free(chans[1].config_signature);
         ChannelAppendTest::TearDown();
     }
 
@@ -1167,7 +1187,7 @@ TEST_F(ChannelRemoveTest, removes_one_channel_from_the_tail_when_prefix_matches)
     dsnap.sample_rate = 2000000;
     dsnap.has_gain = false;
     dsnap.channel_enabled = {true};
-    dsnap.channel_freq_hz = {120000000};  // matches chans[0] - chans[1] is the one being removed
+    dsnap.channel_signature = {"chan0-signature"};  // matches chans[0] - chans[1] is being removed
     snapshot.devices.push_back(dsnap);
 
     std::atomic<bool> stop_consumer{false};
@@ -1185,31 +1205,125 @@ TEST_F(ChannelRemoveTest, removes_one_channel_from_the_tail_when_prefix_matches)
     EXPECT_TRUE(chans[0].enabled.load());   // untouched
 }
 
-TEST_F(ChannelRemoveTest, mismatched_prefix_is_requires_restart_and_removes_nothing) {
-    // Simulates removing a channel from the MIDDLE of the config file rather than the end: the
-    // snapshot's one surviving channel is chans[1]'s freq, not chans[0]'s - position-based
-    // removal can't tell this apart from a pure tail removal by count alone, so it must refuse
-    // rather than guess and tear down the wrong (currently-last) channel.
+// Deleting a channel from the MIDDLE (or start) of the config, not the tail, used to be flatly
+// rejected (item 29's original freq-only prefix check) - the more general signature-based common-
+// prefix comparison (item 30) instead finds where live and file first disagree and rebuilds
+// everything from that point on, tearing down whatever no longer matches at each index and
+// re-appending whatever the file now says belongs there. This is a deliberate behavior change,
+// not just a refactor: deleting channel A (index 0) here leaves channel B's definition - itself
+// completely unchanged in the file - alone at the new index 0. From the diff's perspective,
+// "index 0 doesn't match live index 0" is indistinguishable from an in-place edit, so B still
+// gets torn down and reconnected as a side effect of correctly removing A - a brief interruption
+// for B, not data loss, and a strictly better outcome than the old behavior's flat refusal.
+TEST_F(ChannelAppendTest, deleting_a_non_tail_channel_rebuilds_from_the_point_of_divergence) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    // See ChannelRemoveTest's fixture comment (above) for why freq_t is calloc'd rather than
+    // genuinely constructed here.
+    freq_t* freq_a = (freq_t*)calloc(1, sizeof(freq_t));
+    freq_t* freq_b = (freq_t*)calloc(1, sizeof(freq_t));
+    freq_a->frequency = 120000000;
+    freq_b->frequency = 120050000;
+
+    channel_t chans[2] = {};
+    chans[0].enabled = true;
+    chans[0].freqlist = freq_a;
+    chans[0].freq_count = 1;
+    chans[0].pending_remove_request = -1;
+    chans[1].enabled = true;
+    chans[1].freqlist = freq_b;
+    chans[1].freq_count = 1;
+    chans[1].pending_remove_request = -1;
+    size_t bins[2] = {0, 0};
+    size_t base_bins[2] = {0, 0};
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 2;
+    dev.channel_capacity = 2;
+    dev.channels = chans;
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    // Parse the ORIGINAL (both channels present) config to prime each live channel's
+    // config_signature exactly the way startup would.
+    std::string original_path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "a"; } ); },
+    { freq = 120050000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "b"; } ); }
+  );
+});
+)");
+    ConfigSnapshot original_snapshot;
+    std::string parse_error;
+    ASSERT_TRUE(parse_config_snapshot(original_path, &original_snapshot, &parse_error)) << parse_error;
+    chans[0].config_signature = strdup(original_snapshot.devices[0].channel_signature[0].c_str());
+    chans[1].config_signature = strdup(original_snapshot.devices[0].channel_signature[1].c_str());
+
+    // Channel A is now deleted from the file - only B's (unchanged) definition remains, at index 0.
+    std::string path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120050000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "b"; } ); }
+  );
+});
+)");
     ConfigSnapshot snapshot;
-    DeviceConfigSnapshot dsnap;
-    dsnap.type = "rtlsdr";
-    dsnap.mode = R_MULTICHANNEL;
-    dsnap.channel_count = 1;
-    dsnap.centerfreq = 120000000;  // unchanged - no retune expected
-    dsnap.sample_rate = 2000000;
-    dsnap.has_gain = false;
-    dsnap.channel_enabled = {true};
-    dsnap.channel_freq_hz = {120050000};  // chans[1]'s freq, not chans[0]'s
-    snapshot.devices.push_back(dsnap);
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+
+    // Services pending_remove_request for both channels, standing in for output_thread() - same
+    // shape as ChannelRemoveTest::start_consumer().
+    std::atomic<bool> stop_consumer{false};
+    std::thread consumer([&]() {
+        while (!stop_consumer.load()) {
+            for (channel_t& channel : chans) {
+                if (channel.pending_remove_request.load(std::memory_order_acquire) == 1) {
+                    channel_teardown_for_removal(&channel);
+                    channel.pending_remove_request.store(-1, std::memory_order_release);
+                }
+            }
+            std::this_thread::yield();
+        }
+    });
 
     DiffResult result = compute_and_apply_diff(snapshot);
+    stop_consumer.store(true);
+    consumer.join();
 
-    EXPECT_EQ(dev.channel_count.load(), 2);  // unchanged
-    EXPECT_TRUE(result.applied.empty());
-    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
-    EXPECT_NE(result.skipped_requires_restart[0].find("pure tail removal"), std::string::npos);
-    EXPECT_TRUE(chans[0].enabled.load());
-    EXPECT_TRUE(chans[1].enabled.load());
+    ASSERT_EQ(dev.channel_count.load(), 1);
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+    bool saw_removed = false, saw_added = false;
+    for (const auto& s : result.applied) {
+        if (s.find("removed 2 channel") != std::string::npos)
+            saw_removed = true;
+        if (s.find("added 1 channel") != std::string::npos)
+            saw_added = true;
+    }
+    EXPECT_TRUE(saw_removed);
+    EXPECT_TRUE(saw_added);
+    // Final state: exactly one channel, matching B's definition, correctly re-established at
+    // index 0 - not the stale chans[0] slot's old (channel A) content.
+    ASSERT_EQ(chans[0].freq_count, 1);
+    EXPECT_EQ(chans[0].freqlist[0].frequency, 120050000);
+    EXPECT_EQ(chans[0].output_count, 1);
 }
 
 TEST_F(ChannelRemoveTest, removal_timeout_leaves_a_valid_partially_reduced_count) {
@@ -1225,7 +1339,7 @@ TEST_F(ChannelRemoveTest, removal_timeout_leaves_a_valid_partially_reduced_count
     dsnap.sample_rate = 2000000;
     dsnap.has_gain = false;
     dsnap.channel_enabled = {};
-    dsnap.channel_freq_hz = {};
+    dsnap.channel_signature = {};
     snapshot.devices.push_back(dsnap);
 
     DiffResult result = compute_and_apply_diff(snapshot);
@@ -1266,4 +1380,269 @@ TEST_F(ChannelAppendTest, r_scan_channel_count_decrease_is_requires_restart) {
     EXPECT_EQ(dev.channel_count.load(), 1);
     ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
     EXPECT_NE(result.skipped_requires_restart[0].find("R_SCAN"), std::string::npos);
+}
+
+// build_channel_identity_signature() (config.cpp) is what backs the common-prefix check above -
+// these test it directly, against real parsed config text, independent of the diff machinery.
+TEST(ChannelIdentitySignatureTest, identical_configs_produce_identical_signatures) {
+    libconfig::Config cfg1, cfg2;
+    cfg1.readString(R"(chan: { freq = 120000000; modulation = "nfm"; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); };)");
+    cfg2.readString(R"(chan: { freq = 120000000; modulation = "nfm"; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); };)");
+    EXPECT_EQ(build_channel_identity_signature(cfg1.lookup("chan")), build_channel_identity_signature(cfg2.lookup("chan")));
+}
+
+TEST(ChannelIdentitySignatureTest, differing_scalar_field_produces_different_signature) {
+    libconfig::Config cfg1, cfg2;
+    cfg1.readString("chan: { freq = 120000000; bandwidth = 5000; };");
+    cfg2.readString("chan: { freq = 120000000; bandwidth = 8000; };");
+    EXPECT_NE(build_channel_identity_signature(cfg1.lookup("chan")), build_channel_identity_signature(cfg2.lookup("chan")));
+}
+
+TEST(ChannelIdentitySignatureTest, differing_nested_output_field_produces_different_signature) {
+    // outputs is a list of groups - proves serialize_setting()'s recursion actually reaches into
+    // nested structures, not just top-level scalar fields.
+    libconfig::Config cfg1, cfg2;
+    cfg1.readString(R"(chan: { freq = 120000000; outputs: ( { type = "mixer"; name = "mix1"; balance = 0.0; } ); };)");
+    cfg2.readString(R"(chan: { freq = 120000000; outputs: ( { type = "mixer"; name = "mix1"; balance = 0.5; } ); };)");
+    EXPECT_NE(build_channel_identity_signature(cfg1.lookup("chan")), build_channel_identity_signature(cfg2.lookup("chan")));
+}
+
+TEST(ChannelIdentitySignatureTest, enabled_field_is_excluded_from_signature) {
+    // "enabled" is diffed/applied separately via a cheap flag flip - see
+    // build_channel_identity_signature()'s comment (config.cpp) for why it's deliberately left
+    // out, so toggling it alone never forces a full tear-down/replace.
+    libconfig::Config cfg1, cfg2;
+    cfg1.readString("chan: { freq = 120000000; enabled = true; };");
+    cfg2.readString("chan: { freq = 120000000; enabled = false; };");
+    EXPECT_EQ(build_channel_identity_signature(cfg1.lookup("chan")), build_channel_identity_signature(cfg2.lookup("chan")));
+}
+
+// End-to-end coverage for the tail-replace mechanism these signatures back: editing an already-
+// live channel's field (not just adding/removing channels) is picked up by reload_diff.
+TEST_F(ChannelAppendTest, replaces_tail_channel_when_its_definition_changes) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    channel_t chans[2] = {};
+    chans[0].enabled = true;
+    size_t bins[2] = {0, 0};
+    size_t base_bins[2] = {0, 0};
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 2;
+    dev.channel_capacity = 2;
+    dev.channels = chans;
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    std::string original_path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); },
+    { freq = 120050000; bandwidth = 5000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "y"; } ); }
+  );
+});
+)");
+    ConfigSnapshot original_snapshot;
+    std::string parse_error;
+    ASSERT_TRUE(parse_config_snapshot(original_path, &original_snapshot, &parse_error)) << parse_error;
+    ASSERT_TRUE(parse_channel((*original_snapshot.devices[0].raw_channels_setting)[0], &dev, 0, 0, &chans[0]));
+    ASSERT_TRUE(parse_channel((*original_snapshot.devices[0].raw_channels_setting)[1], &dev, 0, 1, &chans[1]));
+    std::string old_signature(chans[1].config_signature);
+
+    // Channel 1's bandwidth changes - same freq, same output, different bandwidth. Channel 0 is
+    // untouched in the file.
+    std::string path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); },
+    { freq = 120050000; bandwidth = 8000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "y"; } ); }
+  );
+});
+)");
+    ConfigSnapshot snapshot;
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+
+    // Services pending_remove_request for both channels, standing in for output_thread() - the
+    // replaced tail channel's teardown needs this or channel_request_remove() times out.
+    std::atomic<bool> stop_consumer{false};
+    std::thread consumer([&]() {
+        while (!stop_consumer.load()) {
+            for (channel_t& channel : chans) {
+                if (channel.pending_remove_request.load(std::memory_order_acquire) == 1) {
+                    channel_teardown_for_removal(&channel);
+                    channel.pending_remove_request.store(-1, std::memory_order_release);
+                }
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+    stop_consumer.store(true);
+    consumer.join();
+
+    EXPECT_EQ(dev.channel_count.load(), 2);
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+    bool saw_removed = false, saw_added = false;
+    for (const auto& s : result.applied) {
+        if (s.find("removed 1 channel") != std::string::npos)
+            saw_removed = true;
+        if (s.find("added 1 channel") != std::string::npos)
+            saw_added = true;
+    }
+    EXPECT_TRUE(saw_removed);
+    EXPECT_TRUE(saw_added);
+    // Channel 0 (unchanged) must be untouched - still the exact same parsed instance, not a
+    // freshly re-parsed one.
+    EXPECT_EQ(chans[0].output_count, 1);
+    // Channel 1 was genuinely replaced - freq is the same (by design, only bandwidth changed),
+    // but its signature must reflect the new config, proving it's a fresh parse, not the stale one.
+    ASSERT_EQ(chans[1].freq_count, 1);
+    EXPECT_EQ(chans[1].freqlist[0].frequency, 120050000);
+    ASSERT_NE(chans[1].config_signature, nullptr);
+    EXPECT_NE(std::string(chans[1].config_signature), old_signature);
+}
+
+// Same mechanism, applied to the case item 30 was specifically asked for: editing an existing
+// channel's mixer connection (ampfactor/balance) live, not just adding a brand-new one (item 28).
+TEST_F(ChannelAppendTest, replaces_tail_channel_with_edited_mixer_output) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    channel_t chans[1] = {};
+    size_t bins[1] = {0};
+    size_t base_bins[1] = {0};
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 1;
+    dev.channel_capacity = 1;
+    dev.channels = chans;
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    mixer_t mixer = {};
+    mixer.name = "mix1";
+    mixer.enabled = true;
+    mixer.channel.enabled = true;
+    mixer.channel.output_count = 0;
+    mixer.pending_enable_request = -1;
+    mixer.input_count = 0;
+    mixer.input_capacity = 0;
+    // Room for the replacement's own reconnect - see mixer_disable_input()'s comment (mixer.cpp)
+    // for the known caveat this relies on: a replaced channel's old mixer input slot is never
+    // released back to input_capacity, so every edit of a mixer-connected channel consumes one
+    // more reserve_inputs slot, permanently.
+    mixer.reserve_inputs = 1;
+    mixers = &mixer;
+    mixer_count = 1;
+
+    std::string original_path = write_config(R"(
+mixers: {
+  mix1: {
+    outputs: ( { type = "file"; directory = "/tmp"; filename_template = "mix"; } );
+  };
+};
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "mixer"; name = "mix1"; balance = 0.0; } ); }
+  );
+});
+)");
+    ConfigSnapshot original_snapshot;
+    std::string parse_error;
+    ASSERT_TRUE(parse_config_snapshot(original_path, &original_snapshot, &parse_error)) << parse_error;
+    ASSERT_TRUE(parse_channel((*original_snapshot.devices[0].raw_channels_setting)[0], &dev, 0, 0, &chans[0]));
+    mixer_finalize_capacity();
+    ASSERT_EQ(mixer.input_count.load(), 1);  // connected once at "startup"
+
+    // The channel's balance changes - same freq, same mixer, different balance.
+    std::string path = write_config(R"(
+mixers: {
+  mix1: {
+    outputs: ( { type = "file"; directory = "/tmp"; filename_template = "mix"; } );
+  };
+};
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "mixer"; name = "mix1"; balance = 0.7; } ); }
+  );
+});
+)");
+    ConfigSnapshot snapshot;
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+
+    // Services pending_remove_request, standing in for output_thread() - the replaced channel's
+    // teardown needs this or the request times out. Note: channel_teardown_for_removal() calls
+    // disable_channel_outputs() (src/output.cpp), which is stubbed to a no-op in this test binary
+    // (see test_mixer.cpp's file-scope stub comment) since output.cpp itself - shout/lame/real
+    // file I/O - isn't linked into unittests. That means mixer_disable_input() genuinely never
+    // runs here, so input_mask[0] can't be asserted on in this test; what CAN be verified here is
+    // everything downstream of the real (not stubbed) mixer_connect_input() call the replacement
+    // channel makes.
+    std::atomic<bool> stop_consumer{false};
+    std::thread consumer([&]() {
+        while (!stop_consumer.load()) {
+            for (channel_t& channel : chans) {
+                if (channel.pending_remove_request.load(std::memory_order_acquire) == 1) {
+                    channel_teardown_for_removal(&channel);
+                    channel.pending_remove_request.store(-1, std::memory_order_release);
+                }
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+    stop_consumer.store(true);
+    consumer.join();
+
+    EXPECT_EQ(dev.channel_count.load(), 1);
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+    // The edit works, but demonstrates the documented caveat: mixer_disable_input() (mixer.cpp,
+    // called from the real disable_channel_outputs() in production - stubbed out in this test
+    // binary, see above) only masks the old slot; it never releases it back to input_capacity. So
+    // the replacement channel's fresh mixer_connect_input() call consumes a NEW slot (index 1,
+    // the reserve_inputs headroom) rather than reusing index 0 - input_count is 2, not 1.
+    EXPECT_EQ(mixer.input_count.load(), 2);
+    ASSERT_EQ(chans[0].output_count, 1);
+    mixer_data* mdata = (mixer_data*)chans[0].outputs[0].data;
+    EXPECT_EQ(mdata->mixer, &mixer);
+    EXPECT_EQ(mdata->input, 1);
+    EXPECT_TRUE(mixer.input_mask[1]);
+    EXPECT_FLOAT_EQ(mixer.inputs[mdata->input].ampl, fminf(1.0f, 1.0f - 0.7f));
 }
