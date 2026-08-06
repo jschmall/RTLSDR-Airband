@@ -1552,3 +1552,20 @@ send-side pacing code; confirm with a wire capture first.
   unit must set `User=`/`Group=` to a non-root service account — the control socket's
   `SO_PEERCRED` check rejects any client whose UID doesn't match the daemon's own, so a
   root-run daemon can only be controlled by root-run tooling.
+- **That non-root service account also needs USB device permissions it doesn't get for free.**
+  Hit this in production 2026-08-06: the `rtl_042` instance (RTL-SDR Blog V4, `serial = "17"`)
+  was switched to `User=`/`Group=` to enable `control_socket_path` and immediately started
+  failing every restart with `RTLSDR device with serial number 17 not found`, despite the
+  device being present and working fine via `rtl_test` and previously via a root-run daemon.
+  Root cause: every prior instance on this host had always run as root (via `sudo`), which
+  bypasses USB device permissions entirely; the new non-root account was never added to
+  `plugdev`, the group `librtlsdr2`'s own udev rule (`/lib/udev/rules.d/60-librtlsdr2.rules`)
+  grants device access to. Fixed with `sudo usermod -aG plugdev <service-account>` +
+  restarting the unit — no code change, no udev rule change, one-time per host (group
+  membership, not per-service). Symptom is confusingly generic ("not found", not "permission
+  denied") because `rtlsdr_find_device_by_serial()` (`src/input-rtlsdr.cpp`) silently discards
+  the return code of `rtlsdr_get_device_usb_strings()` — a real robustness gap in that
+  function, pre-existing (not introduced by `dynamic_reload`), not yet fixed; a future fix
+  should log/surface a permission failure there distinctly from a genuine no-match. Documented
+  in `init.d/rtl_airband.service` so this isn't rediscovered the hard way on the next
+  control-socket rollout.

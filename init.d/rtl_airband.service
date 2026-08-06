@@ -17,6 +17,18 @@ Restart=no
 # the control socket only accepts connections whose UID matches the daemon's
 # own UID (SO_PEERCRED check in control_socket.cpp). Leaving this unset runs
 # the daemon as root, which locks out any non-root control-socket client.
+#
+# Once User=/Group= is set, that account also needs OS-level permission to
+# open the SDR's USB device node - root has this implicitly, a non-root
+# service account does not. On Debian/Ubuntu, librtlsdr's own udev rule
+# (/lib/udev/rules.d/60-librtlsdr2.rules) grants access via the "plugdev"
+# group; add the service account to it:
+#   sudo usermod -aG plugdev <rtl-airband-service-account>
+# then restart the unit (no reboot/re-login needed - systemd resolves group
+# membership fresh at service start). Symptom if this is missed: the daemon
+# starts, connects its outputs, then fails with "RTLSDR device with serial
+# number <N> not found" (or "Failed to open rtlsdr device") even though the
+# device is present and works fine when run manually as root.
 
 [Install]
 WantedBy=multi-user.target
