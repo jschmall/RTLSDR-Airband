@@ -1,11 +1,14 @@
 # RTLSDR-Airband
 
-![version tag](https://img.shields.io/github/v/tag/rtl-airband/RTLSDR-Airband?label=)
+![fork version](https://img.shields.io/github/v/tag/jschmall/RTLSDR-Airband?label=this%20fork)
+![upstream version](https://img.shields.io/github/v/tag/rtl-airband/RTLSDR-Airband?label=upstream)
 
 ## Fork-Specific Features
 
 This is a personal fork of [`rtl-airband/RTLSDR-Airband`](https://github.com/rtl-airband/RTLSDR-Airband)
-that tracks upstream `main` and carries a small delta on top of it:
+that tracks upstream `main` and carries a small delta on top of it. This fork tags its own
+releases independently of upstream's — `v5.3.0` adds live reconfiguration (below) and
+`send_tx_tags` on top of upstream `v5.2.1`.
 
 - **`post_write_script` and `min_rx_seconds` file-output options** — run a script after
   each completed recording and skip saving very short transmissions. Cherry-picked from
