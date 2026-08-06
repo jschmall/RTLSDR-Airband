@@ -994,6 +994,38 @@ Keep the local delta small and well understood.
     assertion locking in the new substring, mirroring item 32's regression test. All 207 tests
     pass; not separately re-verified against real hardware since this is a string-only change to
     an already-hardware-tested failure path (items 26/33/34).
+37. **Control socket: per-connection recv timeout + buffer cap** (`src/control_socket.{cpp,h}`)
+    — the first fix out of a pre-merge review pass across the whole `dynamic_reload` branch
+    (items 26-36), specifically scoped to the easiest of four findings, ordered easiest to
+    hardest. `handle_connection()` previously had no timeout on its `recv()` loop and no cap on
+    how much it would buffer waiting for a newline — a single stalled or misbehaving client (a
+    bug in a caller, or a `nc -U`/manual session left open) blocked *every* other control-socket
+    operation on that instance indefinitely, since `control_main()`'s accept loop is single-
+    threaded and doesn't service a new connection until `handle_connection()` returns. This also
+    meant a stuck client could delay a clean process shutdown by the same amount, since
+    `control_shutdown_requested` is only re-checked between `recv()` calls.
+    - `handle_connection()` now takes `timeout_sec`/`max_buffered_bytes` parameters (defaulted in
+      the header to 10s/16KiB for the production call site in `control_main()`, so that call site
+      needed no changes) and sets `SO_RCVTIMEO` on the accepted fd; a client that sends more than
+      `max_buffered_bytes` without a newline is disconnected immediately rather than buffered
+      without limit.
+    - Moved out of the anonymous namespace and declared in `control_socket.h` (matching the
+      existing pattern for `control_socket_dispatch_command_line()`/`control_socket_parse_command_
+      line()`) specifically so it's unit-testable — unlike those two, there's no way to exercise a
+      real `recv()` timeout without a real socket, so the new tests use a short injected timeout
+      rather than the production default to stay fast.
+    - This does **not** make the control socket handle multiple clients concurrently — that
+      remains a single-connection-at-a-time design, unchanged and out of scope for this fix.
+      Verified via real-hardware testing: a stuck first client with no data sent still delays a
+      second client's request, but now bounded to the configured timeout (~10s, confirmed via a
+      live timed test) rather than blocking forever.
+    - Unit tested in `src/test_control_socket.cpp`'s new `HandleConnectionTest` fixture, using a
+      real `AF_UNIX` `socketpair()` (not mocked): closes on timeout with no data sent, closes when
+      the buffer cap is exceeded without a newline, and a normal request/response round trip still
+      works unchanged over the real socket. All 210 tests (3 net new) pass across Debug,
+      Debug+NFM, and ASan/UBSan. Verified end-to-end against real RTL-SDR hardware: a normal
+      `retune` command still works, and a stuck client no longer wedges a second client's request
+      past the new timeout.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

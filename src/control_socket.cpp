@@ -25,6 +25,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>  // struct timeval, for SO_RCVTIMEO
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -366,32 +367,6 @@ string handle_reload_diff(const map<string, string>&) {
     return "{\"ok\":true,\"applied\":" + json_string_array(diff.applied) + ",\"skipped_requires_restart\":" + json_string_array(diff.skipped_requires_restart) + "}";
 }
 
-void handle_connection(int conn_fd) {
-    string buffer;
-    char chunk[4096];
-    while (!control_shutdown_requested) {
-        ssize_t n = recv(conn_fd, chunk, sizeof(chunk), 0);
-        if (n <= 0) {
-            break;
-        }
-        buffer.append(chunk, (size_t)n);
-        size_t newline;
-        while ((newline = buffer.find('\n')) != string::npos) {
-            string line = buffer.substr(0, newline);
-            buffer.erase(0, newline + 1);
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-            if (line.empty()) {
-                continue;
-            }
-            string response = control_socket_dispatch_command_line(line) + "\n";
-            send(conn_fd, response.data(), response.size(), MSG_NOSIGNAL);
-        }
-    }
-    close(conn_fd);
-}
-
 bool peer_is_same_uid(int conn_fd) {
     struct ucred cred;
     socklen_t len = sizeof(cred);
@@ -425,6 +400,55 @@ void* control_main(void*) {
 }
 
 }  // namespace
+
+// Bounds on a single client connection so one stalled or misbehaving client can't wedge every
+// other control-socket operation on this instance: timeout_sec makes a stuck recv() return
+// instead of blocking control_main()'s single accept loop indefinitely (and, since this runs
+// entirely inside handle_connection() with no other thread able to service new connections in
+// the meantime, also bounds how long a stuck client can delay a clean process shutdown -
+// control_shutdown_requested is only re-checked between recv() calls). max_buffered_bytes bounds
+// how much a client that never sends a newline can make this process buffer - the same-uid trust
+// model already limits who can open this socket at all, but there's no reason to trust a
+// connected client to behave, either. Exposed (declared in control_socket.h) with real socket I/O
+// - unlike the parse/dispatch functions above, there's no meaningful way to unit test a recv()
+// timeout without a real socket pair - so tests pass a short timeout/small cap rather than the
+// production defaults to keep this fast.
+void handle_connection(int conn_fd, int timeout_sec, size_t max_buffered_bytes) {
+    struct timeval tv;
+    tv.tv_sec = timeout_sec;
+    tv.tv_usec = 0;
+    setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    string buffer;
+    char chunk[4096];
+    while (!control_shutdown_requested) {
+        ssize_t n = recv(conn_fd, chunk, sizeof(chunk), 0);
+        if (n <= 0) {
+            // n == 0: peer closed. n < 0: either SO_RCVTIMEO expired (EAGAIN/EWOULDBLOCK) or a
+            // real socket error - either way, don't wait on this connection any longer.
+            break;
+        }
+        buffer.append(chunk, (size_t)n);
+        if (buffer.size() > max_buffered_bytes && buffer.find('\n') == string::npos) {
+            log(LOG_WARNING, "control_socket: client sent %zu bytes with no newline, closing connection\n", buffer.size());
+            break;
+        }
+        size_t newline;
+        while ((newline = buffer.find('\n')) != string::npos) {
+            string line = buffer.substr(0, newline);
+            buffer.erase(0, newline + 1);
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            if (line.empty()) {
+                continue;
+            }
+            string response = control_socket_dispatch_command_line(line) + "\n";
+            send(conn_fd, response.data(), response.size(), MSG_NOSIGNAL);
+        }
+    }
+    close(conn_fd);
+}
 
 string control_socket_dispatch_command_line(const string& line) {
     map<string, string> fields;

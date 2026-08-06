@@ -48,4 +48,12 @@ std::string control_socket_dispatch_command(const std::map<std::string, std::str
 // per line it reads off the socket. Exposed for the same testability reason as the two above.
 std::string control_socket_dispatch_command_line(const std::string& line);
 
+// Services one already-accepted client connection until it disconnects, times out
+// (timeout_sec, SO_RCVTIMEO), sends more than max_buffered_bytes without a newline, or
+// control_socket_shutdown() is called - then closes conn_fd. The production caller
+// (control_main()) always uses the defaults; tests pass a short timeout/small cap to exercise
+// the same real-socket code path quickly. See its definition (control_socket.cpp) for why these
+// bounds exist.
+void handle_connection(int conn_fd, int timeout_sec = 10, size_t max_buffered_bytes = 16384);
+
 #endif /* _CONTROL_SOCKET_H */

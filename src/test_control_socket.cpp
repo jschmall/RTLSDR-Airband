@@ -17,6 +17,8 @@
 
 #include "test_base_class.h"
 
+#include <sys/socket.h>
+#include <unistd.h>
 #include <thread>
 
 #include "control_socket.h"
@@ -277,4 +279,78 @@ TEST_F(ControlSocketDispatchTest, dispatch_command_line_response_never_contains_
     EXPECT_NE(response.find("\"ok\":false"), string::npos);
     EXPECT_EQ(response.find('\n'), string::npos) << "response: " << response;
     EXPECT_NE(response.find("bogus\\ncmd"), string::npos) << "response: " << response;
+}
+
+// handle_connection() is the one function in this file that does real socket I/O rather than
+// pure parsing/dispatch - these use a real AF_UNIX socketpair() so the timeout/buffer-cap logic
+// under test is exercised for real, not mocked away. Short timeout_sec/max_buffered_bytes values
+// (rather than control_socket.h's production defaults) keep these fast - see handle_connection()'s
+// declaration comment (control_socket.h) for why a real socket is unavoidable here.
+class HandleConnectionTest : public TestBaseClass {
+   protected:
+    int server_fd = -1;
+    int client_fd = -1;
+
+    void SetUp() override {
+        TestBaseClass::SetUp();
+        int fds[2];
+        ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+        server_fd = fds[0];
+        client_fd = fds[1];
+    }
+
+    void TearDown() override {
+        if (client_fd >= 0) {
+            close(client_fd);
+        }
+        TestBaseClass::TearDown();
+    }
+};
+
+TEST_F(HandleConnectionTest, closes_connection_after_recv_timeout_with_no_data) {
+    std::thread server([&]() { handle_connection(server_fd, /*timeout_sec=*/1, /*max_buffered_bytes=*/16384); });
+
+    // Client sends nothing at all - handle_connection()'s recv() should time out (not hang
+    // forever) and close its end, which the client observes as EOF (recv() returning 0).
+    char buf[16];
+    ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
+    EXPECT_EQ(n, 0) << "expected EOF (server closed after timeout), got " << n;
+
+    server.join();
+}
+
+TEST_F(HandleConnectionTest, closes_connection_when_buffer_exceeds_cap_without_a_newline) {
+    std::thread server([&]() { handle_connection(server_fd, /*timeout_sec=*/5, /*max_buffered_bytes=*/16); });
+
+    // Send more than max_buffered_bytes with no newline - handle_connection() should give up on
+    // this connection immediately rather than buffering it indefinitely.
+    string junk(64, 'x');
+    ASSERT_GT(send(client_fd, junk.data(), junk.size(), 0), 0);
+
+    char buf[16];
+    ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
+    EXPECT_EQ(n, 0) << "expected EOF (server closed after exceeding buffer cap), got " << n;
+
+    server.join();
+}
+
+TEST_F(HandleConnectionTest, still_dispatches_and_responds_to_a_real_command_normally) {
+    // Confirms the new timeout/cap logic doesn't disturb the normal request/response path -
+    // a real end-to-end round trip over the actual socket, not just dispatch_command_line()
+    // called directly.
+    std::thread server([&]() { handle_connection(server_fd, /*timeout_sec=*/5, /*max_buffered_bytes=*/16384); });
+
+    string request = "not valid json\n";
+    ASSERT_GT(send(client_fd, request.data(), request.size(), 0), 0);
+
+    char buf[256] = {0};
+    ssize_t n = recv(client_fd, buf, sizeof(buf) - 1, 0);
+    ASSERT_GT(n, 0);
+    string response(buf, (size_t)n);
+    EXPECT_NE(response.find("\"ok\":false"), string::npos) << "response: " << response;
+    EXPECT_NE(response.find('\n'), string::npos) << "response should be newline-terminated";
+
+    close(client_fd);
+    client_fd = -1;  // TearDown already closes it; avoid a double-close
+    server.join();
 }
