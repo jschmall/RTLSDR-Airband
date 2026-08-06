@@ -28,28 +28,70 @@ that tracks upstream `main` and carries a small delta on top of it:
 
 ### 🧪 On This Branch Only (`dynamic_reload`, not yet on `main`)
 
-This branch adds a live retune/reconfiguration control socket, so an operator can push
-config changes to a running instance without dropping the feed for a full restart. It's
-still soaking on a test instance before being considered for `main` — see
-[`CLAUDE.md`](CLAUDE.md) (fork-delta items 26-27) for the full design notes, scope, and
-known limitations.
+This branch lets you push most config changes to an already-running instance without
+dropping the audio feed for a full restart. It's still soaking on a test instance before
+being considered for `main` — see [`CLAUDE.md`](CLAUDE.md) (fork-delta items 26–35) for
+full engineering detail if you need it.
 
-- **`control_socket_path`** — a same-host-only Unix domain socket (owner-only permissions)
-  that accepts one JSON command per line and returns one JSON response line:
-  `retune`, `set_gain`, `set_bandwidth`, `channel_enable`/`channel_disable`,
-  `mixer_enable`/`mixer_disable`, and `reload_diff` (re-reads the config file on disk and
-  live-applies whatever it safely can, reporting the rest as needing a restart).
-- **New `enabled = true/false` channel/mixer config keyword** — declare a channel or
-  mixer up front (optionally starting disabled) so it can be toggled live via the socket.
-  Adding a mixer or device that wasn't in the original config still requires a restart.
-- **`reserve_channels`** — reserve extra, unused-at-startup channel slots on a device so a
-  channel that *wasn't* in the original config can be appended later, live: add it to the
-  config file and send `reload_diff`, no restart needed. Requires setting
-  `reserve_channels` up front on that device (one restart to opt in); an
-  `R_SCAN`-mode device, or exceeding the reserved headroom, still falls back to reporting
-  that a restart is needed.
-- SIGHUP-triggered full reload (above) is unaffected and remains the fallback for any
-  change outside this feature's scope (e.g. sample rate, mixer/device add).
+**How it works, in short:** each instance opens a small local control socket
+(`control_socket_path` in its config). Edit the instance's config file as normal, then
+tell it to reload — it re-reads the file, applies everything it safely can to the running
+process, and reports back exactly what changed and what (if anything) still needs a
+restart. Nothing changes about how you edit configs; this just removes the restart step
+for most day-to-day edits.
+
+#### What can be changed live, no restart needed
+
+- **Center frequency** — for a device tuned to a fixed frequency with multiple channels
+  on it (not a scanning device, see below).
+- **Gain**
+- **Tuner bandwidth**
+- **Frequency correction (PPM)**
+- **Sample rate**
+- **Turning a channel or mixer on or off**
+- **Adding a channel to a device** — as long as you set aside room for it ahead of time
+  (see "reserving room for later," below). Without that, adding a channel still needs a
+  restart.
+- **Removing a channel**
+- **Editing an existing channel** — frequency, mode, filters, squelch, its outputs,
+  anything about it. Under the hood this is really a remove-and-re-add, so there's a brief
+  audio gap on that one channel while it happens, but everything else keeps running.
+- **Connecting a channel's output into a mixer** — again, only if the mixer has room
+  reserved for it.
+
+#### What still needs a restart
+
+- **Adding or removing an entire radio (device) or mixer.** The fleet's shape — how many
+  radios, how many mixers — is fixed at startup.
+- **Changing what kind of radio hardware a device uses** (its driver).
+- **Switching a device between "multiple fixed channels" and "scan a list of
+  frequencies" mode.**
+- **Anything on a scanning-mode device.** Scanning devices don't support live changes at
+  all — any change to one always needs a restart.
+- **A mixer's own output settings** (where its mixed audio goes) — set once at startup,
+  not editable live. Only which channels feed *into* the mixer can change live.
+- **A device's USB buffer count, or which physical dongle it's bound to** (serial number
+  or index).
+- **Anything outside per-device/per-channel/per-mixer settings** — the control socket
+  path itself, logging format, metrics settings, and similar global options are read once
+  at startup only.
+
+#### Reserving room for later
+
+Adding a channel to a device, or connecting a new channel into a mixer, both need room
+that was set aside in advance — the running process won't grow its own internal capacity
+on the fly. Add `reserve_channels` (on a device) or `reserve_inputs` (on a mixer) to your
+config now, even before you know exactly what you'll add later — one restart to pick
+that up. After that, using that reserved room — adding the channel, connecting it to the
+mixer — needs no restart at all. Running out of reserved room, or trying this on a
+scanning-mode device, is reported back as "still needs a restart," not a silent failure.
+
+#### If something can't be applied live
+
+The reload response tells you exactly what it changed and what it couldn't. A rejected
+change is never left in a broken or half-applied state — the instance keeps running
+normally throughout, and you can either fix the config and try again, or fall back to
+SIGHUP (a clean, brief restart) to pick up anything that genuinely requires one.
 
 ### Metrics Exposed via the Stats Endpoint
 
