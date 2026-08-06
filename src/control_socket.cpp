@@ -206,6 +206,33 @@ string handle_retune(const map<string, string>& fields) {
     return ok_response();
 }
 
+string handle_set_sample_rate(const map<string, string>& fields) {
+    string err;
+    device_t* dev;
+    if (!get_device(fields, &dev, &err)) {
+        return error_response(err);
+    }
+    int sample_rate;
+    if (!get_int_field(fields, "sample_rate", &sample_rate)) {
+        return error_response("missing or invalid 'sample_rate'");
+    }
+    if (!device_request_sample_rate(dev, sample_rate)) {
+        return error_response("device is not R_MULTICHANNEL, or driver does not support live sample_rate changes");
+    }
+    // Budget a longer timeout than retune's - the apply side includes a full RX-thread join and
+    // hardware device reopen, not just one API call. See device_confirm_sample_rate()'s
+    // declaration comment (live_reconfig.h).
+    bool timed_out = false;
+    bool ok = device_confirm_sample_rate(dev, /*timeout_us=*/3000000, &timed_out);
+    if (timed_out) {
+        return error_response("sample_rate change timed out waiting for the demod thread");
+    }
+    if (!ok) {
+        return error_response("sample_rate change failed and was rolled back to the previous rate (or the device is now down), see logs");
+    }
+    return ok_response();
+}
+
 string handle_set_gain(const map<string, string>& fields) {
     string err;
     device_t* dev;
@@ -499,6 +526,8 @@ string control_socket_dispatch_command(const map<string, string>& fields) {
     }
     if (cmd == "retune") {
         return handle_retune(fields);
+    } else if (cmd == "set_sample_rate") {
+        return handle_set_sample_rate(fields);
     } else if (cmd == "set_gain") {
         return handle_set_gain(fields);
     } else if (cmd == "set_bandwidth") {

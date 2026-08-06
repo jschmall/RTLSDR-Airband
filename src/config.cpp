@@ -979,13 +979,9 @@ int parse_devices(libconfig::Setting& devs) {
         assert(dev->input->bytes_per_sample > 0);
         assert(dev->input->sample_rate > WAVE_RATE);
 
-        // For the input buffer size use a base value and round it up to the nearest multiple
-        // of FFT_BATCH blocks of input samples.
-        // ceil is required here because sample rate is not guaranteed to be an integer multiple of WAVE_RATE.
-        size_t fft_batch_len = FFT_BATCH * (2 * dev->input->bytes_per_sample * (size_t)ceil((double)dev->input->sample_rate / (double)WAVE_RATE));
-        dev->input->buf_size = MIN_BUF_SIZE;
-        if (dev->input->buf_size % fft_batch_len != 0)
-            dev->input->buf_size += fft_batch_len - dev->input->buf_size % fft_batch_len;
+        // Shared with live_reconfig.cpp's device_apply_sample_rate() so both paths agree by
+        // construction - see compute_input_buf_size()'s declaration comment (live_reconfig.h).
+        dev->input->buf_size = compute_input_buf_size(dev->input->sample_rate, dev->input->bytes_per_sample);
         debug_print("dev->input->buf_size: %zu\n", dev->input->buf_size);
         dev->input->buffer = (unsigned char*)XCALLOC(sizeof(unsigned char), dev->input->buf_size + 2 * dev->input->bytes_per_sample * fft_size);
         dev->input->bufs = dev->input->bufe = 0;
@@ -997,6 +993,8 @@ int parse_devices(libconfig::Setting& devs) {
         dev->last_frequency = -1;
         dev->pending_centerfreq_request = -1;
         dev->centerfreq_apply_failed = false;
+        dev->pending_sample_rate_request = -1;
+        dev->sample_rate_apply_failed = false;
 
         libconfig::Setting& chans = devs[i]["channels"];
         if (chans.getLength() < 1) {

@@ -453,6 +453,24 @@ void* demodulate(void* params) {
             dev->pending_centerfreq_request.store(-1, std::memory_order_release);
         }
 
+        int pending_sample_rate = dev->pending_sample_rate_request.load(std::memory_order_acquire);
+        if (pending_sample_rate >= 0) {
+            // Same "publish result before clearing the request" discipline as
+            // pending_centerfreq_request above (see both fields' comments, rtl_airband.h). Unlike
+            // centerfreq, a sample_rate change touches input->buffer/buf_size/bufs/bufe (see
+            // device_apply_sample_rate(), live_reconfig.cpp) - `available`, computed above from
+            // the pre-change buffer state, is no longer valid afterward, so this always moves on
+            // to the next device rather than falling through to the bps/available check below,
+            // regardless of whether the change succeeded, was rolled back, or failed outright. The
+            // next round-robin pass over this device recomputes `available` fresh from the top of
+            // this loop.
+            bool ok = device_apply_sample_rate(dev, pending_sample_rate);
+            dev->sample_rate_apply_failed.store(!ok, std::memory_order_release);
+            dev->pending_sample_rate_request.store(-1, std::memory_order_release);
+            device_num = next_device(demod_params, device_num);
+            continue;
+        }
+
         // number of input bytes per output wave sample (x 2 for I and Q)
         size_t bps = 2 * dev->input->bytes_per_sample * (size_t)round((double)dev->input->sample_rate / (double)WAVE_RATE);
         if (available < bps * FFT_BATCH + fft_size * dev->input->bytes_per_sample * 2) {

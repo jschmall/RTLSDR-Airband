@@ -30,6 +30,13 @@
 size_t compute_channel_bin(int channel_freq, int centerfreq, int sample_rate, size_t num_fft_bins);
 uint32_t compute_channel_dm_dphi(int channel_freq, int centerfreq, int sample_rate);
 
+// Pure math, shared with config.cpp's startup input_t::buffer sizing (parse_devices()) so both
+// paths agree by construction - same rationale as compute_channel_bin() above. A mismatch here
+// between startup and a live sample_rate change would be a real correctness bug (inconsistent
+// buf_size/bps/available arithmetic), unlike e.g. snapshot_parse_anynum2int()'s deliberate
+// duplication of a startup-only convenience parser (live_reconfig.cpp) where drift is harmless.
+size_t compute_input_buf_size(int sample_rate, int bytes_per_sample);
+
 // Called by the control socket thread. Validates dev->mode (only R_MULTICHANNEL devices are
 // retunable this way - R_SCAN devices already have their own controller-thread retune loop) and,
 // if valid, posts the request; returns false without touching any state otherwise. The actual
@@ -59,6 +66,32 @@ bool device_confirm_retune(device_t* dev, int timeout_us, bool* timed_out);
 // failure here does not mark the device dead - see input_set_centerfreq()'s comment
 // (input-common.cpp).
 bool device_apply_retune(device_t* dev, int new_centerfreq);
+
+// Live sample_rate change - same request/apply/confirm shape as retune above
+// (device_request_retune/device_confirm_retune/device_apply_retune), but device_apply_sample_rate()
+// is substantially heavier: it stops this device's RX thread, reopens the hardware at the new
+// rate, resizes the input buffer, and recomputes every channel's bins/base_bins/dm_dphi, all
+// synchronously within this device's own turn in the demod thread's round-robin (see
+// demodulate(), rtl_airband.cpp) - the same single-writer-thread invariant device_apply_retune()
+// already relies on. Also unlike retune/gain/bandwidth/correction, a failure here isn't free to
+// walk away from: the RX pipeline was already torn down for the attempt, so
+// device_apply_sample_rate() rolls back to the OLD rate (against the still-intact old buffer,
+// never freed until the new rate is confirmed working) rather than leaving the device stopped.
+// Only marks dev->input->state = INPUT_FAILED if that rollback ALSO fails - a genuine "the
+// device won't come back up at any rate" case, which demodulate()'s existing
+// INPUT_FAILED -> INPUT_DISABLED handling already knows how to fold into devices_running/the
+// "all receivers failed" exit path with no new machinery needed there.
+//
+// device_request_sample_rate() additionally rejects (returns false, posts nothing) if
+// dev->input->stop is NULL - some drivers may have nothing to pause/reopen, and structurally
+// cannot support this operation at all.
+//
+// device_confirm_sample_rate() mirrors device_confirm_retune() exactly (same polling/reporting
+// contract) - callers should budget a longer timeout_us than a plain retune, since the apply
+// side includes a full RX-thread join and hardware device reopen, not just one API call.
+bool device_request_sample_rate(device_t* dev, int new_sample_rate);
+bool device_confirm_sample_rate(device_t* dev, int timeout_us, bool* timed_out);
+bool device_apply_sample_rate(device_t* dev, int new_sample_rate);
 
 // Channel enable/disable, split into request (control socket thread) / apply (output thread)
 // halves - see channel_t::pending_enable_request's comment (rtl_airband.h) for why: a channel's

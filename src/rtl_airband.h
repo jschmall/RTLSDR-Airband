@@ -450,6 +450,21 @@ struct device_t {
     // that already reflects whether the hardware call actually succeeded, not just that the
     // demod thread picked the request up.
     std::atomic<bool> centerfreq_apply_failed;
+    // Live sample_rate change request, same request/apply split as pending_centerfreq_request
+    // above but heavier: the demod thread must stop this device's RX thread, reopen the hardware
+    // at the new rate, resize the input buffer, and recompute every channel's
+    // bins/base_bins/dm_dphi - see device_apply_sample_rate() (live_reconfig.cpp) for the full
+    // sequence, including its rollback-to-the-old-rate-on-failure behavior. -1 means no pending
+    // request.
+    std::atomic<int> pending_sample_rate_request;
+    // Set by the demod thread to the actual outcome - true if the requested rate was rejected
+    // (regardless of whether rollback to the old rate succeeded), published BEFORE
+    // pending_sample_rate_request is reset to -1, same ordering discipline as
+    // centerfreq_apply_failed above. A caller that wants to know whether the device survived a
+    // rejected request (rollback succeeded, still running at the old rate) vs. is now genuinely
+    // down (rollback also failed) should check input->state separately - only the latter case
+    // sets INPUT_FAILED.
+    std::atomic<bool> sample_rate_apply_failed;
     enum rec_modes mode;
     size_t output_overrun_count;
 };

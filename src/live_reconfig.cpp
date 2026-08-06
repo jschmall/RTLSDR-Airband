@@ -52,6 +52,19 @@ uint32_t compute_channel_dm_dphi(int channel_freq, int centerfreq, int sample_ra
     return (uint32_t)((int)dm_dphi);
 }
 
+size_t compute_input_buf_size(int sample_rate, int bytes_per_sample) {
+    // For the input buffer size use a base value and round it up to the nearest multiple of
+    // FFT_BATCH blocks of input samples. ceil is required here because sample rate is not
+    // guaranteed to be an integer multiple of WAVE_RATE. Must stay bit-for-bit identical to what
+    // config.cpp's startup sizing computes - see this function's declaration comment
+    // (live_reconfig.h) for why.
+    size_t fft_batch_len = FFT_BATCH * (2 * (size_t)bytes_per_sample * (size_t)ceil((double)sample_rate / (double)WAVE_RATE));
+    size_t buf_size = MIN_BUF_SIZE;
+    if (buf_size % fft_batch_len != 0)
+        buf_size += fft_batch_len - buf_size % fft_batch_len;
+    return buf_size;
+}
+
 bool device_request_retune(device_t* dev, int new_centerfreq) {
     if (dev->mode != R_MULTICHANNEL) {
         // R_SCAN devices retune via their own controller_thread's fixed-offset scheme; accepting
@@ -182,11 +195,32 @@ bool mixer_request_disable(mixer_t* mixer, int timeout_us) {
     return post_request_and_wait(&mixer->pending_enable_request, 0, timeout_us);
 }
 
+namespace {
+
+// Recomputes every channel's bins/base_bins/dm_dphi in place for the given (centerfreq,
+// sample_rate) pair - shared by device_apply_retune() (only centerfreq varies) and
+// device_apply_sample_rate() (only sample_rate varies) below. Runs inside the demod thread that
+// exclusively owns dev - same thread as AFC's own per-bin adjustments (see the AFC class in
+// rtl_airband.cpp), so plain assignments here are safe without any lock: there is only ever one
+// writer to bins/base_bins/dm_dphi at a time. Callers are responsible for only invoking this
+// after confirming the hardware actually reached (centerfreq, sample_rate) - recomputing bins for
+// a value the hardware never reached would leave the demod math and the actual RF/sampling state
+// disagreeing (see device_apply_retune()'s original ordering-discipline comment, preserved below).
+void recompute_channel_bins(device_t* dev, int centerfreq, int sample_rate) {
+    for (int j = 0; j < dev->channel_count; j++) {
+        channel_t* channel = dev->channels + j;
+        int channel_freq = channel->freqlist[0].frequency;
+        dev->base_bins[j] = dev->bins[j] = compute_channel_bin(channel_freq, centerfreq, sample_rate, fft_size);
+        if (channel->needs_raw_iq) {
+            channel->dm_dphi = compute_channel_dm_dphi(channel_freq, centerfreq, sample_rate);
+            channel->dm_phi = 0;
+        }
+    }
+}
+
+}  // namespace
+
 bool device_apply_retune(device_t* dev, int new_centerfreq) {
-    // Runs inside the demod thread that exclusively owns dev - same thread as AFC's own per-bin
-    // adjustments (see the AFC class in rtl_airband.cpp), so plain assignments here are safe
-    // without any lock: there is only ever one writer to bins/base_bins/dm_dphi at a time.
-    //
     // Hardware retune is attempted FIRST, before touching bins/base_bins/dm_dphi: on failure the
     // radio is still physically on the old centerfreq (input_set_centerfreq() only updates
     // input->centerfreq on success), so recomputing bins for new_centerfreq first would leave the
@@ -197,16 +231,142 @@ bool device_apply_retune(device_t* dev, int new_centerfreq) {
     if (input_set_centerfreq(dev->input, new_centerfreq) != 0) {
         return false;
     }
-    for (int j = 0; j < dev->channel_count; j++) {
-        channel_t* channel = dev->channels + j;
-        int channel_freq = channel->freqlist[0].frequency;
-        dev->base_bins[j] = dev->bins[j] = compute_channel_bin(channel_freq, new_centerfreq, dev->input->sample_rate, fft_size);
-        if (channel->needs_raw_iq) {
-            channel->dm_dphi = compute_channel_dm_dphi(channel_freq, new_centerfreq, dev->input->sample_rate);
-            channel->dm_phi = 0;
+    recompute_channel_bins(dev, new_centerfreq, dev->input->sample_rate);
+    return true;
+}
+
+bool device_request_sample_rate(device_t* dev, int new_sample_rate) {
+    if (dev->mode != R_MULTICHANNEL) {
+        // Same rationale as device_request_retune() above - R_SCAN devices retune via their own
+        // controller_thread's fixed-offset scheme, and R_SCAN live reconfiguration is out of
+        // scope entirely.
+        return false;
+    }
+    if (dev->input->stop == NULL) {
+        // Structurally can't pause/reopen this driver's device - see device_apply_sample_rate()'s
+        // comment (live_reconfig.h) for why that's required.
+        return false;
+    }
+    dev->pending_sample_rate_request.store(new_sample_rate, std::memory_order_release);
+    return true;
+}
+
+bool device_confirm_sample_rate(device_t* dev, int timeout_us, bool* timed_out) {
+    // Mirrors device_confirm_retune() exactly - see both functions' declaration comments
+    // (live_reconfig.h) for the shared "publish result before clearing the request" rationale.
+    const int poll_interval_us = 5000;
+    int waited_us = 0;
+    while (dev->pending_sample_rate_request.load(std::memory_order_acquire) != -1 && waited_us < timeout_us) {
+        usleep(poll_interval_us);
+        waited_us += poll_interval_us;
+    }
+    if (dev->pending_sample_rate_request.load(std::memory_order_acquire) != -1) {
+        *timed_out = true;
+        return false;
+    }
+    *timed_out = false;
+    return !dev->sample_rate_apply_failed.load(std::memory_order_acquire);
+}
+
+namespace {
+
+// Wraps dev->input->init() (e.g. rtlsdr_init()) so a startup-only fatal error() call becomes a
+// catchable failure instead of killing the whole process - the same mechanism try_append_channels()
+// above already established for parse_channel()'s error() calls (config_error_is_recoverable,
+// src/logging.cpp). Deliberately does NOT call the generic input_init() wrapper
+// (src/input-common.cpp): that function unconditionally re-runs pthread_mutex_init() on
+// buffer_lock (undefined behavior on an already-live mutex) and unconditionally overwrites
+// input->state, neither of which is correct for reopening an already-running device - both are
+// left to device_apply_sample_rate() below.
+bool device_reopen_recoverable(device_t* dev, string* error_text) {
+    config_error_is_recoverable = true;
+    ostringstream captured;
+    std::streambuf* old_cerr_buf = std::cerr.rdbuf(captured.rdbuf());
+    bool ok = true;
+    string exception_text;
+    try {
+        if (dev->input->init(dev->input) < 0) {
+            ok = false;
         }
+    } catch (const std::exception& e) {
+        // Catches ConfigApplyError (what recoverable-mode error() throws) - unlike
+        // try_append_channels()'s use of this same pattern, a driver's init() hook doesn't walk a
+        // libconfig::Setting tree, so a raw libconfig::ConfigException isn't expected here, but
+        // catching std::exception broadly costs nothing and matches the established precedent.
+        ok = false;
+        exception_text = e.what();
+    }
+    std::cerr.rdbuf(old_cerr_buf);
+    config_error_is_recoverable = false;
+    if (!ok) {
+        string captured_text = captured.str();
+        *error_text = captured_text.empty() ? exception_text : captured_text;
+        return false;
     }
     return true;
+}
+
+}  // namespace
+
+bool device_apply_sample_rate(device_t* dev, int new_sample_rate) {
+    input_t* input = dev->input;
+    int old_sample_rate = input->sample_rate;
+
+    // Compute and allocate the new buffer FIRST, before touching the RX thread at all - pure
+    // computation (XCALLOC either succeeds or the process is out of memory, an existing fatal
+    // condition throughout this codebase via xrealloc()'s own convention, not a new failure mode
+    // to handle here), and keeping the old buffer untouched until the new rate is confirmed
+    // working is what makes rollback cheap: on failure there's nothing to reallocate, just reopen
+    // and restart against the buffer that's already there.
+    size_t new_buf_size = compute_input_buf_size(new_sample_rate, input->bytes_per_sample);
+    unsigned char* new_buffer = (unsigned char*)XCALLOC(sizeof(unsigned char), new_buf_size + 2 * (size_t)input->bytes_per_sample * fft_size);
+
+    // Stop the RX thread directly via the driver hook (NOT input_stop() - that sets
+    // input->state = INPUT_STOPPED and is written as a one-shot, process-exit-only call, see its
+    // comment, src/input-common.cpp) and join it ourselves.
+    if (input->stop(input) != 0) {
+        // The driver couldn't cleanly stop - e.g. a failed cancel of the in-flight async read. The
+        // device is presumably still fine at the old rate (nothing was actually torn down), so
+        // this is a rejected request, not a device failure. Deliberately does NOT pthread_join()
+        // here: if the driver's stop() failed to actually cancel the blocking read, joining could
+        // hang forever waiting for a thread that will never exit on its own.
+        free(new_buffer);
+        log(LOG_ERR, "Device: failed to stop RX thread for sample_rate change, request rejected\n");
+        return false;
+    }
+    pthread_join(input->rx_thread, NULL);
+
+    input->sample_rate = new_sample_rate;
+    string error_text;
+    bool reopened = device_reopen_recoverable(dev, &error_text);
+
+    if (reopened) {
+        free(input->buffer);
+        input->buffer = new_buffer;
+        input->buf_size = new_buf_size;
+        input->bufs = input->bufe = 0;
+        pthread_create(&input->rx_thread, NULL, input->run_rx_thread, input);
+        recompute_channel_bins(dev, input->centerfreq, new_sample_rate);
+        return true;
+    }
+
+    log(LOG_ERR, "Failed to apply sample_rate %d: %s - rolling back to %d\n", new_sample_rate, error_text.c_str(), old_sample_rate);
+    input->sample_rate = old_sample_rate;
+    string rollback_error_text;
+    bool rolled_back = device_reopen_recoverable(dev, &rollback_error_text);
+
+    free(new_buffer);  // never adopted, whether rollback succeeded or not - old buffer is untouched
+
+    if (rolled_back) {
+        pthread_create(&input->rx_thread, NULL, input->run_rx_thread, input);
+        // bins/dm_dphi are already correct for old_sample_rate - nothing about this device's
+        // tuning actually changed, so no recompute is needed.
+        return false;
+    }
+
+    log(LOG_ERR, "Rollback to previous sample_rate %d also failed: %s - device is down\n", old_sample_rate, rollback_error_text.c_str());
+    input->state = INPUT_FAILED;
+    return false;
 }
 
 namespace {
@@ -438,9 +598,9 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
                 result.skipped_requires_restart.push_back(label + ": mode changed");
                 continue;
             }
-            if (snap.sample_rate != 0 && snap.sample_rate != dev->input->sample_rate) {
-                result.skipped_requires_restart.push_back(label + ": sample_rate changed");
-            }
+            // sample_rate is live-appliable now (device_apply_sample_rate() below) - see that
+            // block, placed after the centerfreq diff further down, for the actual diff/apply
+            // logic. No longer an automatic skipped_requires_restart entry.
 
             // Longest common prefix, by raw config signature (build_channel_identity_signature(),
             // config.cpp), between what's live and what the file now says - see DeviceConfig
@@ -529,6 +689,31 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
                     }
                 } else {
                     result.skipped_requires_restart.push_back(label + ": centerfreq changed but retune request was rejected");
+                }
+            }
+
+            if (dev->mode == R_MULTICHANNEL && snap.sample_rate != 0 && snap.sample_rate != dev->input->sample_rate) {
+                // Unlike gain/bandwidth/correction below, sample_rate DOES have a live-readable
+                // current value (dev->input->sample_rate), so this is a real diff, not an
+                // unconditional reapply - deliberately so, since this operation is expensive (RX
+                // thread stop/reopen/restart), not a cheap idempotent call.
+                if (device_request_sample_rate(dev, snap.sample_rate)) {
+                    // Budget a longer timeout than a plain retune - the apply side includes a full
+                    // RX-thread join and hardware device reopen, not just one API call. See
+                    // device_confirm_sample_rate()'s declaration comment (live_reconfig.h).
+                    bool timed_out = false;
+                    bool ok = device_confirm_sample_rate(dev, /*timeout_us=*/3000000, &timed_out);
+                    if (ok) {
+                        result.applied.push_back(label + ": sample_rate -> " + to_string(snap.sample_rate));
+                    } else if (timed_out) {
+                        result.applied.push_back(label + ": sample_rate -> " + to_string(snap.sample_rate) + " (request posted, not yet confirmed applied)");
+                    } else {
+                        result.skipped_requires_restart.push_back(label +
+                                                                  ": sample_rate change failed and was rolled back to the previous rate (or the device is now down - check logs and device health) - "
+                                                                  "no restart needed if rolled back, retry reload_diff");
+                    }
+                } else {
+                    result.skipped_requires_restart.push_back(label + ": sample_rate changed but the request was rejected (not R_MULTICHANNEL, or driver does not support live rate changes)");
                 }
             }
 

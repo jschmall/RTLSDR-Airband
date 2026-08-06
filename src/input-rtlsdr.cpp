@@ -85,23 +85,19 @@ static int rtlsdr_find_device_by_serial(char const* const s) {
     return -1;
 }
 
-int rtlsdr_init(input_t* const input) {
-    rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
-    if (dev_data->serial != NULL) {
-        dev_data->index = rtlsdr_find_device_by_serial(dev_data->serial);
-        if (dev_data->index < 0) {
-            cerr << "RTLSDR device with serial number " << dev_data->serial << " not found\n";
-            error();
-        }
-    }
+namespace {
 
-    dev_data->dev = NULL;
-    rtlsdr_open(&dev_data->dev, dev_data->index);
-    if (NULL == dev_data->dev) {
-        log(LOG_ERR, "Failed to open rtlsdr device #%d.\n", dev_data->index);
-        error();
-    }
-
+// The device-configuration half of rtlsdr_init() (everything after a successful rtlsdr_open()) -
+// factored out so rtlsdr_init() can guarantee dev_data->dev is closed on ANY failure exit from
+// this part, not just left open. That guarantee matters once error() can be non-fatal
+// (config_error_is_recoverable, live_reconfig.cpp's device_reopen_recoverable()): a live
+// sample_rate change's rollback attempt (device_apply_sample_rate()) calls rtlsdr_init() a SECOND
+// time after a first attempt failed, and a still-open handle from that failed first attempt makes
+// the rollback's own rtlsdr_open() fail too ("usb_claim_interface error", the interface is still
+// claimed) - a real failure mode found via real-hardware testing of the rollback path, not a
+// theoretical concern. At real startup, a failure here is always fatal anyway (error() exits the
+// whole process), so this cleanup is a no-op difference there.
+int rtlsdr_configure_opened_device(input_t* const input, rtlsdr_dev_data_t* const dev_data) {
     rtlsdr_dev_t* rtl = dev_data->dev;
     int r = rtlsdr_set_sample_rate(rtl, input->sample_rate);
     if (r < 0) {
@@ -165,6 +161,40 @@ int rtlsdr_init(input_t* const input) {
     rtlsdr_reset_buffer(rtl);
     log(LOG_INFO, "RTLSDR device %d initialized\n", dev_data->index);
     return 0;
+}
+
+}  // namespace
+
+int rtlsdr_init(input_t* const input) {
+    rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
+    if (dev_data->serial != NULL) {
+        dev_data->index = rtlsdr_find_device_by_serial(dev_data->serial);
+        if (dev_data->index < 0) {
+            cerr << "RTLSDR device with serial number " << dev_data->serial << " not found\n";
+            error();
+        }
+    }
+
+    dev_data->dev = NULL;
+    rtlsdr_open(&dev_data->dev, dev_data->index);
+    if (NULL == dev_data->dev) {
+        log(LOG_ERR, "Failed to open rtlsdr device #%d.\n", dev_data->index);
+        error();
+    }
+
+    int result = -1;
+    try {
+        result = rtlsdr_configure_opened_device(input, dev_data);
+    } catch (...) {
+        rtlsdr_close(dev_data->dev);
+        dev_data->dev = NULL;
+        throw;
+    }
+    if (result < 0) {
+        rtlsdr_close(dev_data->dev);
+        dev_data->dev = NULL;
+    }
+    return result;
 }
 
 void* rtlsdr_rx_thread(void* ctx) {

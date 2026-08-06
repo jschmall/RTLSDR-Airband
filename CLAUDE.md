@@ -849,6 +849,134 @@ Keep the local delta small and well understood.
       live `buffers`/`serial`/`index` changes, R_SCAN live reconfiguration, device/mixer count
       changes, driver `type`/`mode` changes, and all top-level (non-device) settings — none of
       these are planned.
+35. **Live device `sample_rate` change** (`src/live_reconfig.{cpp,h}`, `src/rtl_airband.{cpp,h}`,
+    `src/config.cpp`, `src/control_socket.cpp`, `src/input-rtlsdr.cpp`) — the last, most expensive
+    item on the same user-prioritized to-do list (items 33/34), previously always
+    `skipped_requires_restart`. Unlike every other item 26-34 live-set operation, changing
+    `sample_rate` genuinely requires stopping and restarting the device's RX thread, resizing
+    `input_t::buffer`/`buf_size`, and recomputing every channel's bins/`dm_dphi` for the new rate
+    — a different class of change from anything mutated in place before this.
+    - Scoping investigation found the FFTW plan/`fft_size` is a single process-wide global with
+      zero dependency on any device's `sample_rate` (de-risks cross-device concerns entirely —
+      changing one device's rate cannot touch another device's FFT processing), and that
+      recomputing bins/`dm_dphi` for a new rate is mechanically identical to what live centerfreq
+      retune already does (both already take `sample_rate` as an explicit parameter). The
+      genuinely new work is narrower: safely quiescing/restarting one device's RX thread while
+      sibling devices (and, in the default single-demod-thread topology, this one) keep running,
+      and swapping the buffer out from under a demod thread that has no synchronization on the
+      buffer *pointer/size* today (only on `bufs`/`bufe`).
+    - `compute_input_buf_size()` (`live_reconfig.{cpp,h}`) extracts the sample-rate-dependent
+      buffer-size formula out of `parse_devices()` (`config.cpp`) into a pure function shared by
+      both the startup path and the new live path — same "must stay in sync by construction"
+      rationale as `compute_channel_bin()`/`compute_channel_dm_dphi()`, and a real correctness
+      requirement here (a mismatch would produce inconsistent `buf_size`/`bps`/`available`
+      arithmetic), unlike e.g. `snapshot_parse_anynum2int()`'s deliberate duplication elsewhere in
+      the same file.
+    - `device_apply_sample_rate()` (`live_reconfig.cpp`) is the new heavy apply function, run
+      synchronously within this device's own turn in the demod thread's round-robin
+      (`demodulate()`, `rtl_airband.cpp`) — same single-writer-thread invariant
+      `device_apply_retune()` already relies on for bins/`base_bins`/`dm_dphi`, extended here to
+      also cover the RX thread and buffer:
+      1. Computes and allocates the new buffer *first*, before touching the RX thread at all —
+         the old buffer stays untouched until the new rate is confirmed working, which is what
+         makes rollback cheap (nothing to reallocate on failure, just reopen and restart against
+         what's already there).
+      2. Stops the RX thread via the driver's `stop` hook directly (not `input_stop()` — that
+         sets `input->state = INPUT_STOPPED` and is a one-shot, process-exit-only call, its only
+         pre-existing caller being final shutdown) and joins it. If `stop()` itself fails, aborts
+         immediately without joining (a join could hang forever if the driver failed to actually
+         cancel the blocking read) — the device is presumably still fine at the old rate, so this
+         is a rejected request, not a device failure.
+      3. Reopens via `device_reopen_recoverable()` (new, anonymous-namespace helper) — wraps the
+         driver's `init()` hook (e.g. `rtlsdr_init()`) with the same `config_error_is_recoverable`
+         thread-local-gate mechanism item 27 already established for `parse_channel()`'s `error()`
+         calls, so a startup-only fatal call inside `init()` becomes a catchable failure instead of
+         killing the whole process. Deliberately does not call the generic `input_init()` wrapper
+         (`input-common.cpp`): that function unconditionally re-runs `pthread_mutex_init()` on
+         `buffer_lock` (undefined behavior on an already-live mutex) and unconditionally overwrites
+         `input->state`, neither correct for reopening an already-running device.
+      4. On success: frees the old buffer, adopts the new one, resets `bufs`/`bufe` to 0, restarts
+         the RX thread, recomputes bins/`dm_dphi` for the new rate (reusing `device_apply_retune()`
+         's per-channel loop, extracted into a shared private `recompute_channel_bins()` helper).
+      5. On failure: per explicit user direction when this was scoped, attempts rollback to the
+         *old* rate (reopen again, against the still-intact old buffer) rather than immediately
+         giving up — restores full service in the common case (e.g. a transient i2c hiccup on the
+         new rate) instead of leaving the device down for something recoverable.
+      6. Only if that rollback *also* fails does this mark `input->state = INPUT_FAILED` — a
+         genuine "won't come back up at any rate" case, which `demodulate()`'s existing
+         `INPUT_FAILED` → `INPUT_DISABLED` handling already folds into `devices_running`/the "all
+         receivers failed" exit path with no new machinery needed there.
+    - `rtlsdr_init()` (`input-rtlsdr.cpp`) was refactored to guarantee this rollback path actually
+      works: found via real-hardware testing (not caught by any fake-driver unit test, since the
+      fakes don't hold real USB resources) that a failure partway through the original
+      straight-line function left `dev_data->dev` open, so the rollback's own second
+      `rtlsdr_open()` call collided with the still-claimed USB interface
+      (`usb_claim_interface error -6`) and failed for an unrelated reason. Fixed by extracting
+      everything after a successful `rtlsdr_open()` into `rtlsdr_configure_opened_device()` and
+      wrapping its call in `rtlsdr_init()` with a try/catch plus a return-code check that always
+      closes `dev_data->dev` (and resets it to NULL) on any failure exit, whether via a plain
+      `return -1` or a thrown `ConfigApplyError` — a no-op difference at real startup (a failure
+      there is always fatal anyway) but essential for a live reopen attempt to retry cleanly.
+    - New `device_t::pending_sample_rate_request`/`sample_rate_apply_failed`
+      (`rtl_airband.h`) — same request/apply/confirm shape as the centerfreq fields
+      (`device_request_sample_rate()`/`device_confirm_sample_rate()`, mirroring
+      `device_request_retune()`/`device_confirm_retune()` exactly), plus a new standalone
+      `set_sample_rate` control-socket command (`handle_set_sample_rate`, matching
+      `retune`/`set_gain`/`set_bandwidth`/`set_correction`'s shape) and `reload_diff` wiring.
+      Unlike gain/bandwidth/correction, `sample_rate` *does* have a live-readable current value
+      (`dev->input->sample_rate`), so `reload_diff` does a real diff rather than gain's
+      "reapply unconditionally" pattern — re-triggering a full RX-thread stop/reopen/restart cycle
+      on every `reload_diff` call regardless of whether the value actually changed would be a real
+      cost, not a harmless idempotent no-op. Budgets a longer confirmation timeout (3s vs. plain
+      retune's 500ms) given the apply side includes a full RX-thread join and hardware reopen, not
+      just one API call.
+    - Also required an explicit `pending_sample_rate_request = -1`/`sample_rate_apply_failed =
+      false` initialization in `parse_devices()` (`config.cpp`), mirroring the pre-existing
+      centerfreq initialization there — missing this was a second real bug caught only by
+      real-hardware testing: a freshly `XCALLOC`'d (zero-initialized) `device_t` defaults
+      `pending_sample_rate_request` to `0`, which every unit test happened to override explicitly
+      but production startup did not, so the demod thread's `if (pending_sample_rate >= 0)` check
+      (`rtl_airband.cpp`) treated a fresh device as having an immediate pending request for
+      `sample_rate = 0` — dividing by zero in `compute_input_buf_size()` on the very first pass,
+      a guaranteed SIGFPE crash at startup that no unit test exercised because every hand-built
+      test fixture set the field explicitly.
+    - Unit tested extensively: `ComputeInputBufSizeTest` (pure function), `device_confirm_sample_
+      rate_reports_success`/`_failure`/`_timeout_when_never_consumed`, `device_request_sample_
+      rate_rejects_r_scan`/`_rejects_driver_without_stop_hook`/`_accepts_r_multichannel_with_stop_
+      hook`, and a dedicated `SampleRateApplyTest` fixture (`src/test_live_reconfig.cpp`) with real
+      fake `init`/`stop`/`run_rx_thread` driver hooks and a genuinely spawned, joined
+      `pthread_t` RX thread (not mocked away, since `device_apply_sample_rate()` calls
+      `pthread_join()` directly and needs a real thread to join) covering the success path,
+      rollback-on-failure, rollback-also-fails (`INPUT_FAILED`), and stop-fails-without-touching-
+      state paths, plus `DiffApplyTest.sample_rate_diff_posts_request_and_reports_success`/
+      `_reports_rollback_message_on_failure`/`sample_rate_unchanged_does_not_post_a_request`.
+      Building this surfaced a third, pre-existing latent bug (documented in item 29 but not
+      previously confirmed to actually manifest): a stack-constructed `freq_t` embeds a `Squelch`,
+      whose constructor unconditionally calls `debug_print()` — safe in production, but `debugf`
+      is never `fopen()`'d in the unit test binary, so this is undefined behavior under a `-DDEBUG`
+      build. Under plain `Debug` it silently corrupted heap state that only crashed a later,
+      unrelated test (`"malloc(): unaligned tcache chunk detected"`); under ASan it was caught
+      immediately at the actual fault site. Fixed in the new `SampleRateApplyTest` fixture the same
+      way `ChannelRemoveTest` already does (`calloc`, not a real C++ construction) — the other
+      pre-existing tests using the unsafe pattern were left alone as out of scope for this change.
+      All 207 tests (14 net new) pass across Debug, Debug+NFM, and under ASan/UBSan.
+    - Verified end-to-end against real RTL-SDR hardware, including the two bugs above (both found
+      *by* this hardware testing, not by unit tests): a live `set_sample_rate` command and a
+      config-edit-plus-`reload_diff` both successfully changed the live rate (confirmed via
+      "Found Rafael Micro R820T tuner" / "RTLSDR device 0 initialized" reappearing in the log,
+      i.e. a genuine reopen occurred) with the device fully functional afterward (a follow-up
+      `retune` succeeded); a fault-injected reopen failure (temporary, reverted, gated on
+      `config_error_is_recoverable` so it can never fire at real startup) correctly triggered
+      rollback to the previous rate with the device left fully functional; no crash or sanitizer
+      report in either case once both bugs were fixed.
+    - Known limitation, not addressed here: in the non-default `multiple_demod_threads=false`
+      (single shared demod thread) topology with more than one device, this device's turn in the
+      round-robin blocks synchronously for the whole stop/reopen/restart sequence (potentially
+      hundreds of milliseconds for a real USB reopen), pausing every other device that thread
+      services for that duration. An accepted tradeoff for this fork's actual one-device-per-
+      instance deployment (see "Deployment Context"), where this concern doesn't arise at all, but
+      worth reconsidering before this feature is used in a genuinely multi-device-per-thread
+      deployment.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

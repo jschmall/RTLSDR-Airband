@@ -302,6 +302,291 @@ TEST_F(LiveReconfigTest, device_confirm_retune_reports_timeout_when_never_consum
     EXPECT_EQ(dev.pending_centerfreq_request.load(), 121000000);  // untouched
 }
 
+TEST(ComputeInputBufSizeTest, matches_the_startup_sizing_formula_config_cpp_used_to_compute_inline) {
+    // Fixed known-good values, independent of WAVE_RATE (which differs between NFM and non-NFM
+    // builds) - MIN_BUF_SIZE is always a multiple of any realistic fft_batch_len, so buf_size
+    // should always come back as exactly MIN_BUF_SIZE for these inputs regardless of build.
+    EXPECT_EQ(compute_input_buf_size(2000000, 1), (size_t)MIN_BUF_SIZE);
+    EXPECT_GT(compute_input_buf_size(3000000, 1), 0u);
+}
+
+TEST(ComputeInputBufSizeTest, larger_sample_rate_produces_larger_or_equal_buf_size) {
+    size_t small = compute_input_buf_size(1000000, 1);
+    size_t large = compute_input_buf_size(3000000, 1);
+    EXPECT_GE(large, small);
+}
+
+TEST_F(LiveReconfigTest, device_confirm_sample_rate_reports_success) {
+    device_t dev = {};
+    dev.pending_sample_rate_request = -1;  // already consumed
+    dev.sample_rate_apply_failed = false;
+
+    bool timed_out = true;
+    bool ok = device_confirm_sample_rate(&dev, /*timeout_us=*/50000, &timed_out);
+
+    EXPECT_TRUE(ok);
+    EXPECT_FALSE(timed_out);
+}
+
+TEST_F(LiveReconfigTest, device_confirm_sample_rate_reports_failure) {
+    device_t dev = {};
+    dev.pending_sample_rate_request = -1;
+    dev.sample_rate_apply_failed = true;
+
+    bool timed_out = false;
+    bool ok = device_confirm_sample_rate(&dev, /*timeout_us=*/50000, &timed_out);
+
+    EXPECT_FALSE(ok);
+    EXPECT_FALSE(timed_out);
+}
+
+TEST_F(LiveReconfigTest, device_confirm_sample_rate_reports_timeout_when_never_consumed) {
+    device_t dev = {};
+    dev.pending_sample_rate_request = 3000000;  // never consumed by anything in this test
+
+    bool timed_out = false;
+    bool ok = device_confirm_sample_rate(&dev, /*timeout_us=*/20000, &timed_out);
+
+    EXPECT_FALSE(ok);
+    EXPECT_TRUE(timed_out);
+    EXPECT_EQ(dev.pending_sample_rate_request.load(), 3000000);
+}
+
+int fake_stop_ok_for_sample_rate_test(input_t* const) {
+    return 0;
+}
+
+TEST_F(LiveReconfigTest, device_request_sample_rate_rejects_r_scan) {
+    input_t input = {};
+    input.stop = &fake_stop_ok_for_sample_rate_test;
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_SCAN;
+    dev.pending_sample_rate_request = -1;
+
+    bool ok = device_request_sample_rate(&dev, 3000000);
+
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(dev.pending_sample_rate_request.load(), -1);
+}
+
+TEST_F(LiveReconfigTest, device_request_sample_rate_rejects_driver_without_stop_hook) {
+    input_t input = {};
+    input.stop = nullptr;
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.pending_sample_rate_request = -1;
+
+    bool ok = device_request_sample_rate(&dev, 3000000);
+
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(dev.pending_sample_rate_request.load(), -1);
+}
+
+TEST_F(LiveReconfigTest, device_request_sample_rate_accepts_r_multichannel_with_stop_hook) {
+    input_t input = {};
+    input.stop = &fake_stop_ok_for_sample_rate_test;
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.pending_sample_rate_request = -1;
+
+    bool ok = device_request_sample_rate(&dev, 3000000);
+
+    EXPECT_TRUE(ok);
+    EXPECT_EQ(dev.pending_sample_rate_request.load(), 3000000);
+}
+
+namespace {
+
+// Fake driver hooks for device_apply_sample_rate() - a real, joinable RX thread is needed
+// (device_apply_sample_rate() calls pthread_join() on it directly, matching the real driver's
+// contract), so fake_run_rx_thread() blocks until fake_stop() signals it, mirroring
+// rtlsdr_rx_thread()'s real blocking-until-canceled behavior closely enough for this to exercise
+// the actual stop/join/reopen/restart sequence rather than mocking it away.
+struct FakeReconfigurableDevData {
+    std::atomic<bool> stop_requested{false};
+    std::atomic<bool> thread_running{false};
+    std::atomic<int> init_call_count{0};
+    // 0 = init always succeeds; N>0 = the Nth call (1-indexed) fails, every other call succeeds -
+    // lets one test express "new rate fails, rollback succeeds" (fail_on_call=1) distinctly from
+    // "every attempt fails" (fail_on_call=1 combined with never calling again, or see
+    // fail_forever below).
+    int fail_on_call = 0;
+    bool fail_forever = false;
+};
+
+int fake_reconfig_init(input_t* const input) {
+    FakeReconfigurableDevData* d = (FakeReconfigurableDevData*)input->dev_data;
+    int call = d->init_call_count.fetch_add(1) + 1;
+    if (d->fail_forever || call == d->fail_on_call) {
+        return -1;
+    }
+    return 0;
+}
+
+int fake_reconfig_stop(input_t* const input) {
+    FakeReconfigurableDevData* d = (FakeReconfigurableDevData*)input->dev_data;
+    d->stop_requested.store(true, std::memory_order_release);
+    return 0;
+}
+
+int fake_reconfig_stop_fails(input_t* const) {
+    return -1;
+}
+
+void* fake_reconfig_run_rx_thread(void* arg) {
+    input_t* input = (input_t*)arg;
+    FakeReconfigurableDevData* d = (FakeReconfigurableDevData*)input->dev_data;
+    d->thread_running.store(true, std::memory_order_release);
+    while (!d->stop_requested.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    d->thread_running.store(false, std::memory_order_release);
+    return nullptr;
+}
+
+// Spawns fake_reconfig_run_rx_thread and waits for it to actually start, matching what
+// input_start() does at real startup - device_apply_sample_rate() assumes a live, already-running
+// RX thread exists to stop and join.
+void start_fake_reconfig_rx_thread(input_t* input, FakeReconfigurableDevData* dev_data) {
+    dev_data->stop_requested.store(false, std::memory_order_release);
+    pthread_create(&input->rx_thread, NULL, input->run_rx_thread, input);
+    while (!dev_data->thread_running.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+}
+
+}  // namespace
+
+class SampleRateApplyTest : public TestBaseClass {
+   protected:
+    FakeReconfigurableDevData dev_data;
+    input_t input = {};
+    channel_t channel = {};
+    // freq_t embeds a Squelch, which - unlike this fixture's other plain-struct members - has a
+    // real constructor that unconditionally calls debug_print() (Squelch::Squelch() ->
+    // set_squelch_snr_threshold(), squelch.cpp). See ChannelRemoveTest's identical comment above
+    // for the full explanation of why a stack-constructed `freq_t freq = {};` segfaults/corrupts
+    // memory in this Debug-build unittest binary (debugf is never fopen()'d here) - calloc, not a
+    // real C++ construction, sidesteps it the same way mk_freqlist() (config.cpp) already does.
+    freq_t* freq = nullptr;
+    device_t dev = {};
+    unsigned char* old_buffer = nullptr;
+    const size_t kOldBufSize = 4096;
+
+    void SetUp() override {
+        TestBaseClass::SetUp();
+        input.driver_type = "rtlsdr";
+        input.sample_rate = 2000000;
+        input.centerfreq = 120000000;
+        input.bytes_per_sample = 1;
+        input.state = INPUT_RUNNING;
+        input.init = &fake_reconfig_init;
+        input.stop = &fake_reconfig_stop;
+        input.run_rx_thread = &fake_reconfig_run_rx_thread;
+        input.dev_data = &dev_data;
+        old_buffer = (unsigned char*)XCALLOC(1, kOldBufSize);
+        input.buffer = old_buffer;
+        input.buf_size = kOldBufSize;
+        input.bufs = 7;
+        input.bufe = 42;
+
+        freq = (freq_t*)calloc(1, sizeof(freq_t));
+        freq->frequency = 120050000;
+        channel.freqlist = freq;
+
+        dev.input = &input;
+        dev.mode = R_MULTICHANNEL;
+        dev.channel_count = 1;
+        dev.channels = &channel;
+        static size_t bins[1];
+        static size_t base_bins[1];
+        bins[0] = base_bins[0] = 0;
+        dev.bins = bins;
+        dev.base_bins = base_bins;
+
+        start_fake_reconfig_rx_thread(&input, &dev_data);
+    }
+
+    void TearDown() override {
+        free(freq);
+        TestBaseClass::TearDown();
+    }
+
+    // Only call when a real RX thread is still expected to be running (the success and
+    // rollback-succeeded paths restart one; the "stop failed" path never actually stopped the
+    // original one) - the "rollback also failed" path leaves nothing running to join.
+    void stopAndJoinFinalRxThread() {
+        dev_data.stop_requested.store(true, std::memory_order_release);
+        pthread_join(input.rx_thread, NULL);
+    }
+};
+
+TEST_F(SampleRateApplyTest, succeeds_reopens_swaps_buffer_and_recomputes_bins) {
+    bool ok = device_apply_sample_rate(&dev, 3000000);
+
+    EXPECT_TRUE(ok);
+    EXPECT_EQ(input.sample_rate, 3000000);
+    EXPECT_EQ(input.state, INPUT_RUNNING);
+    EXPECT_EQ(input.bufs, 0u);
+    EXPECT_EQ(input.bufe, 0u);
+    EXPECT_EQ(input.buf_size, compute_input_buf_size(3000000, 1));
+    EXPECT_NE(input.buffer, old_buffer);  // swapped to the newly allocated buffer
+    // Bins recomputed for the new sample_rate, matching what parse-time startup would compute.
+    EXPECT_EQ(dev.bins[0], compute_channel_bin(120050000, 120000000, 3000000, fft_size));
+
+    stopAndJoinFinalRxThread();
+    free(input.buffer);
+}
+
+TEST_F(SampleRateApplyTest, rolls_back_to_old_rate_when_new_rate_reopen_fails) {
+    dev_data.fail_on_call = 1;  // first init() call (new rate) fails; second (rollback) succeeds
+
+    bool ok = device_apply_sample_rate(&dev, 3000000);
+
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(input.sample_rate, 2000000);  // rolled back
+    EXPECT_EQ(input.state, INPUT_RUNNING);  // device survived - not marked failed
+    EXPECT_EQ(input.buffer, old_buffer);    // old buffer never touched/freed
+    EXPECT_EQ(input.buf_size, kOldBufSize);
+    // Bins untouched - old_sample_rate's tuning never actually changed, so no recompute needed.
+    EXPECT_EQ(dev.bins[0], 0u);
+
+    stopAndJoinFinalRxThread();
+    free(input.buffer);
+}
+
+TEST_F(SampleRateApplyTest, marks_input_failed_when_rollback_also_fails) {
+    dev_data.fail_forever = true;
+
+    bool ok = device_apply_sample_rate(&dev, 3000000);
+
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(input.state, INPUT_FAILED);
+    // No RX thread is running to restart - both reopen attempts failed - nothing to join here.
+    free(input.buffer);  // old buffer was never freed by device_apply_sample_rate() in this path
+}
+
+TEST_F(SampleRateApplyTest, rejects_without_touching_state_when_stop_fails) {
+    input.stop = &fake_reconfig_stop_fails;
+
+    bool ok = device_apply_sample_rate(&dev, 3000000);
+
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(input.sample_rate, 2000000);  // unchanged
+    EXPECT_EQ(input.state, INPUT_RUNNING);
+    EXPECT_EQ(dev_data.init_call_count.load(), 0);  // never even attempted - stop() failed first
+    EXPECT_EQ(input.buffer, old_buffer);
+
+    // The original RX thread was never actually stopped (stop() failed before touching it) - stop
+    // and join it directly for cleanup, bypassing the fake stop() hook this test replaced.
+    dev_data.stop_requested.store(true, std::memory_order_release);
+    pthread_join(input.rx_thread, NULL);
+    free(input.buffer);
+}
+
 TEST_F(LiveReconfigTest, channel_apply_disable_sets_enabled_false) {
     // channel_apply_disable()/channel_apply_enable() are the apply-side halves, exercised
     // directly here as pure functions (see channel_t::pending_enable_request's comment,
@@ -847,18 +1132,34 @@ TEST_F(DiffApplyTest, mode_change_is_requires_restart) {
     EXPECT_NE(result.skipped_requires_restart[0].find("mode changed"), std::string::npos);
 }
 
-TEST_F(DiffApplyTest, sample_rate_change_is_requires_restart) {
+// sample_rate is live-appliable now (device_apply_sample_rate(), see the SampleRateApplyTest
+// fixture above for direct coverage of that function) - these exercise the same fake
+// init/stop/run_rx_thread hooks and a real background thread standing in for the demod thread's
+// consumption loop, matching the centerfreq_diff_* tests' pattern above.
+TEST_F(DiffApplyTest, sample_rate_diff_posts_request_and_reports_success) {
+    FakeReconfigurableDevData fake_dev_data;
     input_t input = {};
     input.driver_type = "rtlsdr";
     input.sample_rate = 2000000;
     input.centerfreq = 120000000;
+    input.bytes_per_sample = 1;
+    input.state = INPUT_RUNNING;
+    input.init = &fake_reconfig_init;
+    input.stop = &fake_reconfig_stop;
+    input.run_rx_thread = &fake_reconfig_run_rx_thread;
+    input.dev_data = &fake_dev_data;
+    input.buffer = (unsigned char*)XCALLOC(1, 4096);
+    input.buf_size = 4096;
 
     device_t dev = {};
     dev.input = &input;
     dev.mode = R_MULTICHANNEL;
     dev.channel_count = 0;
+    dev.pending_sample_rate_request = -1;
     devices = &dev;
     device_count = 1;
+
+    start_fake_reconfig_rx_thread(&input, &fake_dev_data);
 
     ConfigSnapshot snapshot;
     DeviceConfigSnapshot dsnap;
@@ -870,10 +1171,128 @@ TEST_F(DiffApplyTest, sample_rate_change_is_requires_restart) {
     dsnap.has_gain = false;
     snapshot.devices.push_back(dsnap);
 
+    std::atomic<bool> stop_consumer{false};
+    std::thread consumer([&]() {
+        while (!stop_consumer.load()) {
+            int pending = dev.pending_sample_rate_request.load(std::memory_order_acquire);
+            if (pending != -1) {
+                bool ok = device_apply_sample_rate(&dev, pending);
+                dev.sample_rate_apply_failed.store(!ok, std::memory_order_release);
+                dev.pending_sample_rate_request.store(-1, std::memory_order_release);
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+    stop_consumer.store(true);
+    consumer.join();
+
+    EXPECT_EQ(input.sample_rate, 2400000);
+    ASSERT_EQ(result.applied.size(), 1u);
+    EXPECT_NE(result.applied[0].find("sample_rate -> 2400000"), std::string::npos);
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+
+    fake_dev_data.stop_requested.store(true, std::memory_order_release);
+    pthread_join(input.rx_thread, NULL);
+    free(input.buffer);
+}
+
+TEST_F(DiffApplyTest, sample_rate_diff_reports_rollback_message_on_failure) {
+    FakeReconfigurableDevData fake_dev_data;
+    fake_dev_data.fail_forever = true;  // both the new-rate attempt and the rollback fail
+
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.bytes_per_sample = 1;
+    input.state = INPUT_RUNNING;
+    input.init = &fake_reconfig_init;
+    input.stop = &fake_reconfig_stop;
+    input.run_rx_thread = &fake_reconfig_run_rx_thread;
+    input.dev_data = &fake_dev_data;
+    input.buffer = (unsigned char*)XCALLOC(1, 4096);
+    input.buf_size = 4096;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 0;
+    dev.pending_sample_rate_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    start_fake_reconfig_rx_thread(&input, &fake_dev_data);
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 0;
+    dsnap.centerfreq = 120000000;
+    dsnap.sample_rate = 2400000;  // changed
+    dsnap.has_gain = false;
+    snapshot.devices.push_back(dsnap);
+
+    std::atomic<bool> stop_consumer{false};
+    std::thread consumer([&]() {
+        while (!stop_consumer.load()) {
+            int pending = dev.pending_sample_rate_request.load(std::memory_order_acquire);
+            if (pending != -1) {
+                bool ok = device_apply_sample_rate(&dev, pending);
+                dev.sample_rate_apply_failed.store(!ok, std::memory_order_release);
+                dev.pending_sample_rate_request.store(-1, std::memory_order_release);
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+    stop_consumer.store(true);
+    consumer.join();
+
+    EXPECT_EQ(input.state, INPUT_FAILED);  // both attempts failed - genuinely down
+    EXPECT_TRUE(result.applied.empty());
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("sample_rate"), std::string::npos);
+    EXPECT_NE(result.skipped_requires_restart[0].find("no restart needed if rolled back"), std::string::npos);
+
+    free(input.buffer);  // rx_thread never restarted - nothing to join
+}
+
+TEST_F(DiffApplyTest, sample_rate_unchanged_does_not_post_a_request) {
+    // Unlike gain/bandwidth/correction (no live-readable current value, always reapplied), this
+    // is a real diff - re-requesting the CURRENT sample_rate on every reload_diff would be a real
+    // cost (a full RX-thread stop/reopen/restart cycle) for zero benefit.
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 0;
+    dev.pending_sample_rate_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 0;
+    dsnap.centerfreq = 120000000;
+    dsnap.sample_rate = 2000000;  // unchanged
+    dsnap.has_gain = false;
+    snapshot.devices.push_back(dsnap);
+
     DiffResult result = compute_and_apply_diff(snapshot);
 
-    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
-    EXPECT_NE(result.skipped_requires_restart[0].find("sample_rate changed"), std::string::npos);
+    EXPECT_EQ(dev.pending_sample_rate_request.load(), -1);
+    EXPECT_TRUE(result.applied.empty());
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
 }
 
 TEST_F(DiffApplyTest, gain_not_supported_by_driver_is_silently_skipped_not_reported) {
