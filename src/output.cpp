@@ -52,6 +52,7 @@
 #include "config.h"
 #include "helper_functions.h"
 #include "input-common.h"
+#include "live_reconfig.h"
 #include "rtl_airband.h"
 
 void shout_setup(icecast_data* icecast, mix_modes mixmode) {
@@ -486,10 +487,10 @@ static bool output_file_ready(channel_t* channel, output_t* output) {
         make_dir(output_dir);
     }
 
-    // a mixer's own channel_t (mixer_t::channel) has no freqlist - parse_mixers() never sets
-    // one, since a mixed stream has no single source frequency - so default to 0 rather than
-    // dereferencing NULL.
-    const int channel_frequency = channel->freqlist != NULL ? channel->freqlist[channel->freq_idx].frequency : 0;
+    // A mixer's own channel_t has no freqlist (parse_mixers() never sets one - a mixed stream
+    // has no single source frequency), so channel->freqlist is NULL there; guard both uses
+    // below rather than dereferencing it unconditionally.
+    int const channel_frequency = (channel->freqlist != NULL) ? channel->freqlist[channel->freq_idx].frequency : 0;
 
     // use a string stream to build the output filepath
     std::stringstream ss;
@@ -521,6 +522,9 @@ static bool output_file_ready(channel_t* channel, output_t* output) {
 // mixer channel - needed to compute it; see compute_tx_tag_content()/mixer_select_active_tag_input()
 // at the call sites in output_thread()).
 void process_outputs(channel_t* channel, int cur_scan_freq, const std::string& tx_tag) {
+    if (!channel->enabled) {
+        return;
+    }
     for (int k = 0; k < channel->output_count; k++) {
         if (channel->outputs[k].enabled == false)
             continue;
@@ -666,7 +670,7 @@ void process_outputs(channel_t* channel, int cur_scan_freq, const std::string& t
     }
 }
 
-void disable_channel_outputs(channel_t* channel) {
+void disable_channel_outputs(channel_t* channel, bool permanent) {
     for (int k = 0; k < channel->output_count; k++) {
         output_t* output = channel->outputs + k;
         output->enabled = false;
@@ -682,7 +686,7 @@ void disable_channel_outputs(channel_t* channel) {
             close_file(&channel->outputs[k]);
         } else if (output->type == O_MIXER) {
             mixer_data* mdata = (mixer_data*)(output->data);
-            mixer_disable_input(mdata->mixer, mdata->input);
+            mixer_disable_input(mdata->mixer, mdata->input, permanent);
         } else if (output->type == O_UDP_STREAM) {
             udp_stream_data* sdata = (udp_stream_data*)output->data;
             udp_stream_shutdown(sdata);
@@ -914,6 +918,20 @@ static void output_device_buffer_underruns(FILE* f) {
     for (int i = 0; i < device_count; i++) {
         device_t* dev = devices + i;
         fprintf(f, "buffer_underrun_count{device=\"%d\"}\t%zu\n", i, dev->input->underrun_count);
+    }
+    fprintf(f, "\n");
+}
+
+static void output_device_centerfreq_retune_failures(FILE* f) {
+    fprintf(f,
+            "# HELP centerfreq_retune_failure_count Number of times a live centerfreq retune (dynamic_reload "
+            "control socket, or R_SCAN's automatic frequency-hopping) failed at the hardware level. Does not "
+            "indicate the device stopped running - only that this specific retune attempt did not take effect.\n"
+            "# TYPE centerfreq_retune_failure_count counter\n");
+
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        fprintf(f, "centerfreq_retune_failure_count{device=\"%d\"}\t%zu\n", i, dev->input->centerfreq_retune_failure_count);
     }
     fprintf(f, "\n");
 }
@@ -1274,6 +1292,7 @@ void write_stats_file(timeval* last_stats_write) {
     output_channel_no_ctcss_counter(file);
     output_device_buffer_overflows(file);
     output_device_buffer_underruns(file);
+    output_device_centerfreq_retune_failures(file);
     output_output_overruns(file);
     output_input_overruns(file);
     output_process_cpu_seconds(file);
@@ -1335,6 +1354,16 @@ void* output_thread(void* param) {
     while (!do_exit) {
         output_param->mp3_signal->wait();
         for (int i = output_param->mixer_start; i < output_param->mixer_end; i++) {
+            // Consume any pending dynamic_reload enable/disable request before the enabled
+            // check below - this thread owns mixers[i]'s outputs, so applying the change here
+            // (rather than directly on the control socket thread) is what keeps it from racing
+            // this same thread's concurrent process_outputs() calls on the same output_t structs.
+            int pending = mixers[i].pending_enable_request.exchange(-1, std::memory_order_acq_rel);
+            if (pending == 1) {
+                mixer_enable(&mixers[i]);
+            } else if (pending == 0) {
+                mixer_disable(&mixers[i]);
+            }
             if (mixers[i].enabled == false)
                 continue;
             channel_t* channel = &mixers[i].channel;
@@ -1365,6 +1394,29 @@ void* output_thread(void* param) {
                 }
                 for (int j = 0; j < dev->channel_count; j++) {
                     channel_t* channel = devices[i].channels + j;
+                    // Checked before the enable/disable request below, and - unlike that one -
+                    // not consumed via exchange(): channel_teardown_for_removal() frees this
+                    // channel's LAME encoder, and the caller waiting on this request
+                    // (try_remove_channels(), live_reconfig.cpp) decrements dev->channel_count as
+                    // soon as it observes completion, so the field must not signal "done" until
+                    // the teardown genuinely is - see channel_t::pending_remove_request's comment
+                    // (rtl_airband.h). Skips straight to the next channel: this one's outputs are
+                    // being torn down, not processed, for the rest of this pass.
+                    if (channel->pending_remove_request.load(std::memory_order_acquire) == 1) {
+                        channel_teardown_for_removal(channel);
+                        channel->pending_remove_request.store(-1, std::memory_order_release);
+                        continue;
+                    }
+                    // Consume any pending dynamic_reload enable/disable request before
+                    // process_outputs() - this thread owns this channel's outputs, so applying
+                    // the change here (rather than on the control socket thread) is what keeps
+                    // it from racing this same thread's concurrent process_outputs() calls.
+                    int pending = channel->pending_enable_request.exchange(-1, std::memory_order_acq_rel);
+                    if (pending == 1) {
+                        channel_apply_enable(channel);
+                    } else if (pending == 0) {
+                        channel_apply_disable(channel);
+                    }
                     process_outputs(channel, new_freq, channel_tx_tag(channel));
                     memcpy(channel->waveout, channel->waveout + WAVE_BATCH, AGC_EXTRA * sizeof(float));
                 }
@@ -1377,6 +1429,11 @@ void* output_thread(void* param) {
         if (output_param->device_start == 0) {
             write_stats_file(&last_stats_write);
         }
+        // Frees whatever channel_teardown_for_removal() (live_reconfig.cpp) queued at least
+        // RECLAIM_GRACE_PERIOD_SEC ago - see that function's comment for why the actual free is
+        // deferred this long instead of running inline during teardown. Cheap no-op on every pass
+        // where nothing is queued, which is the common case.
+        reclaim_pending_channel_frees();
     }
 
     // waveavail=1 set by the demod just before do_exit may have been missed if
@@ -1411,6 +1468,11 @@ void* output_check_thread(void*) {
         for (int i = 0; i < device_count; i++) {
             device_t* dev = devices + i;
             for (int j = 0; j < dev->channel_count; j++) {
+                if (!dev->channels[j].enabled) {
+                    // Live-disabled via the control socket - disable_channel_outputs() already
+                    // tore down its connections; don't reconnect them behind that command's back.
+                    continue;
+                }
                 for (int k = 0; k < dev->channels[j].output_count; k++) {
                     if (dev->channels[j].outputs[k].type == O_ICECAST) {
                         icecast_data* icecast = (icecast_data*)(dev->channels[j].outputs[k].data);

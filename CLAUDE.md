@@ -312,14 +312,18 @@ Keep the local delta small and well understood.
     excluded — with it), and re-confirmed the default `RDIO_SCANNER=ON` Debug build still passes
     all 104 tests unaffected.
 25. **Mixer file-output NULL-freqlist crash fix** (`src/output.cpp`) — `output_file_ready()`
-    unconditionally dereferenced `channel->freqlist[channel->freq_idx]` under
-    `#ifdef WITH_RDIO_SCANNER` to populate `fdata->open_frequency`, but a mixer's own
-    `channel_t` (`mixer_t::channel`) has no `freqlist` at all — `parse_mixers()` never sets
-    one, since a mixed stream has no single source frequency — leaving it `NULL` and crashing
-    on the mixer's first file rotation. Never caught before because no automated test exercised
-    a mixer with a `file`-type output that actually received signal; item 26's new mixer system
-    test is what first hit it. Fixed by computing the frequency once, guarded by
-    `channel->freqlist != NULL`, defaulting to `0` for a mixer's own channel.
+    dereferenced `channel->freqlist[channel->freq_idx]` — unconditionally under
+    `#ifdef WITH_RDIO_SCANNER` to populate `fdata->open_frequency`, and again when building the
+    filename if `include_freq` is set — but a mixer's own `channel_t` (`mixer_t::channel`) has
+    no `freqlist` at all — `parse_mixers()` never sets one, since a mixed stream has no single
+    source frequency — leaving it `NULL` and crashing on the mixer's first file rotation. Never
+    caught before because no automated test exercised a mixer with a `file`-type output that
+    actually received signal (`test_multichannel.py` carried a "TODO: add mixer tests... once
+    mixer support is implemented in the system tests" for exactly this gap); found independently
+    twice, by two branches' own new mixer system tests hitting it at almost the same time — item
+    26's `test_icecast_tx_tags.py` mixer case and item 27's `test_channel_add.py`/`test_channel_
+    edit.py` mixer cases. Fixed by computing the frequency once, guarded by `channel->freqlist !=
+    NULL`, defaulting to `0` for a mixer's own channel.
 26. **`send_tx_tags`: per-transmission Icecast metadata for non-scanning channels/mixers**
     (`src/rtl_airband.h`, `src/config.cpp`, `src/output.cpp`, `src/mixer.cpp`,
     `src/helper_functions.{h,cpp}`) — the pre-existing `send_scan_freq_tags` only tags Icecast
@@ -363,6 +367,898 @@ Keep the local delta small and well understood.
     `shout_metadata_delay = 0` to keep assertions independent of the real/simulated-time
     interaction between that (wall-clock) delay and `speedup_factor` (which only accelerates IQ
     replay, not `gettimeofday()`).
+
+27. **`dynamic_reload`: live retune/reconfiguration via a Unix domain control socket**
+    (`src/control_socket.{cpp,h}`, `src/live_reconfig.{cpp,h}`, new) — the only reload mechanism
+    before this was `SIGHUP` → full clean shutdown → `execvp()` re-exec (item 7), meaning any
+    config change dropped the whole feed for a restart cycle. Adds a same-host-only (`0600`,
+    `SO_PEERCRED`-checked) control socket, gated behind a new top-level `control_socket_path`
+    config option, that accepts one JSON object per line and returns one JSON response line:
+    `retune`, `set_gain`, `set_bandwidth`, `channel_enable`/`channel_disable`,
+    `mixer_enable`/`mixer_disable`, `reload_diff`. The `SO_PEERCRED` check requires an exact UID
+    match against the daemon's own `getuid()`, so a systemd unit that leaves `User=`/`Group=`
+    unset (running as root) locks out any non-root control-socket client — discovered while
+    testing this branch. The example unit (`init.d/rtl_airband.service`) now documents this.
+    - **New `enabled = false/true` channel/mixer config keyword** (`src/config.cpp`), distinct
+      from the pre-existing parse-time-permanent `disable` (which skips the config entry
+      entirely — no array slot allocated). `enabled` still allocates everything (bins, `dm_dphi`,
+      outputs) but starts the channel/mixer skipped by the hot loops, so the control socket can
+      toggle it live with no array resize. Mixer/device add/remove is explicitly out of scope —
+      declare a mixer up front (optionally `enabled = false`), then toggle. True dynamic *channel*
+      add (a channel not present at startup at all) is supported — see item 28.
+    - **Live centerfreq retune** only for `R_MULTICHANNEL` devices (`R_SCAN` keeps its existing
+      controller-thread fixed-offset scheme unchanged — see item 2's "Device Modes"). Retuning
+      recomputes every channel's `bins`/`base_bins`/`dm_dphi` for the new center, which — unlike
+      `R_SCAN`'s single fixed-offset — touches state `AFC` (the per-channel automatic
+      frequency-correction class in `rtl_airband.cpp`) also mutates continuously from inside the
+      demod thread. To avoid racing AFC, the control socket only ever posts a request
+      (`device_t::pending_centerfreq_request`, an `int` sentinel `-1`); the demod thread that
+      already exclusively owns `bins`/`base_bins`/`dm_dphi` for that device polls and applies it
+      in-thread (`device_apply_retune()`), so the recompute is always single-writer, same
+      invariant AFC's own adjustments already relied on.
+    - **Channel/mixer enable-disable is a request/apply split for the same reason** —
+      `channel_t`/`mixer_t::pending_enable_request` (sentinel `-1`), posted by the control socket
+      thread, consumed only by the `output_thread()` that owns that channel's/mixer's `outputs`.
+      This split exists because the first implementation called `mixer_disable()` directly from
+      the control socket thread and a system test (item 25's mixer test) reproducibly segfaulted
+      it — a genuine data race against that same output thread's concurrent
+      `process_outputs()`/`close_file()` on the same `output_t` structs. Known remaining gap:
+      the pre-existing "last input died" auto-cascade (`mixer_disable_input()` →
+      `mixer_disable()`, triggered when a device channel's own `O_MIXER` output is disabled) can
+      in principle still run from a *different* output thread than the one owning the target
+      mixer's range when `multiple_output_threads = true` is configured — not hit in the default
+      single-output-thread topology this fork actually deploys, and not fixed here.
+    - **`set_gain`/`set_bandwidth`** added as new *nullable* `input_t` vtable hooks
+      (`src/input-common.h/.cpp`, mirroring the existing `set_centerfreq` hook's shape), returning
+      `ENOTSUP` when a driver leaves the pointer null. `rtlsdr` gets `set_gain` only (no tuner
+      bandwidth API exists in this driver at all); `soapysdr` gets both.
+    - **`reload_diff`** re-reads the same `-c` config file (`cfgfile`, promoted from a `main()`
+      local to a global) into a read-only snapshot (`parse_config_snapshot()` — deliberately not
+      a full mirror of `parse_devices()`/`parse_channels()`/`parse_mixers()`, which can't be
+      safely re-run against already-live state) and applies whatever's in v1 scope through the
+      same primitives a single command would use. Device/channel/mixer count changes,
+      `sample_rate`, driver type, and mode changes are detected and reported under
+      `skipped_requires_restart`, never attempted.
+    - Unit tested in `src/test_live_reconfig.cpp` (bins/`dm_dphi` formulas, request/apply
+      bookkeeping, snapshot parsing, diff computation) and `src/test_control_socket.cpp`
+      (wire-protocol parsing, command validation). System-tested end-to-end in
+      `system_tests/tests/test_control_socket.py` (channel/mixer enable-disable audio gaps,
+      malformed-command handling, socket permissions) using two new helpers,
+      `helpers/control_socket_client.py` and `helpers/interactive_runner.py` (a `Popen`-based
+      runner for tests that need to interact with a running instance mid-stream, unlike
+      `conftest.run_rtl_airband()`'s blocking run-to-completion model). A live-retune system test
+      that specifically confirms retuning one channel doesn't corrupt a sibling channel's bins on
+      the same device — the highest-risk scenario for item 27's centerfreq-retune design — is a
+      documented follow-up, not yet implemented; see `test_control_socket.py`'s module
+      docstring.
+28. **Dynamic channel add via `reload_diff`** (`src/config.cpp`, `src/live_reconfig.{cpp,h}`,
+    `src/rtl_airband.h`, `src/logging.{h,cpp}`) — closes item 27's channel-add gap. The config
+    file stays the single source of truth for a channel's definition: an operator adds a channel
+    block to a device's `channels` list in the file and sends the existing `reload_diff` command
+    (no new wire command); `compute_and_apply_diff()` detects the device's channel count grew as a
+    pure tail append and applies it live. Only a *pure append* is handled — any other
+    `channel_count` change (decrease, reorder, or an existing channel's fields changing) still
+    falls into `skipped_requires_restart` exactly as before.
+    - **`reserve_channels`** (new device-level config int, default `0`) — `dev->channels`/`bins`/
+      `base_bins` are `XCALLOC`'d with this much extra headroom at startup and never resized
+      again; `dev->channel_count` (now `std::atomic<int>`) can grow up to the new
+      `dev->channel_capacity` field by writing into an already-allocated, already-zeroed slot and
+      then publishing the new count. Deliberately not real runtime array growth (`realloc`-ing
+      live while the demod and output threads are both mid-iteration through the old pointer was
+      rejected as an unjustified hazard for two independent reader threads) — an operator must set
+      `reserve_channels` on a device once (one restart) before dynamic add works on it, the same
+      "declare capacity up front" idea item 27 already uses for `enabled = false`. Rejected at
+      parse time on `R_SCAN` devices (a scan device always has exactly one channel; "add a
+      frequency to its `freqlist`" is a different, unimplemented feature).
+    - **`parse_channel()`** (`config.cpp`) — the per-channel body of the startup `parse_channels()`
+      loop, extracted into its own function so the startup path and the live-append path share one
+      implementation (including `parse_outputs()`, so a newly appended channel supports the exact
+      same `outputs: (...)` block — any number/type — as a config-file channel always has). Returns
+      `false` (silently not counted, matching pre-existing behavior) for two latent quirks found
+      during the extraction: the legacy single-value forms of `squelch_snr_threshold == -1` and
+      `bandwidth == 0` `continue`d out of the *entire* per-channel loop in the original code, not
+      just the enclosing `if` — never fixed here, only preserved, since it's pre-existing behavior
+      unrelated to this feature.
+    - **`init_output()`** (`rtl_airband.cpp`) — declared in `rtl_airband.h` so the live-append path
+      can call it too. A freshly appended channel's `output_t` structs are allocated by
+      `parse_outputs()` but have no LAME encoder or open connection until `init_output()` runs;
+      missing this call was caught by the system test below (the appended channel's MP3 file was
+      created but stayed empty) rather than by the C++ unit tests, which stub `init_output()` to
+      isolate the append/publish logic from real LAME/icecast/udp setup.
+    - **Recoverable `error()`** (`logging.{h,cpp}`) — `config.cpp`'s ~50 `error()` call sites call
+      `_Exit(1)`, correct for startup but fatal to a *running* process if reused verbatim for a
+      malformed appended channel. A `thread_local` gate (`config_error_is_recoverable`) makes
+      `error()` throw `ConfigApplyError` instead when set; the live-append path sets it, redirects
+      `cerr` to capture the human-readable message each call site already prints, and catches
+      `std::exception` broadly — not just `ConfigApplyError` — since some required-but-missing
+      config keys (e.g. an absent `outputs` block) are indexed directly (`chan_setting["outputs"]`)
+      without an `error()`-guarded `.exists()` check first and throw a raw
+      `libconfig::SettingNotFoundException`; missing this case in the first pass crashed the whole
+      process on exactly the malformed-channel test case it was meant to guard against. A batch of
+      newly appended channels is all-or-nothing: `dev->channel_count` is only published after every
+      new channel parses and connects successfully; a channel that individually succeeded earlier
+      in a failed batch is leaked (its `strdup`'d labels / `XCALLOC`'d outputs are never freed)
+      rather than unwound — acceptable for a rare, operator-triggered failure path.
+    - Unit tested in `src/test_live_reconfig.cpp`'s `ChannelAppendTest` fixture (append one/many
+      within capacity, capacity-exceeded, malformed-channel-doesn't-crash, `R_SCAN` guard,
+      count-decrease still requires restart) with `init_output()` stubbed to isolate the
+      append/publish logic. System-tested end-to-end in `system_tests/tests/test_channel_add.py`
+      (a channel absent at startup captures real audio after a config edit + `reload_diff`,
+      confirmed alongside its already-running sibling channel being unaffected; appending beyond
+      `reserve_channels` is rejected without disrupting the existing channel) using a new
+      `reserve_channels` parameter on `helpers/config_writer.write_config()`.
+29. **Mixer-input live-append data race fix** (`src/mixer.cpp`, `src/rtl_airband.{cpp,h}`,
+    `src/config.cpp`) — closes a gap flagged but not fixed while item 28 was built: a dynamically
+    appended channel whose config declares a `type = "mixer"` output *did* reach
+    `mixer_connect_input()` (`mixer.cpp`) on the live-append path, and that function grew
+    `mixer_t::inputs`/`inputs_todo`/`input_mask` via an unconditional `XREALLOC` with a comment
+    claiming it was "only run at startup" — no longer true once threads (`mixer_thread()`, the
+    output thread's `mixer_put_samples()`/`mixer_disable_input()`/`mixer_enable_input()`) are
+    already running and reading that pointer/count with no synchronization of their own. A real
+    use-after-free, not theoretical.
+    - Mirrors item 28's own fix for `device_t::channels`: a new `reserve_inputs` mixer-level
+      config int (default `0`) sizes extra headroom, added on top of however many inputs actually
+      connected during startup by a one-time `mixer_finalize_capacity()` (`mixer.cpp`), called
+      from `main()` right after `parse_devices()` returns and before any thread is created — the
+      same single-threaded window item 28 relies on. `mixer_t::input_count` is now
+      `std::atomic<int>`; a new `input_capacity` field (plain `int`, write-once before
+      finalization) mirrors `channel_capacity`. Unlike device channels, a mixer's eventual input
+      count isn't known upfront (`parse_mixers()` runs *before* `parse_devices()`, and inputs are
+      discovered incrementally as channel outputs connect to it) — so, unlike `reserve_channels`,
+      the pre-reserved headroom can only be finalized once, after startup connections are done,
+      not sized upfront.
+    - `mixer_connect_input()` now branches on `mixer_capacity_finalized` (a plain global, not a
+      `mixer.cpp` file-static — the unit test binary links every `test_*.cpp` into one process, and
+      a file-static would leak `true` across unrelated tests in link/registration order): before
+      finalization it grows exactly as before (still single-threaded, still safe); after
+      finalization, exceeding `input_capacity` is rejected with a clear `mixer_get_error()` message
+      instead of reallocating — which, via the same `config_error_is_recoverable` mechanism item 28
+      already built, surfaces as an ordinary `skipped_requires_restart` entry for a live append,
+      with no changes needed in `live_reconfig.cpp` at all.
+    - Two adjacent bugs surfaced by the new system tests below, both fixed alongside the race
+      itself:
+      - A mixer declared with zero startup-connected inputs (the intended shape for a
+        `reserve_inputs`-only, live-append-only mixer) never had its own output initialized —
+        `main()`'s startup loop skipped `init_output()` for any mixer whose `enabled` was still
+        `false` at that point ("no inputs connected = no need to initialize output"), correct
+        before dynamic_reload (a zero-input mixer could never gain one) but not after. Fixed by
+        always initializing a mixer's own outputs at startup regardless of `enabled`, matching how
+        device channels already behave (no such skip exists for them). This incidentally also
+        fixes a second, pre-existing latent instance of the same gap: a mixer declared with its own
+        config-level `enabled = false` that *does* have startup-connected inputs was left with its
+        outputs uninitialized too, since `mixer_disable()` (called for `config_wants_disabled`
+        mixers right after `parse_devices()`) ran before the output-init loop and left `enabled`
+        false by the time that loop checked it.
+      - `control_socket.cpp`'s `json_escape()` didn't escape control characters, only `"` and `\`.
+        Nearly every `error_response()` message is built from a captured `cerr` string that ends in
+        `"\n"` (every `config.cpp` parse-error printout does), and the control socket's wire
+        protocol is one JSON object per line — an unescaped, embedded newline in a response
+        silently truncates it before the closing brace on every client, a latent bug for *any*
+        config-parse error during a live append, not just this one. Only ever exercised by a real
+        socket round-trip, not the pre-existing unit tests (which check `compute_and_apply_diff()`'s
+        returned C++ string directly, never JSON-serialized) — this fork's first system test that
+        actually reaches this path (the capacity-exceeded case below) is what surfaced it. Fixed by
+        escaping `\n`/`\r`/`\t` and other control characters properly.
+    - Unit tested in `src/test_mixer.cpp` (pre/post-finalize growth, headroom sizing, pointer
+      stability across a post-finalize append, capacity-exceeded rejection, the zero-input
+      finalize edge cases — `XREALLOC(ptr, 0)` can return `NULL`, which `xrealloc()` treats as
+      fatal OOM, so finalizing a mixer with zero inputs and zero reserve must skip the realloc
+      entirely), `src/test_live_reconfig.cpp` (a live-appended channel's `type = "mixer"` output
+      connecting within/beyond `reserve_inputs`), and `src/test_control_socket.cpp` (a response
+      never contains a raw newline). System-tested end-to-end in
+      `system_tests/tests/test_channel_add.py` using a new `reserve_inputs` parameter on
+      `helpers/config_writer.write_config()`'s mixer dicts: an appended channel's mixer output
+      produces real audio through the mixer within its reserved headroom, and exceeding it is
+      rejected while the mixer's already-connected input keeps producing correct, undisturbed
+      audio throughout — the closest a system test (no sanitizer) can get to proving the original
+      race is actually closed. Full unit test pass across Debug, Debug+NFM, and
+      `-DRDIO_SCANNER=OFF` builds, plus the full system test suite.
+30. **Live channel removal via `reload_diff`** (`src/live_reconfig.{cpp,h}`, `src/config.cpp`,
+    `src/output.cpp`, `src/rtl_airband.h`) — the inverse of item 28's live channel add: deleting a
+    channel from a device's config and calling `reload_diff` tears it down live instead of always
+    falling into `skipped_requires_restart`. No new config option or control-socket command —
+    same "the config file stays the source of truth, `reload_diff` just picks up the diff"
+    contract as append. Easier than the item 29 mixer race fix in one respect (`dev->channels`/
+    `bins`/`base_bins` never shrink or reallocate — array-slot safety was already solved by item 28's `reserve_channels`/`channel_capacity`, and `dev->channel_count` was already atomic and
+    already re-read fresh everywhere), but adds two problems append never had, both because
+    removal is destructive rather than additive:
+    - **Which channel did the operator actually mean to delete?** Position-based diffing only
+      sees "N fewer channels than before" — it can't tell "the last channel was deleted" apart
+      from "some other channel was deleted, and the last one just happens to be one shorter" by
+      count alone. Guessing wrong and tearing down the currently-last channel instead of the one
+      actually removed would kill the wrong live audio feed — append has no equivalent risk
+      (a wrong guess there can only fail to add something new). Closed by a new
+      `DeviceConfigSnapshot::channel_freq_hz` (per-channel freq, captured in
+      `parse_config_snapshot()` alongside the existing `channel_enabled`) that
+      `compute_and_apply_diff()`'s new decrease branch checks against every surviving channel's
+      live `freqlist[0].frequency` before touching anything; any mismatch — i.e. anything other
+      than a pure tail deletion — falls into `skipped_requires_restart` with no attempt made.
+      Only `R_MULTICHANNEL` is supported (same structural non-goal as append: `R_SCAN` always has
+      exactly one channel). **Superseded by item 31**: `channel_freq_hz` was replaced by a general
+      `channel_signature` field, and a signature mismatch is no longer flatly rejected — see below
+      for why that turned out to be an unnecessary restriction once the underlying mechanism was
+      generalized.
+    - **The confirmation-then-decrement handshake needs a stronger guarantee than item 27's
+      existing enable/disable pattern provides.** Enable/disable's `output_thread()` consumption
+      (`exchange(-1, ...)` then apply) lets a waiter observe "consumed" *before* the apply
+      function finishes — harmless there (nothing is freed), but wrong for removal: the caller
+      (`try_remove_channels()`, `src/live_reconfig.cpp`) decrements `dev->channel_count` the
+      moment it sees confirmation, and other threads that gate on that count (notably
+      `output_check_thread()`, which has no synchronization with `output_thread()` beyond
+      checking `channel->enabled`) would need that gate to already reflect a fully-torn-down
+      channel, not one still mid-teardown. `channel_t::pending_remove_request` is a new, separate
+      atomic field from `pending_enable_request` for exactly this reason: `output_thread()`
+      (`src/output.cpp`) only resets it to `-1` *after* `channel_teardown_for_removal()`
+      (`src/live_reconfig.cpp`) fully completes, not at the moment the request is observed.
+    - **Deliberately narrower than a full free.** `channel_teardown_for_removal()` sets
+      `enabled = false` first (same reason `channel_apply_disable()` does — it's what keeps
+      `output_check_thread()`'s already-existing `!enabled` skip from reaching in during
+      teardown), calls the existing `disable_channel_outputs()`, then additionally closes and
+      frees each output's LAME encoder (`lame_close()` + `free(lamebuf)`) — the one resource that
+      scales meaningfully with channel count and was never freed anywhere except whole-process
+      shutdown (see item 21's `LAMEBUF_SIZE`). `channel->outputs`/`freqlist` and each output's own
+      `data` struct are deliberately left allocated (leaked) rather than freed: freeing those
+      would touch memory `output_check_thread()` reads with no synchronization beyond the same
+      `enabled` check, and they're comparatively small (a few hundred bytes to low KB per
+      channel) — the same "leaked, not unwound" tradeoff item 28 already accepts for a batch-
+      append failure, just applied here to every removal rather than only a rare failure path.
+    - **Not all-or-nothing, unlike append.** `try_remove_channels()` decrements
+      `dev->channel_count` by one immediately after each individual channel's teardown is
+      confirmed, rather than batching the count update to the end — so a mid-batch timeout (the
+      output thread stuck or unusually slow) leaves a valid, still-tail-consistent smaller count
+      instead of either an inconsistent one or losing an already-confirmed removal.
+    - Unit tested in `src/test_live_reconfig.cpp` (`ChannelRemoveTest`: successful tail removal
+      with a background thread standing in for `output_thread()`, timeout leaves a valid partial
+      count; plus an `R_SCAN`-decrease guard alongside the existing append guard — the original
+      mismatched-prefix-is-rejected test was superseded by item 31's rebuild-from-divergence
+      behavior and replaced accordingly). One incidental discovery while writing these:
+      constructing a real `freq_t` in a test (needed here to give channels a real freq to
+      prefix-match against) runs `Squelch`'s constructor, which unconditionally calls
+      `debug_print()` — fine in production, but segfaults in the unit test binary under a
+      `-DDEBUG` build, since `debugf` (`src/logging.cpp`) is only ever `fopen()`'d by the real
+      startup path. Existing tests never hit this because `mk_freqlist()` (`src/config.cpp`)
+      allocates via `XCALLOC`, not a real C++ construction — worked around in the test the same
+      way, not fixed at the source. System-tested end-to-end in
+      `system_tests/tests/test_channel_remove.py` (a channel deleted from the tail stops
+      capturing while its sibling channel keeps running the whole time).
+31. **Live channel edit via `reload_diff` (tail-replace generalization)** (`src/config.cpp`,
+    `src/live_reconfig.{cpp,h}`, `src/rtl_airband.h`) — items 28 and 29 could add or remove a
+    channel live, but not edit one: changing an existing channel's `freq`/`modulation`/
+    `bandwidth`/`squelch_snr_threshold`/`notch`/`ctcss`/`highpass`/`lowpass`/`outputs` was
+    silently ignored by `reload_diff` — not even reported, since nothing compared those fields
+    against what was live. Turned out to need no new mechanism: item 30's removal and item 28's
+    append, run back to back on the same channel index, already *is* an edit — a channel is torn
+    down and a freshly parsed replacement takes its place.
+    - **Detecting *that* something changed, without hand-enumerating *what*.** Rather than adding
+      a parallel snapshot field per config key (unbounded, and silently stale the next time a new
+      channel option is added and someone forgets to wire up its diff), `channel_t` gains a
+      `config_signature` field: a canonical string serialization of the channel's entire raw
+      config block, computed once by a new `build_channel_identity_signature()`
+      (`src/config.cpp`) and set unconditionally at the end of `parse_channel()` — so both the
+      startup path and the live-append/replace path always have one. `serialize_setting()`
+      recursively walks an arbitrary `libconfig::Setting` (scalar, group, list, or array), so
+      nested structure — `outputs`, including per-output-type fields like a mixer connection's
+      `balance` — is captured with no per-field knowledge needed, the same way a new output type
+      or channel option added in the future is automatically covered without touching this code
+      at all. `enabled` is deliberately excluded (see below). `DeviceConfigSnapshot::
+      channel_freq_hz` (item 30) is retired in favor of the more general `DeviceConfigSnapshot::
+      channel_signature`, built the same way from the freshly re-read config.
+    - **The diff itself becomes "find the longest common prefix, replace the rest."**
+      `compute_and_apply_diff()` no longer branches on `snap.channel_count > / < / ==
+      dev->channel_count`; it computes `common_prefix` — the largest index such that every
+      channel `[0, common_prefix)` has an identical signature on both sides — then removes
+      whatever's live past that point (`try_remove_channels()`, now taking an explicit
+      `target_count` parameter rather than deriving it from the snapshot, since a replace's
+      target is the common-prefix length, not necessarily the snapshot's final count) and appends
+      whatever the snapshot has past that point (`try_append_channels()`, unchanged — it already
+      starts from `dev->channel_count`, which is `common_prefix` by the time it runs). A pure
+      count increase or decrease is just the special case where one side of that gap is empty;
+      `R_MULTICHANNEL`-only and the `reserve_channels`-capacity check apply exactly as before.
+    - **Why `enabled` is excluded from the signature.** It already has a cheap, non-destructive
+      live-apply path (`channel_request_enable`/`channel_request_disable`, item 27) that just
+      flips a flag — folding it into the signature would make toggling it alone spuriously
+      trigger a full tear-down/reconnect. The untouched common-prefix channels still get their
+      `enabled` diffed and applied via that existing path, every `reload_diff` call, regardless of
+      whether a tail-replace also happened.
+    - **A deliberate, documented behavior change, not just a refactor**: item 30's removal
+      shipped with a hard rule — a non-tail deletion (removing a channel from the middle of the
+      list) was flatly rejected, because position-based diffing had no way to distinguish "the
+      last channel was deleted" from "a different channel was deleted, coincidentally leaving the
+      same count." The signature-based common-prefix approach doesn't have that ambiguity — it
+      finds *where* the file and live state first disagree, by content, not just by count — so a
+      non-tail deletion now succeeds: the deleted channel is removed, and any sibling channel
+      after it in the array gets torn down and reconnected too (a brief interruption, not data
+      loss) purely as a side effect of everything past the divergence point being rebuilt. This is
+      a strictly better outcome than the old flat rejection (which demanded a full restart for the
+      same edit), at the cost of the rebuilt sibling's brief interruption — considered an
+      acceptable, documented tradeoff rather than something worth a more precise (and
+      considerably more complex) reordering-aware diff. **Known limitation**: the comparison is a
+      positional common *prefix*, not a set match — reordering two unchanged channels in the
+      config file causes both to be rebuilt, since the mechanism can't tell "reordered" apart from
+      "replaced" any more finely than that.
+    - **A pre-existing gap this surfaces, not fixed here**: `mixer_disable_input()` (`src/
+      mixer.cpp`) only masks a mixer input slot off (`input_mask[idx] = false`); it never releases
+      it back to `input_capacity`. Editing an already-live channel whose output is `type =
+      "mixer"` therefore burns one more `reserve_inputs` slot on every edit, permanently — an
+      operator who expects to repeatedly tweak a mixer-connected channel's `balance` needs to size
+      `reserve_inputs` for the number of edits they expect to make, not just the number of
+      channels. Flagged, not fixed, matching this fork's existing practice of documenting a
+      discovered-but-out-of-scope gap rather than silently expanding scope to cover it.
+    - Unit tested directly (`ChannelIdentitySignatureTest`, `src/test_live_reconfig.cpp`: identical
+      configs produce identical signatures, a changed scalar field or a changed nested output
+      field produces a different one, `enabled` alone does not) and end-to-end through
+      `compute_and_apply_diff()` (`replaces_tail_channel_when_its_definition_changes`: a bandwidth
+      edit on an existing channel is picked up, the untouched sibling is provably untouched;
+      `replaces_tail_channel_with_edited_mixer_output`: a mixer `balance` edit reconnects into a
+      fresh `reserve_inputs` slot, demonstrating the capacity-consumption caveat above concretely;
+      `deleting_a_non_tail_channel_rebuilds_from_the_point_of_divergence`: the new non-tail
+      behavior, replacing item 30's old rejection test). Every existing hand-built
+      `ChannelAppendTest`/`DiffApplyTest` case that keeps an "already-live, unchanged" channel at
+      index 0 needed one added line (`chans[0].config_signature = strdup(...)`, mirroring what
+      `parse_channel()` would have set at real parse time) — without it, the new common-prefix
+      check has no signature to compare and correctly treats an untouched channel as diverged too,
+      which is a good reason this field is required, not nullable-and-skipped, everywhere except a
+      mixer's own non-replaceable embedded channel. System-tested end-to-end in
+      `system_tests/tests/test_channel_edit.py` (a squelch-threshold edit on a live channel is
+      picked up, with a brief gap around the edit, while an untouched sibling channel is
+      unaffected the whole time) and `test_channel_remove.py`'s rewritten non-tail-deletion test.
+32. **Live retune/gain/bandwidth failures no longer take down the whole process**
+    (`src/input-common.{cpp,h}`, `src/live_reconfig.{cpp,h}`, `src/control_socket.cpp`,
+    `src/rtl_airband.{cpp,h}`, `src/config.cpp`, `src/output.cpp`) — `input_set_centerfreq()`/
+    `input_set_gain()`/`input_set_bandwidth()` (item 27) unconditionally set
+    `input->state = INPUT_FAILED` on any nonzero return from the driver hook, including a single
+    transient hardware error (e.g. an i2c write failure, `r82xx_set_freq: failed=-9`) on a device
+    whose RX thread was running fine. `demodulate()`'s main loop (`rtl_airband.cpp`) treats
+    `INPUT_FAILED` as fatal for that device — and if it's the last device running, exits the whole
+    process ("All receivers failed, exiting"), found by hitting exactly this while testing a live
+    `retune` control-socket command against a real device. Two call paths hit this: the
+    dynamic_reload control socket's `retune`/`set_gain`/`set_bandwidth` commands, and `R_SCAN`'s
+    pre-existing `controller_thread()` frequency-hopping loop, which also permanently abandoned
+    that device's scan on the same failure (`break`). Fixed by no longer setting `INPUT_FAILED`
+    from these three functions at all — that state now means only what it always should have: the
+    RX stream itself died (`rtlsdr_rx_thread()`'s async-read-loop failure and the equivalents in
+    the other drivers, `input_stop()`'s stop-failure path), not a single failed
+    tuning/gain/bandwidth call. `controller_thread()` now logs and keeps scanning (retries the hop
+    on its next ~200ms cycle) instead of abandoning the device. Startup's `rtlsdr_init()` (item 16)
+    is unaffected — it calls `rtlsdr_set_center_freq()` directly, not through
+    `input_set_centerfreq()`, so its fatal-on-init-failure behavior is untouched.
+    - **A second, independent bug in the same area**: `handle_retune()`'s poll loop consumed
+      `dev->pending_centerfreq_request` (reset it to `-1` via `exchange()`) *before*
+      `device_apply_retune()` (and the `input_set_centerfreq()` call inside it) actually ran, so a
+      caller polling for "is it done" could observe "consumed" before the hardware call — and its
+      result — existed at all. Fixed the same way item 30's `pending_remove_request` already
+      established for "apply does real work, not just a flag flip": a new
+      `device_t::centerfreq_apply_failed` field is set by the demod thread from
+      `device_apply_retune()`'s actual (now bool-returning) result, and
+      `pending_centerfreq_request` is only reset to `-1` after that, not before —
+      `handle_retune()` now checks this field instead of `dev->input->state`.
+    - Adds `input_t::centerfreq_retune_failure_count`, incremented inside
+      `input_set_centerfreq()`'s failure branch (covers both call paths with one line) and exposed
+      via the stats/metrics endpoint (items 8/22) alongside `buffer_underrun_count`, so a
+      recurring hardware tuning fault is visible without grepping syslog across this fork's ~12
+      concurrent instances.
+    - Unit tested in `src/test_live_reconfig.cpp` (`device_apply_retune()`'s failure path leaves
+      `input->state` at `INPUT_RUNNING` and increments the new counter; a background-thread test
+      proves the request/apply ordering itself, not just the state removal; a gain-failure case
+      for `input_set_gain()`) and `src/test_control_socket.cpp` (`handle_retune()` returns an
+      error keyed off `centerfreq_apply_failed`, not `input->state`, plus the success mirror).
+      `controller_thread()`'s own retry-not-abandon behavior is not unit-tested — it's a real
+      pthread loop with no existing test harness for it (see item 20's stated scope). A system
+      test against a fault-injecting input driver is a documented follow-up, not yet implemented —
+      no driver in `system_tests/helpers/` currently supports simulating a `set_centerfreq`
+      failure (the only one exercised end-to-end, `type = "file"`, has a hard no-op
+      `set_centerfreq()` that always succeeds).
+33. **Live retune bins/dm_dphi correctness + `reload_diff` failure reporting fix**
+    (`src/live_reconfig.{cpp,h}`, `src/control_socket.cpp`) — found while investigating a
+    production report of "the same failure" persisting after item 32's fix. Extensive
+    fault-injection and real-hardware stress testing (9,500+ forced consecutive retune failures;
+    700+ real `reload_diff` channel-add/remove-plus-retune cycles, including a run that
+    organically reproduced the actual production i2c fault) never reproduced a crash or a race in
+    the request/apply/confirm machinery items 27/29/32 already built — the actual bugs were both
+    correctness/reporting issues, not crashes or races:
+    - `device_apply_retune()` previously recomputed every channel's `bins`/`base_bins`/`dm_dphi`
+      for the *new* centerfreq unconditionally, before attempting the hardware retune. On a
+      failed `input_set_centerfreq()` call, the radio stays physically on its old centerfreq (see
+      item 32 — `input->centerfreq` is only updated on success), but the demod math had already
+      moved on to the new, never-reached frequency: every channel on that device would demodulate
+      the wrong bin offset relative to what the hardware was actually receiving, until the next
+      successful retune. Fixed by reordering: attempt `input_set_centerfreq()` first, only
+      recompute bins/`dm_dphi` on success.
+    - Separately, `compute_and_apply_diff()`'s centerfreq branch (used by `reload_diff` — the
+      only way rtl-airband-panel's `dynamic_reload` branch applies live changes) reported
+      "applied" based solely on `device_request_retune()` successfully *posting* the request,
+      never checking whether the demod thread's actual hardware call succeeded — unlike the
+      standalone `retune` control-socket command, which already polled
+      `pending_centerfreq_request`/`centerfreq_apply_failed` and reported real failures. A caller
+      using `reload_diff` had no way to know a centerfreq change silently failed to reach the
+      hardware. Fixed by extracting the poll-and-check logic `handle_retune()` already had into a
+      shared `device_confirm_retune()`, used by both `handle_retune()` and
+      `compute_and_apply_diff()` — a real hardware failure now surfaces in
+      `skipped_requires_restart` with a message clarifying no restart is actually needed (retry
+      `reload_diff`), matching the wording convention the channel-append failure case already
+      used for the same "attempted and failed, not out-of-scope" distinction.
+    - Unit tested: extended `device_apply_retune_returns_false_...` to assert bins/`base_bins`
+      are left untouched on a failed retune (the existing test only checked `input->centerfreq`,
+      never bins — the actual gap this bug lived in); new
+      `device_confirm_retune_reports_success`/`_hardware_failure`/`_timeout_when_never_consumed`
+      and `centerfreq_diff_posts_a_retune_request_and_waits_for_confirmation`/
+      `_reports_transient_hardware_failure_instead_of_claiming_success`/
+      `_reports_pending_when_not_yet_confirmed` (`src/test_live_reconfig.cpp`, the last superseding
+      the old posts-and-returns-immediately test). All 186 tests (5 net new) pass across Debug and
+      Debug+NFM. Verified end-to-end against real RTL-SDR hardware (temporary, reverted
+      fault-injection build): a genuinely failing `retune` and `reload_diff` command both now
+      correctly report failure instead of false success, with the device's live `centerfreq`
+      confirmed unchanged; no crash or sanitizer report under either a real-hardware i2c fault
+      (reproduced organically during this session's stress testing) or forced/injected failures.
+    - Worth recording as a negative result: item 27/29/32's design (single-threaded control
+      socket, blocking confirm-before-advance, no double-post hazard) held up under everything
+      short of the actual production incident being reproduced end-to-end. If a genuine *crash*
+      (not a wrong-frequency or under-reported-failure symptom) is seen again, it's unlikely to be
+      in this code path — check the OS/systemd level first (OOM killer, watchdog, resource
+      limits) before re-auditing this machinery.
+    - Also noted, not fixed here: an unrelated pre-existing UBSan finding surfaced incidentally
+      during this session's hardware testing — `src/ctcss.h:68`, "load of value 240, which is not
+      a valid value for type 'bool'" (an uninitialized-read UB, not a new regression from this
+      fix). Flagged as a discovered-but-out-of-scope follow-up per this fork's usual practice.
+34. **Live RTL-SDR tuner bandwidth control** (`src/input-rtlsdr.{cpp,h}`, `src/input-common.h`,
+    `src/live_reconfig.{cpp,h}`) — closes a gap found while scoping a live-bandwidth-adjustment
+    request: `input->set_bandwidth` was hardcoded NULL for the rtlsdr driver with a comment
+    claiming "this driver has no tuner-bandwidth API call anywhere" — verified false against the
+    actual installed dependency (`librtlsdr2 2.0.1`, Ubuntu Noble's `rtl-sdr` package,
+    osmocom-derived): `rtlsdr_set_tuner_bandwidth()` exists and returned success across the full
+    practical range (0=auto, 200kHz-8MHz) against the R820T dongle used to develop and test this.
+    Neither driver (rtlsdr or soapysdr) previously had a *startup*-time bandwidth config option
+    either — only soapysdr had a live hook, reachable solely via the standalone `set_bandwidth`
+    control-socket command, never via `reload_diff` (the only mechanism rtl-airband-panel's
+    `dynamic_reload` branch actually uses).
+    - New optional `bandwidth` device-level config key for rtlsdr (`rtlsdr_parse_config()`,
+      integer Hz, 0 = automatic — librtlsdr's own convention), applied once at `rtlsdr_init()`
+      right after `correction`. Omitting it is fully backward compatible: `dev_data->bandwidth`
+      defaults to 0 (XCALLOC-zeroed), and explicitly calling `rtlsdr_set_tuner_bandwidth(rtl, 0)`
+      at startup is the same "automatic" behavior this driver already had before this existed.
+      Startup failure is fatal, matching item 16's precedent for other tuning parameters
+      (centerfreq/sample_rate/correction) — no special-casing beyond that, since the real-hardware
+      test above found no case where this call failed.
+    - `rtlsdr_set_bandwidth()` implements the pre-existing nullable `input_t::set_bandwidth` hook
+      (item 27) via the same API, so the pre-existing `set_bandwidth` control-socket command
+      (`handle_set_bandwidth`, `input_set_bandwidth()`) now works for rtlsdr with zero changes
+      needed there — only the driver-side NULL was ever missing.
+    - `DeviceConfigSnapshot` gains `has_bandwidth`/`bandwidth` (`live_reconfig.h`), populated in
+      `parse_config_snapshot()` and diffed/applied in `compute_and_apply_diff()` following the
+      exact same pattern gain already uses: `input_t` has no generic live-readable "current
+      bandwidth" (each driver's tracking, where it exists at all, is private to its own
+      `dev_data`), so a `bandwidth` key present in the config file is reapplied unconditionally
+      on every `reload_diff` rather than truly diffed — harmless/idempotent, matching gain's own
+      documented tradeoff. Unlike centerfreq, `input_set_bandwidth()` is synchronous (no
+      `pending_*`/apply-thread split), so its return value is already the real outcome and gets
+      reported accurately (`applied` on success, `skipped_requires_restart` with a
+      not-actually-restart-needed message on a transient hardware failure, silently skipped on
+      `ENOTSUP` for drivers without the hook) — this is what actually makes it usable through the
+      config-edit-then-`reload_diff` workflow the panel and this fork's own deployment rely on,
+      not just the standalone command.
+    - New default member initializers on `DeviceConfigSnapshot::has_bandwidth`/`bandwidth`
+      (`= false`/`= 0`) — a real regression this addition hit during testing: several pre-existing
+      hand-built `DeviceConfigSnapshot` test fixtures only set the fields they cared about, so the
+      new fields were left as indeterminate garbage and intermittently tripped
+      `input_set_bandwidth()`'s `assert(input->dev_data != NULL)` in unrelated tests. The other,
+      pre-existing scalar fields on this struct don't have default initializers and were
+      deliberately left alone (out of scope for this change) — every test that already touches
+      them already sets them explicitly.
+    - Deliberately rtlsdr-only: this fork's actual deployment is exclusively RTL-SDR, one device
+      per instance (see the "Deployment Context" section), and soapysdr already had a live hook;
+      adding soapysdr startup config was left out as unrequested scope.
+    - Unit tested: `DiffApplyTest.bandwidth_not_supported_by_driver_is_silently_skipped_not_reported`/
+      `_applied_via_input_set_bandwidth_is_reported`/`_set_hardware_failure_does_not_mark_input_failed`
+      (mirroring the equivalent gain tests exactly) and `ConfigSnapshotTest.parses_basic_multichannel_device`
+      (extended)/`bandwidth_absent_from_config_reports_has_bandwidth_false`
+      (`src/test_live_reconfig.cpp`). All 190 tests (4 net new) pass across Debug and Debug+NFM.
+      Verified end-to-end against real RTL-SDR hardware: startup `bandwidth = 2000000;` applied
+      cleanly, a live `set_bandwidth` control-socket command changed it to 1000000 Hz, and a
+      config-file edit + `reload_diff` picked up a further change to 3000000 Hz — all three
+      confirmed via log output ("Device #0: bandwidth set to ... Hz") with no crash or sanitizer
+      report.
+35. **Live RTL-SDR frequency correction (PPM) control** (`src/input-rtlsdr.cpp`,
+    `src/input-common.{cpp,h}`, `src/control_socket.cpp`, `src/live_reconfig.{cpp,h}`) — the
+    cheapest item on a user-prioritized live-reconfiguration to-do list scoped in this same
+    session (bandwidth done in item 34; live `sample_rate` change is the remaining, most
+    expensive item — needs RX-thread stop/restart plus buffer/FFT-plan resizing, a different
+    class of change from anything built so far, deliberately not started yet). Unlike bandwidth,
+    `correction` already had startup config support (`rtlsdr_parse_config()`/`rtlsdr_init()`) —
+    this only adds the *live* half, following the exact same three-layer template item 34
+    established: driver hook, standalone control-socket command, `reload_diff` wiring.
+    - New nullable `input_t::set_correction` hook (mirrors `set_gain`/`set_bandwidth` exactly) and
+      `input_set_correction()` (`input-common.{cpp,h}`) — same "failed correction change doesn't
+      mean the RX stream died" non-fatal handling as its siblings.
+    - `rtlsdr_set_correction()` (`input-rtlsdr.cpp`) calls the same `rtlsdr_set_freq_correction()`
+      API `rtlsdr_init()` already uses at startup, including that function's `-2` return code
+      ("already at this value") being treated as success, not failure — matching the startup
+      path's existing handling of the same quirk.
+    - New standalone `set_correction` control-socket command (`handle_set_correction`,
+      `device`/`correction` fields), matching `set_gain`/`set_bandwidth`'s shape exactly.
+    - `DeviceConfigSnapshot` gains `has_correction`/`correction` (defaulted, same rationale as
+      item 34's `has_bandwidth`/`bandwidth` — hand-built test fixtures that predate a field must
+      not see indeterminate garbage), diffed/applied in `compute_and_apply_diff()` following
+      gain/bandwidth's identical "no live-readable current value, reapply unconditionally,
+      synchronous call so the return value is already the real outcome" pattern.
+    - Unit tested: `DiffApplyTest.correction_not_supported_by_driver_is_silently_skipped_not_reported`/
+      `_applied_via_input_set_correction_is_reported`/`_set_hardware_failure_does_not_mark_input_failed`
+      and `ConfigSnapshotTest.parses_basic_multichannel_device` (further extended)/
+      `bandwidth_absent_from_config_reports_has_bandwidth_false` (further extended to also assert
+      `has_correction`) (`src/test_live_reconfig.cpp`). All 193 tests (3 net new) pass across
+      Debug and Debug+NFM. Verified end-to-end against real RTL-SDR hardware: a live
+      `set_correction` command changed correction to 50 ppm, and a config-file edit +
+      `reload_diff` picked up a further change to 65 ppm — both confirmed via log output
+      ("Device #0: freq correction set to ... ppm") with no crash or sanitizer report.
+    - Deliberately out of scope, per explicit user direction when this to-do list was scoped:
+      live `buffers`/`serial`/`index` changes, R_SCAN live reconfiguration, device/mixer count
+      changes, driver `type`/`mode` changes, and all top-level (non-device) settings — none of
+      these are planned.
+36. **Live device `sample_rate` change** (`src/live_reconfig.{cpp,h}`, `src/rtl_airband.{cpp,h}`,
+    `src/config.cpp`, `src/control_socket.cpp`, `src/input-rtlsdr.cpp`) — the last, most expensive
+    item on the same user-prioritized to-do list (items 34/35), previously always
+    `skipped_requires_restart`. Unlike every other item 27-35 live-set operation, changing
+    `sample_rate` genuinely requires stopping and restarting the device's RX thread, resizing
+    `input_t::buffer`/`buf_size`, and recomputing every channel's bins/`dm_dphi` for the new rate
+    — a different class of change from anything mutated in place before this.
+    - Scoping investigation found the FFTW plan/`fft_size` is a single process-wide global with
+      zero dependency on any device's `sample_rate` (de-risks cross-device concerns entirely —
+      changing one device's rate cannot touch another device's FFT processing), and that
+      recomputing bins/`dm_dphi` for a new rate is mechanically identical to what live centerfreq
+      retune already does (both already take `sample_rate` as an explicit parameter). The
+      genuinely new work is narrower: safely quiescing/restarting one device's RX thread while
+      sibling devices (and, in the default single-demod-thread topology, this one) keep running,
+      and swapping the buffer out from under a demod thread that has no synchronization on the
+      buffer *pointer/size* today (only on `bufs`/`bufe`).
+    - `compute_input_buf_size()` (`live_reconfig.{cpp,h}`) extracts the sample-rate-dependent
+      buffer-size formula out of `parse_devices()` (`config.cpp`) into a pure function shared by
+      both the startup path and the new live path — same "must stay in sync by construction"
+      rationale as `compute_channel_bin()`/`compute_channel_dm_dphi()`, and a real correctness
+      requirement here (a mismatch would produce inconsistent `buf_size`/`bps`/`available`
+      arithmetic), unlike e.g. `snapshot_parse_anynum2int()`'s deliberate duplication elsewhere in
+      the same file.
+    - `device_apply_sample_rate()` (`live_reconfig.cpp`) is the new heavy apply function, run
+      synchronously within this device's own turn in the demod thread's round-robin
+      (`demodulate()`, `rtl_airband.cpp`) — same single-writer-thread invariant
+      `device_apply_retune()` already relies on for bins/`base_bins`/`dm_dphi`, extended here to
+      also cover the RX thread and buffer:
+      1. Computes and allocates the new buffer *first*, before touching the RX thread at all —
+         the old buffer stays untouched until the new rate is confirmed working, which is what
+         makes rollback cheap (nothing to reallocate on failure, just reopen and restart against
+         what's already there).
+      2. Stops the RX thread via the driver's `stop` hook directly (not `input_stop()` — that
+         sets `input->state = INPUT_STOPPED` and is a one-shot, process-exit-only call, its only
+         pre-existing caller being final shutdown) and joins it. If `stop()` itself fails, aborts
+         immediately without joining (a join could hang forever if the driver failed to actually
+         cancel the blocking read) — the device is presumably still fine at the old rate, so this
+         is a rejected request, not a device failure.
+      3. Reopens via `device_reopen_recoverable()` (new, anonymous-namespace helper) — wraps the
+         driver's `init()` hook (e.g. `rtlsdr_init()`) with the same `config_error_is_recoverable`
+         thread-local-gate mechanism item 28 already established for `parse_channel()`'s `error()`
+         calls, so a startup-only fatal call inside `init()` becomes a catchable failure instead of
+         killing the whole process. Deliberately does not call the generic `input_init()` wrapper
+         (`input-common.cpp`): that function unconditionally re-runs `pthread_mutex_init()` on
+         `buffer_lock` (undefined behavior on an already-live mutex) and unconditionally overwrites
+         `input->state`, neither correct for reopening an already-running device.
+      4. On success: frees the old buffer, adopts the new one, resets `bufs`/`bufe` to 0, restarts
+         the RX thread, recomputes bins/`dm_dphi` for the new rate (reusing `device_apply_retune()`
+         's per-channel loop, extracted into a shared private `recompute_channel_bins()` helper).
+      5. On failure: per explicit user direction when this was scoped, attempts rollback to the
+         *old* rate (reopen again, against the still-intact old buffer) rather than immediately
+         giving up — restores full service in the common case (e.g. a transient i2c hiccup on the
+         new rate) instead of leaving the device down for something recoverable.
+      6. Only if that rollback *also* fails does this mark `input->state = INPUT_FAILED` — a
+         genuine "won't come back up at any rate" case, which `demodulate()`'s existing
+         `INPUT_FAILED` → `INPUT_DISABLED` handling already folds into `devices_running`/the "all
+         receivers failed" exit path with no new machinery needed there.
+    - `rtlsdr_init()` (`input-rtlsdr.cpp`) was refactored to guarantee this rollback path actually
+      works: found via real-hardware testing (not caught by any fake-driver unit test, since the
+      fakes don't hold real USB resources) that a failure partway through the original
+      straight-line function left `dev_data->dev` open, so the rollback's own second
+      `rtlsdr_open()` call collided with the still-claimed USB interface
+      (`usb_claim_interface error -6`) and failed for an unrelated reason. Fixed by extracting
+      everything after a successful `rtlsdr_open()` into `rtlsdr_configure_opened_device()` and
+      wrapping its call in `rtlsdr_init()` with a try/catch plus a return-code check that always
+      closes `dev_data->dev` (and resets it to NULL) on any failure exit, whether via a plain
+      `return -1` or a thrown `ConfigApplyError` — a no-op difference at real startup (a failure
+      there is always fatal anyway) but essential for a live reopen attempt to retry cleanly.
+    - New `device_t::pending_sample_rate_request`/`sample_rate_apply_failed`
+      (`rtl_airband.h`) — same request/apply/confirm shape as the centerfreq fields
+      (`device_request_sample_rate()`/`device_confirm_sample_rate()`, mirroring
+      `device_request_retune()`/`device_confirm_retune()` exactly), plus a new standalone
+      `set_sample_rate` control-socket command (`handle_set_sample_rate`, matching
+      `retune`/`set_gain`/`set_bandwidth`/`set_correction`'s shape) and `reload_diff` wiring.
+      Unlike gain/bandwidth/correction, `sample_rate` *does* have a live-readable current value
+      (`dev->input->sample_rate`), so `reload_diff` does a real diff rather than gain's
+      "reapply unconditionally" pattern — re-triggering a full RX-thread stop/reopen/restart cycle
+      on every `reload_diff` call regardless of whether the value actually changed would be a real
+      cost, not a harmless idempotent no-op. Budgets a longer confirmation timeout (3s vs. plain
+      retune's 500ms) given the apply side includes a full RX-thread join and hardware reopen, not
+      just one API call.
+    - Also required an explicit `pending_sample_rate_request = -1`/`sample_rate_apply_failed =
+      false` initialization in `parse_devices()` (`config.cpp`), mirroring the pre-existing
+      centerfreq initialization there — missing this was a second real bug caught only by
+      real-hardware testing: a freshly `XCALLOC`'d (zero-initialized) `device_t` defaults
+      `pending_sample_rate_request` to `0`, which every unit test happened to override explicitly
+      but production startup did not, so the demod thread's `if (pending_sample_rate >= 0)` check
+      (`rtl_airband.cpp`) treated a fresh device as having an immediate pending request for
+      `sample_rate = 0` — dividing by zero in `compute_input_buf_size()` on the very first pass,
+      a guaranteed SIGFPE crash at startup that no unit test exercised because every hand-built
+      test fixture set the field explicitly.
+    - Unit tested extensively: `ComputeInputBufSizeTest` (pure function), `device_confirm_sample_
+      rate_reports_success`/`_failure`/`_timeout_when_never_consumed`, `device_request_sample_
+      rate_rejects_r_scan`/`_rejects_driver_without_stop_hook`/`_accepts_r_multichannel_with_stop_
+      hook`, and a dedicated `SampleRateApplyTest` fixture (`src/test_live_reconfig.cpp`) with real
+      fake `init`/`stop`/`run_rx_thread` driver hooks and a genuinely spawned, joined
+      `pthread_t` RX thread (not mocked away, since `device_apply_sample_rate()` calls
+      `pthread_join()` directly and needs a real thread to join) covering the success path,
+      rollback-on-failure, rollback-also-fails (`INPUT_FAILED`), and stop-fails-without-touching-
+      state paths, plus `DiffApplyTest.sample_rate_diff_posts_request_and_reports_success`/
+      `_reports_rollback_message_on_failure`/`sample_rate_unchanged_does_not_post_a_request`.
+      Building this surfaced a third, pre-existing latent bug (documented in item 30 but not
+      previously confirmed to actually manifest): a stack-constructed `freq_t` embeds a `Squelch`,
+      whose constructor unconditionally calls `debug_print()` — safe in production, but `debugf`
+      is never `fopen()`'d in the unit test binary, so this is undefined behavior under a `-DDEBUG`
+      build. Under plain `Debug` it silently corrupted heap state that only crashed a later,
+      unrelated test (`"malloc(): unaligned tcache chunk detected"`); under ASan it was caught
+      immediately at the actual fault site. Fixed in the new `SampleRateApplyTest` fixture the same
+      way `ChannelRemoveTest` already does (`calloc`, not a real C++ construction) — the other
+      pre-existing tests using the unsafe pattern were left alone as out of scope for this change.
+      All 207 tests (14 net new) pass across Debug, Debug+NFM, and under ASan/UBSan.
+    - Verified end-to-end against real RTL-SDR hardware, including the two bugs above (both found
+      *by* this hardware testing, not by unit tests): a live `set_sample_rate` command and a
+      config-edit-plus-`reload_diff` both successfully changed the live rate (confirmed via
+      "Found Rafael Micro R820T tuner" / "RTLSDR device 0 initialized" reappearing in the log,
+      i.e. a genuine reopen occurred) with the device fully functional afterward (a follow-up
+      `retune` succeeded); a fault-injected reopen failure (temporary, reverted, gated on
+      `config_error_is_recoverable` so it can never fire at real startup) correctly triggered
+      rollback to the previous rate with the device left fully functional; no crash or sanitizer
+      report in either case once both bugs were fixed.
+    - Known limitation, not addressed here: in the non-default `multiple_demod_threads=false`
+      (single shared demod thread) topology with more than one device, this device's turn in the
+      round-robin blocks synchronously for the whole stop/reopen/restart sequence (potentially
+      hundreds of milliseconds for a real USB reopen), pausing every other device that thread
+      services for that duration. An accepted tradeoff for this fork's actual one-device-per-
+      instance deployment (see "Deployment Context"), where this concern doesn't arise at all, but
+      worth reconsidering before this feature is used in a genuinely multi-device-per-thread
+      deployment.
+37. **`reload_diff` wording consistency: gain/bandwidth/correction failures now say "no restart
+    needed" too** (`src/live_reconfig.cpp`) — found while checking rtl-airband-panel's
+    `LiveApplyBanner` (which classifies `skipped_requires_restart` entries by matching the "no
+    restart needed" substring, added for items 33/36's centerfreq/sample_rate wording) against
+    every field that can land in that array. `gain`/`bandwidth`/`correction` failures (items 27/34/35) are the *same* kind of transient, retryable failure as a failed centerfreq/sample_rate
+    change — no live-readable current value, reapplied unconditionally next `reload_diff`, no
+    restart actually required — but their messages just said "present in config but failed to
+    apply live, see logs", with no indication of that. A caller (this panel, or any other control-
+    socket consumer) had no way to distinguish these from a genuinely restart-required entry other
+    than by field name. Appended "- no restart needed, retry reload_diff" to all three messages,
+    matching centerfreq/sample_rate's existing wording exactly. `gain_set_hardware_failure_does_
+    not_mark_input_failed`/`bandwidth_set_hardware_failure_does_not_mark_input_failed`/`correction_
+    set_hardware_failure_does_not_mark_input_failed` (`src/test_live_reconfig.cpp`) each gained an
+    assertion locking in the new substring, mirroring item 33's regression test. All 207 tests
+    pass; not separately re-verified against real hardware since this is a string-only change to
+    an already-hardware-tested failure path (items 27/34/35).
+38. **Control socket: per-connection recv timeout + buffer cap** (`src/control_socket.{cpp,h}`)
+    — the first fix out of a pre-merge review pass across the whole `dynamic_reload` branch
+    (items 27-37), specifically scoped to the easiest of four findings, ordered easiest to
+    hardest. `handle_connection()` previously had no timeout on its `recv()` loop and no cap on
+    how much it would buffer waiting for a newline — a single stalled or misbehaving client (a
+    bug in a caller, or a `nc -U`/manual session left open) blocked *every* other control-socket
+    operation on that instance indefinitely, since `control_main()`'s accept loop is single-
+    threaded and doesn't service a new connection until `handle_connection()` returns. This also
+    meant a stuck client could delay a clean process shutdown by the same amount, since
+    `control_shutdown_requested` is only re-checked between `recv()` calls.
+    - `handle_connection()` now takes `timeout_sec`/`max_buffered_bytes` parameters (defaulted in
+      the header to 10s/16KiB for the production call site in `control_main()`, so that call site
+      needed no changes) and sets `SO_RCVTIMEO` on the accepted fd; a client that sends more than
+      `max_buffered_bytes` without a newline is disconnected immediately rather than buffered
+      without limit.
+    - Moved out of the anonymous namespace and declared in `control_socket.h` (matching the
+      existing pattern for `control_socket_dispatch_command_line()`/`control_socket_parse_command_
+      line()`) specifically so it's unit-testable — unlike those two, there's no way to exercise a
+      real `recv()` timeout without a real socket, so the new tests use a short injected timeout
+      rather than the production default to stay fast.
+    - This does **not** make the control socket handle multiple clients concurrently — that
+      remains a single-connection-at-a-time design, unchanged and out of scope for this fix.
+      Verified via real-hardware testing: a stuck first client with no data sent still delays a
+      second client's request, but now bounded to the configured timeout (~10s, confirmed via a
+      live timed test) rather than blocking forever.
+    - Unit tested in `src/test_control_socket.cpp`'s new `HandleConnectionTest` fixture, using a
+      real `AF_UNIX` `socketpair()` (not mocked): closes on timeout with no data sent, closes when
+      the buffer cap is exceeded without a newline, and a normal request/response round trip still
+      works unchanged over the real socket. All 210 tests (3 net new) pass across Debug,
+      Debug+NFM, and ASan/UBSan. Verified end-to-end against real RTL-SDR hardware: a normal
+      `retune` command still works, and a stuck client no longer wedges a second client's request
+      past the new timeout.
+39. **Channel removal: tombstone to prevent a real crash on a stale index** (`src/rtl_airband.h`,
+    `src/config.cpp`, `src/live_reconfig.cpp`, `src/control_socket.cpp`) — the second, harder
+    finding from the same pre-merge review pass as item 38, and the highest-severity of the four:
+    a genuine crash path, not just tech debt.
+    - **The bug**: `try_remove_channels()` (`live_reconfig.cpp`) only decrements
+      `dev->channel_count` after `channel_request_remove()` confirms the output thread has
+      finished tearing a channel down. If that confirmation times out (plausible under real load —
+      a congested Icecast connection, exactly this fork's actual Broadcastify-over-the-internet
+      deployment shape), `try_remove_channels()` gives up and reports the channel as not removed —
+      but the request it already posted is still live and *will* be processed by the output thread
+      whenever it next catches up, asynchronously, with no further correlation back to the caller.
+      `dev->channel_count` is never decremented for that index. In that window (which can be
+      arbitrarily long, not just the ~500ms request timeout, if the output thread was genuinely
+      stuck), the channel index looks "still live" to `get_device_and_channel()`
+      (`control_socket.cpp`), the sole bounds check backing the standalone `channel_enable`/
+      `channel_disable` commands — but the removal is either in flight or has already actually
+      completed, freeing the channel's LAME encoder (`channel_teardown_for_removal()`). If a
+      `channel_enable` command lands on that same index in this window, `channel_apply_enable()`
+      reopens the channel's connections but never reallocates LAME (only `init_output()` does,
+      called only at startup or for a freshly-appended channel) — the next `process_outputs()`
+      pass then calls into LAME with a null encoder and crashes the entire `output_thread()`,
+      taking down **every feed on that instance**, not just the one channel being edited.
+    - **A second, quieter bug from the same root cause**: `channel_teardown_for_removal()` never
+      updates `channel->config_signature`. If an operator reverts a channel deletion in the config
+      file (restoring the exact original definition), `compute_and_apply_diff()`'s common-prefix
+      signature match (item 31) would previously see "signature unchanged" and never re-diff that
+      index again — the channel stays permanently, silently dead (torn down, `enabled = false`)
+      with no way for `reload_diff` to ever revive it short of a full restart.
+    - **The fix**: a new permanent tombstone, `channel_t::removed` (`rtl_airband.h`), set by
+      `channel_teardown_for_removal()` once a removal has actually completed, and reset to `false`
+      only by `parse_channel()` (`config.cpp`) populating a fresh channel into a reused slot
+      (mirroring exactly how `pending_enable_request`/`pending_remove_request` are already reset
+      there). Checked in two places:
+      - `get_device_and_channel()` (`control_socket.cpp`) now rejects any index where
+        `pending_remove_request != -1` (a removal is currently in flight - closes the window
+        *before* teardown completes too, not just after) or `removed == true` (already torn
+        down) — closing the crash path entirely, with a clear error instead of a silent time bomb.
+      - `compute_and_apply_diff()`'s common-prefix walk (`live_reconfig.cpp`) now treats a
+        tombstoned channel as always diverged, regardless of signature match — forcing a reverted
+        delete to be correctly retried and revived instead of silently skipped forever.
+    - Investigated and deliberately did *not* tombstone at the moment a removal is merely
+      *requested* (i.e., inside `channel_request_remove()` itself) as a simpler alternative:
+      checking `pending_remove_request != -1` already covers that entire in-flight window, so a
+      separate request-time tombstone would be redundant - the two checks together (in-flight OR
+      already-removed) close the full window with no gap, using one new field rather than two.
+    - Unit tested in `src/test_control_socket.cpp`'s `ControlSocketDispatchTest` (four new cases:
+      rejects a channel with a removal in flight, rejects an already-removed channel, confirms
+      `channel_disable` is covered by the same fix, confirms a normal never-removed channel is
+      unaffected — each asserting `pending_enable_request` is never posted against a rejected
+      index, the actual mechanism that would otherwise lead to the crash) and
+      `src/test_live_reconfig.cpp`'s new `ChannelAppendTest.tombstoned_channel_is_revived_even_
+      when_its_signature_still_matches` (the full revert-a-delete scenario: a channel tombstoned
+      with a config_signature that still matches the file is correctly torn down and re-appended,
+      not silently skipped, and the tombstone is cleared on revival). All 215 tests (5 net new)
+      pass across Debug, Debug+NFM, and ASan/UBSan. Verified end-to-end against real RTL-SDR
+      hardware: normal `channel_enable`/`channel_disable`/`retune` all confirmed unaffected by the
+      new check (this fix is pure software bounds-checking logic with no new hardware interaction,
+      so hardware verification was scoped to confirming no regression, not reproducing the exact
+      race - which is precisely and directly exercised by the unit tests' simulated stuck/working
+      consumer threads instead).
+
+40. **Mixer: reclaim an input slot on permanent channel removal, not just temporary disable**
+    (`src/rtl_airband.h`, `src/mixer.cpp`, `src/output.cpp`, `src/live_reconfig.cpp`) — the third
+    of the four pre-merge-review findings, and the last of item 31's own documented caveats still
+    open: `mixer_disable_input()` only ever masked a slot off (`input_mask[idx] = false`); it never
+    released the slot back to `input_capacity`. That's correct for an *ordinary* temporary disable
+    (`mixer_disable()`'s "all inputs died" auto-cascade, `channel_apply_disable()`'s control-socket
+    `channel_disable` command) — the same channel is expected to reconnect to the same index later
+    via `mixer_enable_input()` — but item 31's live channel *edit* tears the old channel down and
+    appends a fresh replacement, so every single live edit of a mixer-connected channel was
+    permanently burning a new `reserve_inputs` slot it could never get back, exactly as item 31
+    flagged but left unfixed at the time.
+    - **The fix**: `disable_channel_outputs()` (`output.cpp`) and `mixer_disable_input()`
+      (`mixer.cpp`) both gained a `permanent` bool parameter (default `false`, so every pre-existing
+      call site is unchanged). `channel_teardown_for_removal()` (`live_reconfig.cpp` — used by both
+      item 30's removal and item 31's tail-replace edit) is the only caller that passes `true`. A
+      new parallel array, `mixer_t::input_removed` (`rtl_airband.h`), is tombstoned by
+      `mixer_disable_input(..., permanent=true)` and checked first thing in `mixer_connect_input()`
+      — a tombstoned slot is reused (fields reset, `input_mask`/`inputs_todo` republished, same
+      "publish `input_mask` last" discipline the fresh-slot path already used) before any capacity
+      check or growth is attempted, so reuse never touches `input_capacity`/`reserve_inputs` at all.
+      The slot's `pthread_mutex_t` is deliberately never re-initialized or destroyed on reuse — only
+      ever set up once, at the slot's first real allocation — since `mixer_thread()` locks every
+      slot's mutex unconditionally every pass regardless of `input_mask` (see its per-input loop),
+      so the mutex object must always remain valid for the mixer's entire lifetime.
+    - **Reuse-scan safety**: the scan and reuse both run inside `mixer_connect_input()`, which is
+      only ever called from the single control-socket thread's `reload_diff`-driven live-append
+      path (`control_socket.cpp`'s accept loop handles one connection at a time — see item 27's own
+      comment on this) — so there's no concurrent-writer race on the scan itself, matching every
+      other live-reconfig primitive's single-writer-thread invariant.
+    - Unit tested directly in `src/test_mixer.cpp` (`MixerCapacityTest`: permanent disable
+      tombstones without disturbing other inputs, non-permanent disable does not tombstone, reuse
+      pre- and post-`mixer_finalize_capacity()` without growing capacity, and a
+      `mixer_put_samples()` round-trip through a reused slot proving the un-reinitialized mutex is
+      still genuinely usable) and end-to-end through `test_live_reconfig.cpp`'s existing
+      `replaces_tail_channel_with_edited_mixer_output` test, updated to assert the now-fixed
+      behavior (`input_count` stays at 1, the old slot is reused, no `reserve_inputs` needed) rather
+      than the old caveat it used to document. That test's coverage required upgrading
+      `test_mixer.cpp`'s file-scope `disable_channel_outputs()` stub (previously a total no-op,
+      since the real one in `output.cpp` needs shout/lame/real file I/O this test binary doesn't
+      link in) to reproduce just the `O_MIXER` branch — pure `mixer.cpp` logic, already linked —
+      so the reclaim path is genuinely exercised through the same call chain production uses, not
+      simulated. All 220 tests (5 net new) pass across Debug, Debug+NFM, `-DRDIO_SCANNER=OFF`, and
+      ASan/UBSan. No hardware interaction in this fix (pure in-process mixer bookkeeping), so
+      verification was unit/system-test-only — `system_tests/tests/test_channel_add.py`,
+      `test_channel_edit.py`, `test_channel_remove.py`, and `test_control_socket.py` all still pass
+      against rebuilt `Release`/`Release_nfm` binaries, confirming no regression in the mixer output
+      paths those tests already exercise end-to-end.
+    - **Merge-time fix (main → `dynamic_reload`, this branch's merge into `main`)**: item 26's
+      `send_tx_tags` added `mixinput_t::source_device_idx`/`source_channel_idx` (resolved by
+      `parse_outputs()` right after `mixer_connect_input()` returns, on every connect - fresh or
+      reused) on a separate line of history, so this item's reuse branch never anticipated them.
+      The fresh-growth path already reset both to `-1` before publishing `input_mask[i] = true`
+      (`mixer_tx_tag()` treats `-1` as "no tag", never dereferences it); the reuse branch didn't,
+      so a reused slot briefly exposed the *previous* occupant's still-valid-but-wrong source
+      indices to `mixer_tx_tag()` in the window between `mixer_connect_input()` publishing the
+      slot and `parse_outputs()` setting the real values a few lines later - a stale-but-not-unsafe
+      on-air tag for one tick, not a crash. Fixed by resetting both to `-1` in the reuse branch
+      too, matching the fresh-growth path's discipline exactly.
+
+41. **Channel teardown: safely reclaim leaked outputs/freqlist memory** (`src/live_reconfig.{cpp,h}`,
+    `src/output.cpp`, `src/test_live_reconfig.cpp`) — the fourth and hardest of the pre-merge-review
+    findings. `channel_teardown_for_removal()` (used by both item 30's removal and item 31's tail-
+    replace edit) deliberately left `channel->outputs`/`freqlist`/`config_signature` and each
+    output's own `data` struct allocated forever, because freeing them immediately risked a real
+    use-after-free: `output_check_thread()` and the demod thread's per-channel loop both gate their
+    access on `channel->enabled` (`std::atomic<bool>`, set false first) before touching this memory,
+    but that only narrows the risk window, it doesn't close it — a reader that already observed
+    `enabled == true` and is mid-access when the free happens has no synchronization stopping it.
+    Investigating this surfaced a **third, unguarded reader** beyond the two originally scoped:
+    `write_stats_file()`'s (`output.cpp`) per-channel metrics loop iterates `channel->freqlist`
+    unconditionally, with no `enabled` check at all — the widest, least-protected exposure of the
+    three, on a 15-second cycle (`STATS_FILE_TIMING`).
+    - **Rejected approach**: a generation/epoch counter synchronized against every reader thread
+      (demod, `output_check_thread`, `write_stats_file`, each with a different cadence and, for the
+      stats writer, no existing gate to build on) — correct in principle, but would have required
+      touching multiple hot-path loops for a fix whose entire point is closing a memory-safety gap,
+      not a performance-critical primitive.
+    - **The fix**: a deferred, time-based reclamation queue, entirely private to `live_reconfig.cpp`
+      and drained by `output_thread()` (`output.cpp`) — the same thread that already exclusively
+      owns this memory via `channel_teardown_for_removal()`. Teardown now captures
+      `outputs`/`output_count`/`freqlist`/`freq_count`/`config_signature` into a
+      `PendingChannelFree` entry (timestamped, pushed under a small `pthread_mutex_t`) instead of
+      freeing them — `channel->outputs`/`freqlist`/`config_signature` are deliberately left pointing
+      at this still-valid memory in the meantime, so a slot reused by a later `parse_channel()` call
+      (an edit, not just a removal) simply overwrites the pointers with fresh ones; the old values
+      are already safely captured. `reclaim_pending_channel_frees()`, called once per
+      `output_thread()` pass (a lock-free `std::atomic<size_t>` size check makes this a no-op on the
+      overwhelming majority of passes, when nothing is queued), actually frees anything whose
+      `reclaim_grace_period_sec` (30s in production — comfortably more than double
+      `STATS_FILE_TIMING`, since `write_stats_file()` itself runs to completion in well under a
+      second, so any invocation in flight when a channel is torn down is long finished by the time
+      this elapses) has passed. `lame`/`lamebuf` are unaffected — those still free immediately, as
+      before this item, since neither `output_check_thread()` nor `write_stats_file()` ever touches
+      them.
+    - **`free_output_data()`** (`live_reconfig.cpp`, anonymous namespace) mirrors, in reverse, every
+      heap allocation `parse_outputs()` (`config.cpp`) makes per output type: `icecast_data`/
+      `udp_stream_data`/`pulse_data` are `XCALLOC`'d with individually `strdup()`'d string fields
+      (plain `free()`, `const_cast` needed since the struct fields are `const char*`); `file_data`
+      (and its nested `rdio_scanner_data`, if configured) are `new`'d with `std::string` members
+      (`delete`, not `free()` — a free()/delete mismatch here would itself be a heap-corruption bug
+      this fix exists to prevent); `mixer_data` owns no nested pointers (`mixer_t*` points at the
+      process-wide `mixers[]` array, never freed here). `freqlist[k].label` (`strdup()`'d,
+      `config.cpp`) is freed per-entry before the `freqlist` array itself.
+    - Unit tested in `src/test_live_reconfig.cpp`'s new `ReclaimPendingChannelFreesTest` fixture:
+      one test proves the queue/timing contract directly (`pending_channel_free_backlog()` — a new
+      test-only introspection hook, `reclaim_grace_period_sec` — a new test-only overridable global,
+      same rationale as `mixer_capacity_finalized`'s existing one — shrunk to make the grace period
+      deterministic instead of a real 30-second sleep); a second builds a channel with real,
+      fully-populated `icecast_data`/`file_data` (with nested `rdio_scanner_data`)/`udp_stream_data`/
+      `pulse_data` outputs — everything except `O_MIXER`, whose reclaim path has no type-specific
+      logic and is already covered by item 40's tests — and tears it down for real, with no
+      explicit memory assertion needed: a double-free, an allocator mismatch, or a buffer overflow
+      anywhere in `free_output_data()` would abort the whole test binary under ASan before reaching
+      the final `EXPECT`. Confirmed clean under ASan/UBSan **with LeakSanitizer enabled** (the full
+      suite otherwise runs with `detect_leaks=0` — unrelated pre-existing fixture leaks elsewhere —
+      but these two tests specifically were run leak-detection-on and reported none, positively
+      confirming the fix, not just "doesn't crash"). Existing tests that call
+      `channel_teardown_for_removal()` directly (`ChannelRemoveTest`) needed their `TearDown()`
+      updated to drain the pending-free queue (grace period forced to 0) before their own direct
+      `free()` calls, to avoid a cross-test double-free once a later test (this item's own) shrinks
+      `reclaim_grace_period_sec` and drains everything still queued from earlier tests in the same
+      process. All 222 tests (7 net new across items 40–41) pass across Debug, Debug+NFM,
+      `-DRDIO_SCANNER=OFF`, and ASan/UBSan. No hardware interaction (pure in-process memory
+      management), so verification was unit/system-test-only —
+      `system_tests/tests/test_channel_add.py`, `test_channel_edit.py`, `test_channel_remove.py`,
+      `test_control_socket.py`, `test_icecast_output.py`, and `test_rdio_scanner_output.py` all
+      still pass against rebuilt `Release`/`Release_nfm` binaries with `reclaim_pending_channel_
+      frees()` now running on every `output_thread()` pass in the real binary, not just the test
+      harness.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
@@ -652,3 +1548,7 @@ send-side pacing code; confirm with a wire capture first.
   feeding Broadcastify. Same VLAN as the SDR host, direct L2, no firewall in the path.
 - Per-instance channel configs live outside this repo and are not committed. Paste them into a
   session when they are relevant rather than adding them here.
+- Once an instance's config sets `control_socket_path` (`dynamic_reload`, item 27), its systemd
+  unit must set `User=`/`Group=` to a non-root service account — the control socket's
+  `SO_PEERCRED` check rejects any client whose UID doesn't match the daemon's own, so a
+  root-run daemon can only be controlled by root-run tooling.

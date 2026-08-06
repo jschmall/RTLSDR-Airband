@@ -26,9 +26,12 @@
 #include <cstdlib>
 #include <cstring>
 #include "config.h"
+#include "live_reconfig.h"  // reconnect_channel_outputs
 #include "rtl_airband.h"
 
 static char* err;
+
+bool mixer_capacity_finalized = false;
 
 static inline void mixer_set_error(const char* msg) {
     err = strdup(msg);
@@ -54,23 +57,89 @@ void mixer_disable(mixer_t* mixer) {
     disable_channel_outputs(&mixer->channel);
 }
 
+// Live-reenable counterpart to mixer_disable(), for the dynamic_reload control socket. Resets
+// every input's mask (undoing mixer_disable_input()'s bookkeeping - without this, the very next
+// normal squelch-close on any single input would immediately misfire the "all inputs died"
+// auto-disable in mixer_disable_input() below) and re-arms the mixer's own outputs, then flips
+// mixer->enabled last so no other thread observes a half-armed mixer as enabled.
+void mixer_enable(mixer_t* mixer) {
+    for (int i = 0; i < mixer->input_count; i++) {
+        mixer->input_mask[i] = true;
+        mixer->inputs_todo[i] = true;
+    }
+    reconnect_channel_outputs(&mixer->channel);
+    mixer->enabled = true;
+}
+
 int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance) {
     if (!mixer) {
         mixer_set_error("mixer is undefined");
         return (-1);
     }
+    // Reclaim a permanently-vacated slot before consuming new capacity, if one exists. Only ever
+    // set by mixer_disable_input(..., permanent=true) - see input_removed's comment (rtl_airband.h)
+    // - so a slot found here is guaranteed to have input_mask[j] already false and its mutex still
+    // valid (never destroyed, only ever masked off), same invariant a fresh slot has right before
+    // this function first publishes it. Reusing it does not touch input_capacity/reserve_inputs at
+    // all, which is the whole point: a live-edited channel (item 30) no longer burns a fresh
+    // reserve_inputs slot on every edit.
+    for (int j = 0; j < mixer->input_count; j++) {
+        if (!mixer->input_removed[j]) {
+            continue;
+        }
+        mixer->inputs[j].ampfactor = ampfactor;
+        mixer->inputs[j].ampl = fminf(1.0f, 1.0f - balance);
+        mixer->inputs[j].ampr = fminf(1.0f, 1.0f + balance);
+        if (balance != 0.0f)
+            mixer->channel.mode = MM_STEREO;
+        mixer->inputs[j].ready = false;
+        mixer->inputs[j].has_signal = false;
+        mixer->inputs[j].input_overrun_count = 0;
+        // Reset to the same "not yet resolved" sentinel the fresh-slot path below uses -
+        // otherwise a reused slot would transiently expose the PREVIOUS occupant's source
+        // indices to process_outputs()'s send_tx_tags lookup (mixer_tx_tag()) in the brief
+        // window between this function publishing input_mask[j] and parse_outputs() (config.cpp)
+        // setting the real values for the new occupant right after. -1 is treated as "no tag" by
+        // mixer_tx_tag(), not dereferenced.
+        mixer->inputs[j].source_device_idx = -1;
+        mixer->inputs[j].source_channel_idx = -1;
+        mixer->inputs_todo[j] = true;
+        // Publish last, same discipline as the fresh-slot path below: mixer_thread() only reads
+        // input_mask[j] first (short-circuiting before touching input->ready/wavein), so nothing
+        // else needs to be valid until this flips true.
+        mixer->input_mask[j] = true;
+        mixer->input_removed[j] = false;
+        mixer->enabled = true;
+        debug_print("reused input slot %d: ampfactor=%.1f ampl=%.1f ampr=%.1f\n", j, mixer->inputs[j].ampfactor, mixer->inputs[j].ampl, mixer->inputs[j].ampr);
+        return j;
+    }
+
     int i = mixer->input_count;
 
-    // allocate new mixer - this could be more efficient by pre-allocating but this
-    // is only run at startup so not a big deal
-    if (mixer->inputs == NULL) {
-        mixer->inputs = (mixinput_t*)XCALLOC(i + 1, sizeof(struct mixinput_t));
-        mixer->inputs_todo = (bool*)XCALLOC(i + 1, sizeof(bool));
-        mixer->input_mask = (bool*)XCALLOC(i + 1, sizeof(bool));
-    } else {
-        mixer->inputs = (mixinput_t*)XREALLOC(mixer->inputs, (i + 1) * sizeof(struct mixinput_t));
-        mixer->inputs_todo = (bool*)XREALLOC(mixer->inputs_todo, (i + 1) * sizeof(bool));
-        mixer->input_mask = (bool*)XREALLOC(mixer->input_mask, (i + 1) * sizeof(bool));
+    if (i >= mixer->input_capacity) {
+        if (mixer_capacity_finalized) {
+            // Past the single-threaded startup window (mixer_finalize_capacity() already ran) -
+            // mixer_thread()/mixer_put_samples() may be reading inputs/input_count right now, so
+            // growing via realloc here would be a use-after-free. This is a live append
+            // (dynamic_reload reload_diff) with insufficient reserve_inputs headroom - reject it
+            // instead, same shape as device_t::channel_capacity being exceeded.
+            mixer_set_error("mixer input capacity exceeded - increase reserve_inputs for this mixer");
+            return (-1);
+        }
+        // Still startup (parse_devices() hasn't finished / mixer_finalize_capacity() hasn't run
+        // yet) - no other thread exists yet, so growing here is safe, same as before this fix.
+        if (mixer->inputs == NULL) {
+            mixer->inputs = (mixinput_t*)XCALLOC(i + 1, sizeof(struct mixinput_t));
+            mixer->inputs_todo = (bool*)XCALLOC(i + 1, sizeof(bool));
+            mixer->input_mask = (bool*)XCALLOC(i + 1, sizeof(bool));
+            mixer->input_removed = (bool*)XCALLOC(i + 1, sizeof(bool));
+        } else {
+            mixer->inputs = (mixinput_t*)XREALLOC(mixer->inputs, (i + 1) * sizeof(struct mixinput_t));
+            mixer->inputs_todo = (bool*)XREALLOC(mixer->inputs_todo, (i + 1) * sizeof(bool));
+            mixer->input_mask = (bool*)XREALLOC(mixer->input_mask, (i + 1) * sizeof(bool));
+            mixer->input_removed = (bool*)XREALLOC(mixer->input_removed, (i + 1) * sizeof(bool));
+        }
+        mixer->input_capacity = i + 1;
     }
 
     mixer->inputs[i].wavein = (float*)XCALLOC(WAVE_LEN, sizeof(float));
@@ -89,17 +158,77 @@ int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance) {
     mixer->inputs[i].source_device_idx = -1;
     mixer->inputs[i].source_channel_idx = -1;
     mixer->input_mask[i] = true;
+    mixer->input_removed[i] = false;
     mixer->inputs_todo[i] = true;
     mixer->enabled = true;
     debug_print("ampfactor=%.1f ampl=%.1f ampr=%.1f\n", mixer->inputs[i].ampfactor, mixer->inputs[i].ampl, mixer->inputs[i].ampr);
-    return (mixer->input_count++);
+    mixer->input_count.store(i + 1, std::memory_order_release);
+    return i;
 }
 
-void mixer_disable_input(mixer_t* mixer, int input_idx) {
+// Called once from main(), after parse_devices() returns (so every startup channel's mixer
+// output has had a chance to connect) and before any thread is created. Reserves reserve_inputs
+// extra headroom on top of whatever connected during startup and locks inputs/inputs_todo/
+// input_mask in place for good - after this, mixer_connect_input() never reallocates, which is
+// what makes a later live append (dynamic_reload reload_diff) safe with no lock.
+void mixer_finalize_capacity() {
+    for (int m = 0; m < mixer_count; m++) {
+        mixer_t* mixer = &mixers[m];
+        int old_count = mixer->input_count;
+        int new_capacity = old_count + mixer->reserve_inputs;
+        if (new_capacity == 0) {
+            // No inputs connected at startup and no headroom reserved - leave everything NULL.
+            // realloc(ptr, 0) can return NULL, which xrealloc() treats as fatal OOM; skip it.
+            mixer->input_capacity = 0;
+        } else if (mixer->inputs == NULL) {
+            // A live-append-only mixer: zero inputs connected at startup, but reserve_inputs > 0.
+            mixer->inputs = (mixinput_t*)XCALLOC(new_capacity, sizeof(struct mixinput_t));
+            mixer->inputs_todo = (bool*)XCALLOC(new_capacity, sizeof(bool));
+            mixer->input_mask = (bool*)XCALLOC(new_capacity, sizeof(bool));
+            mixer->input_removed = (bool*)XCALLOC(new_capacity, sizeof(bool));
+            mixer->input_capacity = new_capacity;
+        } else if (new_capacity > mixer->input_capacity) {
+            mixer->inputs = (mixinput_t*)XREALLOC(mixer->inputs, new_capacity * sizeof(struct mixinput_t));
+            mixer->inputs_todo = (bool*)XREALLOC(mixer->inputs_todo, new_capacity * sizeof(bool));
+            mixer->input_mask = (bool*)XREALLOC(mixer->input_mask, new_capacity * sizeof(bool));
+            mixer->input_removed = (bool*)XREALLOC(mixer->input_removed, new_capacity * sizeof(bool));
+            // XREALLOC, unlike XCALLOC, does not zero the newly grown tail. mixinput_t now has a
+            // non-trivial has_signal (std::atomic<bool>) member, so it can no longer be memset -
+            // zero/reset each new slot's fields individually instead. mutex is deliberately left
+            // alone: mixer_connect_input() always pthread_mutex_init()s it the first time a slot
+            // is actually claimed (fresh-growth or reuse), so it's never relied on being
+            // pre-zeroed here.
+            for (int k = old_count; k < new_capacity; k++) {
+                mixer->inputs[k].wavein = NULL;
+                mixer->inputs[k].ampfactor = 0.0f;
+                mixer->inputs[k].ampl = 0.0f;
+                mixer->inputs[k].ampr = 0.0f;
+                mixer->inputs[k].ready = false;
+                mixer->inputs[k].has_signal = false;
+                mixer->inputs[k].input_overrun_count = 0;
+                mixer->inputs[k].source_device_idx = -1;
+                mixer->inputs[k].source_channel_idx = -1;
+            }
+            memset(mixer->inputs_todo + old_count, 0, mixer->reserve_inputs * sizeof(bool));
+            memset(mixer->input_mask + old_count, 0, mixer->reserve_inputs * sizeof(bool));
+            memset(mixer->input_removed + old_count, 0, mixer->reserve_inputs * sizeof(bool));
+            mixer->input_capacity = new_capacity;
+        }
+    }
+    mixer_capacity_finalized = true;
+}
+
+void mixer_disable_input(mixer_t* mixer, int input_idx, bool permanent) {
     assert(mixer);
     assert(input_idx < mixer->input_count);
 
     mixer->input_mask[input_idx] = false;
+    if (permanent) {
+        // Tombstone the slot for mixer_connect_input() to reclaim - see input_removed's comment
+        // (rtl_airband.h). Set before the "all inputs died" check below so a mixer whose last
+        // remaining input is permanently removed correctly disables either way.
+        mixer->input_removed[input_idx] = true;
+    }
 
     // break out if any inputs remain true
     for (int i = 0; i < mixer->input_count; i++) {
@@ -111,6 +240,12 @@ void mixer_disable_input(mixer_t* mixer, int input_idx) {
     // all inputs are false so disable the mixer
     log(LOG_NOTICE, "Disabling mixer '%s' - all inputs died\n", mixer->name);
     mixer_disable(mixer);
+}
+
+void mixer_enable_input(mixer_t* mixer, int input_idx) {
+    assert(mixer);
+    assert(input_idx < mixer->input_count);
+    mixer->input_mask[input_idx] = true;
 }
 
 void mixer_put_samples(mixer_t* mixer, int input_idx, const float* samples, bool has_signal, unsigned int len) {

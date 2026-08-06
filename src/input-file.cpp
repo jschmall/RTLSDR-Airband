@@ -178,6 +178,7 @@ MODULE_EXPORT input_t* file_input_new() {
     input->fullscale = (float)SCHAR_MAX - 0.5f;
     input->bytes_per_sample = sizeof(unsigned char);
     input->sample_rate = 0;
+    input->driver_type = "file";
     input->parse_config = &file_parse_config;
     input->init = &file_init;
     input->run_rx_thread = &file_rx_thread;

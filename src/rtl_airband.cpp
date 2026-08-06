@@ -59,7 +59,9 @@
 #include <ctime>
 #include <iostream>
 #include <libconfig.h++>
+#include "control_socket.h"
 #include "input-common.h"
+#include "live_reconfig.h"
 #include "logging.h"
 #include "rtl_airband.h"
 #include "squelch.h"
@@ -86,6 +88,10 @@ bool log_scan_activity = false;
 char* stats_filepath = NULL;
 char* stats_http_address = NULL;
 int stats_http_port = 0;
+char* control_socket_path = NULL;
+#pragma GCC diagnostic ignored "-Wwrite-strings"
+char* cfgfile = CFGFILE;  // overridden by -c; promoted to global so reload_diff (control_socket.cpp) can re-read the same path
+#pragma GCC diagnostic warning "-Wwrite-strings"
 #ifdef WITH_RDIO_SCANNER
 int rdio_scanner_queue_depth = 64;  // matches the previous hardcoded MAX_QUEUE_DEPTH
 #endif                              /* WITH_RDIO_SCANNER */
@@ -132,7 +138,11 @@ void* controller_thread(void* params) {
                 dev->channels[0].freq_idx = i;
                 new_centerfreq = dev->channels[0].freqlist[i].frequency + 20 * (double)(dev->input->sample_rate / fft_size);
                 if (input_set_centerfreq(dev->input, new_centerfreq) < 0) {
-                    break;
+                    // A transient hardware retune failure doesn't mean scanning should stop
+                    // permanently for this device - see input_set_centerfreq()'s comment
+                    // (input-common.cpp). Stay in the loop; the next hop attempt in ~200ms is
+                    // the retry.
+                    log(LOG_WARNING, "Failed to retune to %d Hz during frequency scan, will retry on next hop\n", new_centerfreq);
                 }
             }
         } else {
@@ -433,6 +443,34 @@ void* demodulate(void* params) {
             continue;
         }
 
+        int pending_retune = dev->pending_centerfreq_request.load(std::memory_order_acquire);
+        if (pending_retune >= 0) {
+            // Not consumed via exchange(): a control socket thread polling pending_centerfreq_request
+            // must not observe "consumed" until centerfreq_apply_failed already reflects this
+            // attempt's actual result - see both fields' comments (rtl_airband.h).
+            bool ok = device_apply_retune(dev, pending_retune);
+            dev->centerfreq_apply_failed.store(!ok, std::memory_order_release);
+            dev->pending_centerfreq_request.store(-1, std::memory_order_release);
+        }
+
+        int pending_sample_rate = dev->pending_sample_rate_request.load(std::memory_order_acquire);
+        if (pending_sample_rate >= 0) {
+            // Same "publish result before clearing the request" discipline as
+            // pending_centerfreq_request above (see both fields' comments, rtl_airband.h). Unlike
+            // centerfreq, a sample_rate change touches input->buffer/buf_size/bufs/bufe (see
+            // device_apply_sample_rate(), live_reconfig.cpp) - `available`, computed above from
+            // the pre-change buffer state, is no longer valid afterward, so this always moves on
+            // to the next device rather than falling through to the bps/available check below,
+            // regardless of whether the change succeeded, was rolled back, or failed outright. The
+            // next round-robin pass over this device recomputes `available` fresh from the top of
+            // this loop.
+            bool ok = device_apply_sample_rate(dev, pending_sample_rate);
+            dev->sample_rate_apply_failed.store(!ok, std::memory_order_release);
+            dev->pending_sample_rate_request.store(-1, std::memory_order_release);
+            device_num = next_device(demod_params, device_num);
+            continue;
+        }
+
         // number of input bytes per output wave sample (x 2 for I and Q)
         size_t bps = 2 * dev->input->bytes_per_sample * (size_t)round((double)dev->input->sample_rate / (double)WAVE_RATE);
         if (available < bps * FFT_BATCH + fft_size * dev->input->bytes_per_sample * 2) {
@@ -537,8 +575,11 @@ void* demodulate(void* params) {
 
         if (dev->waveend >= WAVE_BATCH + AGC_EXTRA) {
             for (int i = 0; i < dev->channel_count; i++) {
-                AFC afc(dev, i);
                 channel_t* channel = dev->channels + i;
+                if (!channel->enabled) {
+                    continue;
+                }
+                AFC afc(dev, i);
                 freq_t* fparms = channel->freqlist + channel->freq_idx;
 
                 // set to NO_SIGNAL, will be updated to SIGNAL based on squelch below
@@ -749,7 +790,6 @@ int main(int argc, char* argv[]) {
 #endif /* WITH_PROFILING */
 
 #pragma GCC diagnostic ignored "-Wwrite-strings"
-    char* cfgfile = CFGFILE;
     char* pidfile = PIDFILE;
 #pragma GCC diagnostic warning "-Wwrite-strings"
 
@@ -888,6 +928,9 @@ int main(int argc, char* argv[]) {
                 error();
             }
         }
+        if (root.exists("control_socket_path")) {
+            control_socket_path = strdup(root["control_socket_path"]);
+        }
 #ifdef WITH_RDIO_SCANNER
         if (root.exists("rdio_scanner_queue_depth")) {
             rdio_scanner_queue_depth = (int)root["rdio_scanner_queue_depth"];
@@ -951,11 +994,29 @@ int main(int argc, char* argv[]) {
             error();
         }
         device_count = devs_enabled;
+
+        // mixer_t::enabled is auto-managed by mixer_connect_input() and becomes true as soon as
+        // any channel's mixer output connects, which only happens during the parse_devices()
+        // call above - so a config-time "enabled = false" on the mixer itself can only be
+        // applied now, after every connection has had a chance to happen.
+        for (int m = 0; m < mixer_count; m++) {
+            if (mixers[m].config_wants_disabled && mixers[m].enabled) {
+                mixer_disable(&mixers[m]);
+            }
+        }
+
+        // Must run after every startup channel's mixer output has had a chance to connect
+        // (parse_devices() above) and before any thread is created (first pthread_create() is
+        // further below) - reserves each mixer's configured reserve_inputs headroom and stops
+        // mixer_connect_input() from ever reallocating again, which is what makes a later live
+        // append (dynamic_reload reload_diff) safe. See mixer_finalize_capacity() (mixer.cpp).
+        mixer_finalize_capacity();
+
         debug_print("mixer_count=%d\n", mixer_count);
 #ifdef DEBUG
         for (int z = 0; z < mixer_count; z++) {
             mixer_t* m = &mixers[z];
-            debug_print("mixer[%d]: name=%s, input_count=%d, output_count=%d\n", z, m->name, m->input_count, m->channel.output_count);
+            debug_print("mixer[%d]: name=%s, input_count=%d, output_count=%d\n", z, m->name, (int)m->input_count, m->channel.output_count);
         }
 #endif /* DEBUG */
     } catch (const FileIOException& e) {
@@ -1019,9 +1080,18 @@ int main(int argc, char* argv[]) {
     }
 
     for (int i = 0; i < mixer_count; i++) {
-        if (mixers[i].enabled == false) {
-            continue;  // no inputs connected = no need to initialize output
-        }
+        // Previously skipped when mixers[i].enabled was false ("no inputs connected = no need to
+        // initialize output"), which was safe before dynamic_reload: a mixer with zero startup
+        // inputs could never gain any, so its own output was genuinely never going to be used.
+        // That's no longer true - a mixer declared with reserve_inputs headroom (rtl_airband.h's
+        // mixer_t::input_capacity comment) can start with zero inputs and gain its first one live
+        // later (mixer_connect_input() then flips enabled to true, mixer.cpp), at which point its
+        // own output must already be initialized for mixer_thread()/the output thread to have
+        // anything to write through. Always initializing here also happens to fix the same gap
+        // for a mixer with `enabled = false` in its own config block that has startup-connected
+        // inputs - see the mixer_disable() loop right above, which otherwise leaves the mixer
+        // disabled by the time this loop used to check it, permanently skipping init. Matches
+        // device channels below, which have never had this skip.
         channel_t* channel = &mixers[i].channel;
         for (int k = 0; k < channel->output_count; k++) {
             output_t* output = channel->outputs + k;
@@ -1156,6 +1226,10 @@ int main(int argc, char* argv[]) {
 
     stats_http_start();
 
+    if (control_socket_path) {
+        control_socket_start(control_socket_path);
+    }
+
     sincosf_lut_init();
 
     // Startup the demod threads
@@ -1217,6 +1291,7 @@ int main(int argc, char* argv[]) {
 #endif /* WITH_RDIO_SCANNER */
 
     stats_http_shutdown();
+    control_socket_shutdown();
 
     close_debug();
 #ifdef WITH_PROFILING

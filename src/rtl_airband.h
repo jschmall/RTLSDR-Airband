@@ -380,10 +380,67 @@ struct channel_t {
     int needs_raw_iq;
     int has_iq_outputs;
     std::atomic<ch_states> state;  // mixer channel state flag
+    // Live-disable flag for the dynamic_reload control socket. Read by the demod/output/
+    // controller threads with no lock, same rationale as axcindicate/freq_idx/state above - but
+    // unlike those, this is only ever WRITTEN by the output thread that owns this channel's
+    // outputs (device channels: the output thread serving that device; a mixer's own embedded
+    // channel: never toggled independently, see mixer_t::pending_enable_request instead), never
+    // directly by the control socket thread. Flipping it from another thread would race
+    // output_thread()'s own concurrent reads/writes to channel->outputs - see
+    // pending_enable_request below for how the control socket actually requests a change.
+    std::atomic<bool> enabled;
+    // Live enable/disable request from the dynamic_reload control socket: -1 = none pending,
+    // 0 = disable requested, 1 = enable requested. The control socket thread only ever stores
+    // into this (O(1), touches nothing else); output_thread() (src/output.cpp) polls and
+    // consumes it once per pass, in the same thread that already owns this channel's `enabled`
+    // flag and `outputs` array, so the actual channel_apply_enable()/channel_apply_disable()
+    // (src/live_reconfig.cpp) - which tear down/re-arm icecast, UDP, and pulse connections -
+    // never race that thread's own concurrent use of the same output_t structs.
+    std::atomic<int> pending_enable_request;
+    // Live removal request from the dynamic_reload control socket, posted only via reload_diff
+    // detecting a pure tail decrease in a device's channel count (see compute_and_apply_diff(),
+    // live_reconfig.cpp): -1 = none pending, 1 = removal requested. Same request/apply split and
+    // single-owning-thread rationale as pending_enable_request above, but with one deliberate
+    // difference: unlike enable/disable (which only flips a flag and reconnects/closes network
+    // handles the output thread already exclusively owns), removal frees this channel's LAME
+    // encoder. output_thread() (src/output.cpp) does NOT reset this to -1 the moment it observes
+    // the request - only after channel_teardown_for_removal() (live_reconfig.cpp) has fully
+    // finished, since a caller (try_remove_channels(), live_reconfig.cpp) that decrements
+    // dev->channel_count as soon as it sees an early completion signal would be doing so while
+    // frees are potentially still in flight.
+    std::atomic<int> pending_remove_request;
+    // Permanent tombstone, set by channel_teardown_for_removal() (live_reconfig.cpp) once a
+    // removal has actually completed (LAME encoder freed) - reset to false only by parse_channel()
+    // (config.cpp), when a fresh channel is parsed into this slot (startup, or a later live
+    // append reusing this index after a successful removal). Exists because
+    // try_remove_channels() (live_reconfig.cpp) can give up waiting on a slow/stuck output thread
+    // and return without decrementing dev->channel_count, leaving this index looking "still live"
+    // to anything bounds-checking against channel_count (get_device_and_channel(),
+    // control_socket.cpp) even though the removal is either in flight or has already actually
+    // completed. Checked together with pending_remove_request (!= -1 means a removal is currently
+    // in flight) so a direct channel_enable/channel_disable command can never be issued against a
+    // channel whose removal was requested, whether or not the output thread has gotten to it yet
+    // - the alternative (letting it through) is a real crash: channel_apply_enable() never
+    // reallocates the LAME encoder channel_teardown_for_removal() already freed, so the next
+    // process_outputs() pass calls into LAME with a null encoder. Also checked by
+    // compute_and_apply_diff()'s common-prefix signature walk (live_reconfig.cpp), so reverting a
+    // config edit back to a tombstoned channel's exact original definition doesn't look like "no
+    // change" and get silently skipped - a tombstoned index is always treated as diverged,
+    // forcing it to be retried rather than left permanently dead.
+    std::atomic<bool> removed;
     int output_count;
     output_t* outputs;
     int highpass;  // highpass filter cutoff
     int lowpass;   // lowpass filter cutoff
+    // Canonical serialization of this channel's raw config block (everything except "enabled",
+    // which is diffed/applied separately - see build_channel_identity_signature()'s comment,
+    // config.cpp), set once by parse_channel() (shared by startup and dynamic_reload's live
+    // append/replace path). compute_and_apply_diff() (live_reconfig.cpp) compares this against a
+    // freshly re-read config's own signature for the same index to detect ANY change to an
+    // existing channel - not just a count change - and replace (tear down + re-append) exactly
+    // the channels that actually differ. NULL only for a mixer's own embedded channel (mixer->
+    // channel never goes through parse_channel(), and is never itself replaceable this way).
+    char* config_signature;
 };
 
 enum rec_modes { R_MULTICHANNEL, R_SCAN };
@@ -392,7 +449,19 @@ struct device_t {
 #ifdef NFM
     float alpha;
 #endif /* NFM */
-    int channel_count;
+    // Number of live channels. Grown at runtime (dynamic channel add via reload_diff) up to
+    // channel_capacity by writing a new channel into an already-allocated, already-zeroed slot
+    // and then publishing this count - see compute_and_apply_diff() (live_reconfig.cpp). Every
+    // existing "for (int j = 0; j < dev->channel_count; j++)" loop re-reads this fresh each pass
+    // (never caches it across passes), so the implicit atomic->int conversion means no call site
+    // needs to change.
+    std::atomic<int> channel_count;
+    // Allocated size of channels/bins/base_bins - channel_count plus the device's configured
+    // reserve_channels headroom (config.cpp). Fixed once at startup in parse_devices() and never
+    // changed again; channel_count can grow up to this value without ever reallocating the
+    // arrays below, which is what makes runtime growth safe with no lock: a demod/output thread
+    // reading through channels/bins/base_bins never sees the block move.
+    int channel_capacity;
     size_t *base_bins, *bins;
     channel_t* channels;
     // FIXME: size_t
@@ -405,6 +474,35 @@ struct device_t {
     pthread_mutex_t tag_queue_lock;
     int row;
     int failed;
+    // Live centerfreq retune request from the dynamic_reload control socket thread. -1 means no
+    // pending request. The demod thread that owns this device (and already exclusively owns
+    // bins/base_bins/dm_dphi for AFC's own in-place adjustments, see the AFC class above) polls
+    // and consumes this once per pass, so the actual bins/base_bins/dm_dphi recompute happens
+    // in-thread with plain assignments - no cross-thread synchronization needed on those fields.
+    std::atomic<int> pending_centerfreq_request;
+    // Set by the demod thread (device_apply_retune()'s caller, rtl_airband.cpp) to the actual
+    // outcome of the request above - true on failure, false on success - and published BEFORE
+    // pending_centerfreq_request is reset to -1, not concurrently with it. Mirrors why
+    // channel_t::pending_remove_request is a field separate from pending_enable_request (see its
+    // comment below): a control-socket thread polling for "request consumed" must see a result
+    // that already reflects whether the hardware call actually succeeded, not just that the
+    // demod thread picked the request up.
+    std::atomic<bool> centerfreq_apply_failed;
+    // Live sample_rate change request, same request/apply split as pending_centerfreq_request
+    // above but heavier: the demod thread must stop this device's RX thread, reopen the hardware
+    // at the new rate, resize the input buffer, and recompute every channel's
+    // bins/base_bins/dm_dphi - see device_apply_sample_rate() (live_reconfig.cpp) for the full
+    // sequence, including its rollback-to-the-old-rate-on-failure behavior. -1 means no pending
+    // request.
+    std::atomic<int> pending_sample_rate_request;
+    // Set by the demod thread to the actual outcome - true if the requested rate was rejected
+    // (regardless of whether rollback to the old rate succeeded), published BEFORE
+    // pending_sample_rate_request is reset to -1, same ordering discipline as
+    // centerfreq_apply_failed above. A caller that wants to know whether the device survived a
+    // rejected request (rollback succeeded, still running at the old rate) vs. is now genuinely
+    // down (rollback also failed) should check input->state separately - only the latter case
+    // sets INPUT_FAILED.
+    std::atomic<bool> sample_rate_apply_failed;
     enum rec_modes mode;
     size_t output_overrun_count;
 };
@@ -435,12 +533,54 @@ struct mixinput_t {
 struct mixer_t {
     const char* name;
     bool enabled;
+    // Config-file "enabled = false" intent for the dynamic_reload control socket. `enabled`
+    // above is auto-managed by mixer_connect_input()/mixer_disable_input() and always becomes
+    // true as soon as any input connects, so a config-time "start disabled" request has to be
+    // applied as a post-parse step, after all channels' mixer outputs have connected - see
+    // main()'s call to mixer_disable() for every mixer with config_wants_disabled set, right
+    // after parse_devices() returns.
+    bool config_wants_disabled;
+    // Live enable/disable request from the dynamic_reload control socket: -1 = none pending,
+    // 0 = disable requested, 1 = enable requested. Same rationale as
+    // channel_t::pending_enable_request - `enabled`, `inputs_todo`/`input_mask`, and this
+    // mixer's own outputs are all touched by whichever output thread owns this mixer's range
+    // (output_thread(), src/output.cpp), so a mixer_enable()/mixer_disable() call from the
+    // control socket thread itself would race that thread's concurrent use of the same state.
+    // The control socket only ever stores into this; output_thread() polls and consumes it.
+    std::atomic<int> pending_enable_request;
     int interval;
     size_t output_overrun_count;
-    int input_count;
+    // Number of connected inputs. Grown at runtime (dynamic channel add via reload_diff, when an
+    // appended channel's output is `type = "mixer"`) up to input_capacity by writing into an
+    // already-allocated, already-zeroed slot and then publishing this count - see
+    // mixer_connect_input() (mixer.cpp) and device_t::channel_count's comment above for the same
+    // pattern applied to device channels. Every existing "for (j=0;j<mixer->input_count;j++)"
+    // loop re-reads this fresh each pass, so the implicit atomic->int conversion means no call
+    // site needs to change.
+    std::atomic<int> input_count;
+    // Allocated size of inputs/inputs_todo/input_mask - input_count plus this mixer's configured
+    // reserve_inputs headroom. Unlike device_t::channel_capacity (sized upfront from a known
+    // config list length), a mixer's inputs are discovered incrementally as parse_devices() walks
+    // every device channel's outputs, so this is only fixed once, by mixer_finalize_capacity()
+    // (mixer.cpp), called from main() after parse_devices() returns and before any thread starts.
+    // From that point on, input_count can grow up to this value without ever reallocating the
+    // arrays below, which is what makes runtime growth safe with no lock.
+    int input_capacity;
+    // reserve_inputs from this mixer's config block (default 0), set once by parse_mixers() and
+    // consumed once by mixer_finalize_capacity() - not read again after that.
+    int reserve_inputs;
     mixinput_t* inputs;
     bool* inputs_todo;
     bool* input_mask;
+    // Parallel to input_mask, but permanent-removal-only: set by mixer_disable_input(...,
+    // permanent=true) (a channel actually being torn down, not just disabled) and cleared only
+    // when mixer_connect_input() reclaims that slot for a new input. input_mask alone can't carry
+    // this distinction - it's also flipped false/true by ordinary temporary disable/re-enable
+    // (mixer_disable()/mixer_enable(), channel_apply_disable()/channel_apply_enable()), which must
+    // NOT free the slot, since the same channel is expected to reconnect to the same index later.
+    // Without this, every live-edited mixer-connected channel (item 30) permanently burned a new
+    // reserve_inputs slot instead of reusing the one its previous definition vacated.
+    bool* input_removed;
     channel_t channel;
 };
 
@@ -471,7 +611,10 @@ extern char const* RTL_AIRBAND_VERSION;
 lame_t airlame_init(mix_modes mixmode, int highpass, int lowpass);
 void shout_setup(icecast_data* icecast, mix_modes mixmode);
 void disable_device_outputs(device_t* dev);
-void disable_channel_outputs(channel_t* channel);
+// permanent=true means the owning channel is being torn down for good (channel_teardown_for_
+// removal(), live_reconfig.cpp), not just temporarily disabled - see mixer_disable_input()'s
+// comment (mixer.cpp) for why that distinction matters for its O_MIXER-type outputs.
+void disable_channel_outputs(channel_t* channel, bool permanent = false);
 void* output_check_thread(void* params);
 void* output_thread(void* params);
 
@@ -482,6 +625,8 @@ extern bool multiple_output_threads;
 extern char* stats_filepath;
 extern char* stats_http_address;
 extern int stats_http_port;
+extern char* control_socket_path;
+extern char* cfgfile;
 #ifdef WITH_RDIO_SCANNER
 extern int rdio_scanner_queue_depth;
 #endif /* WITH_RDIO_SCANNER */
@@ -492,6 +637,14 @@ extern volatile int do_exit, device_opened;
 extern float alpha;
 extern device_t* devices;
 extern mixer_t* mixers;
+// Allocates output->lame/lamebuf and connects output->type-specific state (shout_setup()/
+// udp_stream_init()/pulse_setup()) - the "make this output actually ready to encode/send" step
+// that's otherwise only ever run once, at startup, right after parse_devices()/parse_mixers().
+// Shared with the dynamic_reload live channel-append path (live_reconfig.cpp), which must run
+// this for a brand-new channel's outputs before publishing it - unlike channel_apply_enable()'s
+// reconnect_channel_outputs() (live_reconfig.h), which assumes lame/lamebuf already exist from
+// this call and only redoes the connection.
+bool init_output(channel_t* channel, output_t* output);
 
 // util.cpp
 int atomic_inc(volatile int* pv);
@@ -513,9 +666,31 @@ float dBFS_to_level(const float& dBFS);
 float level_to_dBFS(const float& level);
 
 // mixer.cpp
+// Set once by mixer_finalize_capacity(), called from main() after parse_devices() returns and
+// before any thread starts. Before this point, mixer_connect_input() may still grow
+// inputs/inputs_todo/input_mask via realloc (safe - single-threaded startup); after this point it
+// never does, so a live-append attempt that would require growing past input_capacity is rejected
+// instead. A plain global (not a mixer.cpp file-static) so unit tests can reset it explicitly -
+// the unittests binary links every test_*.cpp into one process, and a file-static would leak
+// `true` across unrelated tests in link/registration order.
+extern bool mixer_capacity_finalized;
+void mixer_finalize_capacity();
 mixer_t* getmixerbyname(const char* name);
 int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance);
-void mixer_disable_input(mixer_t* mixer, int input_idx);
+// permanent=true (channel_teardown_for_removal(), via disable_channel_outputs()) tombstones the
+// slot in input_removed so a later mixer_connect_input() can reclaim it instead of consuming new
+// reserve_inputs headroom; permanent=false (ordinary disable) leaves the slot bound to the same
+// channel for a later mixer_enable_input() to re-arm.
+void mixer_disable_input(mixer_t* mixer, int input_idx, bool permanent = false);
+void mixer_enable_input(mixer_t* mixer, int input_idx);
+// mixer_disable()/mixer_enable() do the real work behind the dynamic_reload control socket's
+// mixer_disable/mixer_enable commands (and the shutdown-time/auto "all inputs died" path) - only
+// call these from the output thread that owns this mixer's range (output_thread(), output.cpp),
+// never directly from the control socket thread. See mixer_t::pending_enable_request and
+// live_reconfig.h's mixer_request_enable()/mixer_request_disable() for the thread-safe entry
+// point the control socket actually uses.
+void mixer_disable(mixer_t* mixer);
+void mixer_enable(mixer_t* mixer);
 void mixer_put_samples(mixer_t* mixer, int input_idx, const float* samples, bool has_signal, unsigned int len);
 void* mixer_thread(void* params);
 const char* mixer_get_error();
@@ -528,6 +703,18 @@ int mixer_select_active_tag_input(const mixinput_t* inputs, int input_count);
 // config.cpp
 int parse_devices(libconfig::Setting& devs);
 int parse_mixers(libconfig::Setting& mx);
+// Shared by parse_devices()'s startup path and dynamic_reload's live channel-append path
+// (live_reconfig.cpp) - see parse_channel()'s definition in config.cpp for the full contract,
+// including why it returns false for two pre-existing legacy-value quirks.
+bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx, int chan_idx, channel_t* channel);
+// Recursively serializes chan_setting's raw config fields (skipping "enabled" at the top level)
+// into a canonical string - see channel_t::config_signature's comment for why a whole-subtree
+// signature, rather than a hand-maintained list of individually-diffed fields, is what backs
+// dynamic_reload's live channel-replace detection: it captures every field a channel config can
+// have (freq, modulation, bandwidth, squelch, notch, ctcss, highpass/lowpass, outputs - including
+// arbitrarily nested output-type-specific blocks) with no risk of a future config option being
+// silently left out of the comparison.
+std::string build_channel_identity_signature(const libconfig::Setting& chan_setting);
 
 // udp_stream.cpp
 bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len);

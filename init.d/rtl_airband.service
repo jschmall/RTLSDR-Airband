@@ -6,11 +6,17 @@ After=network.target  # NOTE: `network-online.target` may be better for some use
 
 [Service]
 Type=simple
+User=<rtl-airband-service-account>
+Group=<rtl-airband-service-group>
 ExecStart=/usr/local/bin/rtl_airband -Fe
 # The program may exit only due to startup failure (eg. misconfiguration)
 # or due to failure of all SDR devices (eg. disconnection). In either case,
 # there is no point to restart it, because it would fail once again.
 Restart=no
+# User=/Group= are required, not optional, when control_socket_path is set:
+# the control socket only accepts connections whose UID matches the daemon's
+# own UID (SO_PEERCRED check in control_socket.cpp). Leaving this unset runs
+# the daemon as root, which locks out any non-root control-socket client.
 
 [Install]
 WantedBy=multi-user.target

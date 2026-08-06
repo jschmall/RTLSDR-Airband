@@ -85,23 +85,19 @@ static int rtlsdr_find_device_by_serial(char const* const s) {
     return -1;
 }
 
-int rtlsdr_init(input_t* const input) {
-    rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
-    if (dev_data->serial != NULL) {
-        dev_data->index = rtlsdr_find_device_by_serial(dev_data->serial);
-        if (dev_data->index < 0) {
-            cerr << "RTLSDR device with serial number " << dev_data->serial << " not found\n";
-            error();
-        }
-    }
+namespace {
 
-    dev_data->dev = NULL;
-    rtlsdr_open(&dev_data->dev, dev_data->index);
-    if (NULL == dev_data->dev) {
-        log(LOG_ERR, "Failed to open rtlsdr device #%d.\n", dev_data->index);
-        error();
-    }
-
+// The device-configuration half of rtlsdr_init() (everything after a successful rtlsdr_open()) -
+// factored out so rtlsdr_init() can guarantee dev_data->dev is closed on ANY failure exit from
+// this part, not just left open. That guarantee matters once error() can be non-fatal
+// (config_error_is_recoverable, live_reconfig.cpp's device_reopen_recoverable()): a live
+// sample_rate change's rollback attempt (device_apply_sample_rate()) calls rtlsdr_init() a SECOND
+// time after a first attempt failed, and a still-open handle from that failed first attempt makes
+// the rollback's own rtlsdr_open() fail too ("usb_claim_interface error", the interface is still
+// claimed) - a real failure mode found via real-hardware testing of the rollback path, not a
+// theoretical concern. At real startup, a failure here is always fatal anyway (error() exits the
+// whole process), so this cleanup is a no-op difference there.
+int rtlsdr_configure_opened_device(input_t* const input, rtlsdr_dev_data_t* const dev_data) {
     rtlsdr_dev_t* rtl = dev_data->dev;
     int r = rtlsdr_set_sample_rate(rtl, input->sample_rate);
     if (r < 0) {
@@ -118,6 +114,16 @@ int rtlsdr_init(input_t* const input) {
     r = rtlsdr_set_freq_correction(rtl, dev_data->correction);
     if (r < 0 && r != -2) {
         log(LOG_ERR, "Failed to set freq correction for device #%d. Error %d.\n", dev_data->index, r);
+        return -1;
+    }
+
+    // dev_data->bandwidth defaults to 0 (XCALLOC-zeroed) when "bandwidth" is absent from config,
+    // which librtlsdr treats as "automatic BW selection" - the same behavior this driver already
+    // had before bandwidth control existed here, so omitting the config key is fully backward
+    // compatible.
+    r = rtlsdr_set_tuner_bandwidth(rtl, (uint32_t)dev_data->bandwidth);
+    if (r < 0) {
+        log(LOG_ERR, "Failed to set tuner bandwidth for device #%d. Error %d.\n", dev_data->index, r);
         return -1;
     }
 
@@ -157,6 +163,40 @@ int rtlsdr_init(input_t* const input) {
     return 0;
 }
 
+}  // namespace
+
+int rtlsdr_init(input_t* const input) {
+    rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
+    if (dev_data->serial != NULL) {
+        dev_data->index = rtlsdr_find_device_by_serial(dev_data->serial);
+        if (dev_data->index < 0) {
+            cerr << "RTLSDR device with serial number " << dev_data->serial << " not found\n";
+            error();
+        }
+    }
+
+    dev_data->dev = NULL;
+    rtlsdr_open(&dev_data->dev, dev_data->index);
+    if (NULL == dev_data->dev) {
+        log(LOG_ERR, "Failed to open rtlsdr device #%d.\n", dev_data->index);
+        error();
+    }
+
+    int result = -1;
+    try {
+        result = rtlsdr_configure_opened_device(input, dev_data);
+    } catch (...) {
+        rtlsdr_close(dev_data->dev);
+        dev_data->dev = NULL;
+        throw;
+    }
+    if (result < 0) {
+        rtlsdr_close(dev_data->dev);
+        dev_data->dev = NULL;
+    }
+    return result;
+}
+
 void* rtlsdr_rx_thread(void* ctx) {
     input_t* input = (input_t*)ctx;
     rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
@@ -192,6 +232,56 @@ int rtlsdr_set_centerfreq(input_t* const input, int const centerfreq) {
     return 0;
 }
 
+int rtlsdr_set_gain(input_t* const input, float const gain) {
+    rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
+    assert(dev_data->dev != NULL);
+
+    int target_gain = (int)(gain * 10.0f);  // dev_data->gain is tenths of a dB, same as parse_config
+    int nearest_gain = 0;
+    if (rtlsdr_nearest_gain(dev_data->dev, target_gain, &nearest_gain) != true) {
+        log(LOG_ERR, "Failed to read supported gain list for device #%d\n", dev_data->index);
+        return -1;
+    }
+    int r = rtlsdr_set_tuner_gain(dev_data->dev, nearest_gain);
+    if (r < 0) {
+        log(LOG_ERR, "Failed to set gain to %0.2f for device #%d: error %d\n", (float)nearest_gain / 10.f, dev_data->index, r);
+        return -1;
+    }
+    dev_data->gain = nearest_gain;
+    log(LOG_INFO, "Device #%d: gain set to %0.2f dB\n", dev_data->index, (float)nearest_gain / 10.f);
+    return 0;
+}
+
+int rtlsdr_set_bandwidth(input_t* const input, int const bandwidth) {
+    rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
+    assert(dev_data->dev != NULL);
+
+    int r = rtlsdr_set_tuner_bandwidth(dev_data->dev, (uint32_t)bandwidth);
+    if (r < 0) {
+        log(LOG_ERR, "Failed to set bandwidth for RTLSDR device #%d: error %d\n", dev_data->index, r);
+        return -1;
+    }
+    dev_data->bandwidth = bandwidth;
+    log(LOG_INFO, "Device #%d: bandwidth set to %d Hz\n", dev_data->index, bandwidth);
+    return 0;
+}
+
+int rtlsdr_set_correction(input_t* const input, int const correction) {
+    rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
+    assert(dev_data->dev != NULL);
+
+    // -2 means "already at this value" (see rtlsdr_init()'s identical handling above) - not a
+    // real failure, just a no-op.
+    int r = rtlsdr_set_freq_correction(dev_data->dev, correction);
+    if (r < 0 && r != -2) {
+        log(LOG_ERR, "Failed to set freq correction for RTLSDR device #%d: error %d\n", dev_data->index, r);
+        return -1;
+    }
+    dev_data->correction = correction;
+    log(LOG_INFO, "Device #%d: freq correction set to %d ppm\n", dev_data->index, correction);
+    return 0;
+}
+
 int rtlsdr_parse_config(input_t* const input, libconfig::Setting& cfg) {
     rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
     if (cfg.exists("serial")) {
@@ -214,6 +304,13 @@ int rtlsdr_parse_config(input_t* const input, libconfig::Setting& cfg) {
     }
     if (cfg.exists("correction")) {
         dev_data->correction = (int)cfg["correction"];
+    }
+    if (cfg.exists("bandwidth")) {
+        dev_data->bandwidth = (int)cfg["bandwidth"];
+        if (dev_data->bandwidth < 0) {
+            cerr << "RTLSDR configuration error: bandwidth must be >= 0 (0 = automatic)\n";
+            error();
+        }
     }
     if (cfg.exists("buffers")) {
         dev_data->bufcnt = (int)(cfg["buffers"]);
@@ -248,10 +345,14 @@ MODULE_EXPORT input_t* rtlsdr_input_new() {
     input->fullscale = (float)SCHAR_MAX - 0.5f;
     input->bytes_per_sample = sizeof(unsigned char);
     input->sample_rate = RTLSDR_DEFAULT_SAMPLE_RATE;
+    input->driver_type = "rtlsdr";
     input->parse_config = &rtlsdr_parse_config;
     input->init = &rtlsdr_init;
     input->run_rx_thread = &rtlsdr_rx_thread;
     input->set_centerfreq = &rtlsdr_set_centerfreq;
+    input->set_gain = &rtlsdr_set_gain;
+    input->set_bandwidth = &rtlsdr_set_bandwidth;
+    input->set_correction = &rtlsdr_set_correction;
     input->stop = &rtlsdr_stop;
     return input;
 }

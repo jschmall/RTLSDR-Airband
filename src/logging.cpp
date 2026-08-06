@@ -31,8 +31,13 @@
 LogDestination log_destination = SYSLOG;
 bool log_json_format = false;
 FILE* debugf = NULL;
+thread_local bool config_error_is_recoverable = false;
 
 void error() {
+    if (config_error_is_recoverable) {
+        // Process keeps running - do not close_debug()/_Exit() as the normal path below does.
+        throw ConfigApplyError("configuration error");
+    }
     close_debug();
     _Exit(1);
 }

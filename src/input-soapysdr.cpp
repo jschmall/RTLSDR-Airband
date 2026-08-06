@@ -330,6 +330,38 @@ int soapysdr_set_centerfreq(input_t* const input, int const centerfreq) {
     return 0;
 }
 
+int soapysdr_set_gain(input_t* const input, float const gain) {
+    soapysdr_dev_data_t* dev_data = (soapysdr_dev_data_t*)input->dev_data;
+    assert(dev_data->dev != NULL);
+
+    // Live gain changes only support the single overall-gain model, not per-element gains (the
+    // "gain = <string of key=value pairs>" config form) - that stays config/restart-only.
+    if (SoapySDRDevice_setGainMode(dev_data->dev, SOAPY_SDR_RX, dev_data->channel, false) != 0) {
+        log(LOG_ERR, "Failed to disable AGC for SoapySDR device '%s': %s\n", dev_data->device_string, SoapySDRDevice_lastError());
+        return -1;
+    }
+    if (SoapySDRDevice_setGain(dev_data->dev, SOAPY_SDR_RX, dev_data->channel, (double)gain) != 0) {
+        log(LOG_ERR, "Failed to set gain for SoapySDR device '%s': %s\n", dev_data->device_string, SoapySDRDevice_lastError());
+        return -1;
+    }
+    dev_data->agc = false;
+    dev_data->gain = (double)gain;
+    log(LOG_INFO, "SoapySDR: device '%s': gain set to %.1f dB\n", dev_data->device_string, SoapySDRDevice_getGain(dev_data->dev, SOAPY_SDR_RX, dev_data->channel));
+    return 0;
+}
+
+int soapysdr_set_bandwidth(input_t* const input, int const bandwidth) {
+    soapysdr_dev_data_t* dev_data = (soapysdr_dev_data_t*)input->dev_data;
+    assert(dev_data->dev != NULL);
+
+    if (SoapySDRDevice_setBandwidth(dev_data->dev, SOAPY_SDR_RX, dev_data->channel, (double)bandwidth) != 0) {
+        log(LOG_ERR, "Failed to set bandwidth for SoapySDR device '%s': %s\n", dev_data->device_string, SoapySDRDevice_lastError());
+        return -1;
+    }
+    log(LOG_INFO, "SoapySDR: device '%s': bandwidth set to %.0f Hz\n", dev_data->device_string, SoapySDRDevice_getBandwidth(dev_data->dev, SOAPY_SDR_RX, dev_data->channel));
+    return 0;
+}
+
 MODULE_EXPORT input_t* soapysdr_input_new() {
     soapysdr_dev_data_t* dev_data = (soapysdr_dev_data_t*)XCALLOC(1, sizeof(soapysdr_dev_data_t));
     dev_data->gain = -1.0;  // invalid default gain value
@@ -357,10 +389,13 @@ MODULE_EXPORT input_t* soapysdr_input_new() {
     input->bytes_per_sample = 0;
     input->sample_rate = -1;
 
+    input->driver_type = "soapysdr";
     input->parse_config = &soapysdr_parse_config;
     input->init = &soapysdr_init;
     input->run_rx_thread = &soapysdr_rx_thread;
     input->set_centerfreq = &soapysdr_set_centerfreq;
+    input->set_gain = &soapysdr_set_gain;
+    input->set_bandwidth = &soapysdr_set_bandwidth;
     input->stop = NULL;
     return input;
 }
