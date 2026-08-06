@@ -658,6 +658,52 @@ Keep the local delta small and well understood.
       `system_tests/tests/test_channel_edit.py` (a squelch-threshold edit on a live channel is
       picked up, with a brief gap around the edit, while an untouched sibling channel is
       unaffected the whole time) and `test_channel_remove.py`'s rewritten non-tail-deletion test.
+31. **Live retune/gain/bandwidth failures no longer take down the whole process**
+    (`src/input-common.{cpp,h}`, `src/live_reconfig.{cpp,h}`, `src/control_socket.cpp`,
+    `src/rtl_airband.{cpp,h}`, `src/config.cpp`, `src/output.cpp`) — `input_set_centerfreq()`/
+    `input_set_gain()`/`input_set_bandwidth()` (item 26) unconditionally set
+    `input->state = INPUT_FAILED` on any nonzero return from the driver hook, including a single
+    transient hardware error (e.g. an i2c write failure, `r82xx_set_freq: failed=-9`) on a device
+    whose RX thread was running fine. `demodulate()`'s main loop (`rtl_airband.cpp`) treats
+    `INPUT_FAILED` as fatal for that device — and if it's the last device running, exits the whole
+    process ("All receivers failed, exiting"), found by hitting exactly this while testing a live
+    `retune` control-socket command against a real device. Two call paths hit this: the
+    dynamic_reload control socket's `retune`/`set_gain`/`set_bandwidth` commands, and `R_SCAN`'s
+    pre-existing `controller_thread()` frequency-hopping loop, which also permanently abandoned
+    that device's scan on the same failure (`break`). Fixed by no longer setting `INPUT_FAILED`
+    from these three functions at all — that state now means only what it always should have: the
+    RX stream itself died (`rtlsdr_rx_thread()`'s async-read-loop failure and the equivalents in
+    the other drivers, `input_stop()`'s stop-failure path), not a single failed
+    tuning/gain/bandwidth call. `controller_thread()` now logs and keeps scanning (retries the hop
+    on its next ~200ms cycle) instead of abandoning the device. Startup's `rtlsdr_init()` (item 16)
+    is unaffected — it calls `rtlsdr_set_center_freq()` directly, not through
+    `input_set_centerfreq()`, so its fatal-on-init-failure behavior is untouched.
+    - **A second, independent bug in the same area**: `handle_retune()`'s poll loop consumed
+      `dev->pending_centerfreq_request` (reset it to `-1` via `exchange()`) *before*
+      `device_apply_retune()` (and the `input_set_centerfreq()` call inside it) actually ran, so a
+      caller polling for "is it done" could observe "consumed" before the hardware call — and its
+      result — existed at all. Fixed the same way item 29's `pending_remove_request` already
+      established for "apply does real work, not just a flag flip": a new
+      `device_t::centerfreq_apply_failed` field is set by the demod thread from
+      `device_apply_retune()`'s actual (now bool-returning) result, and
+      `pending_centerfreq_request` is only reset to `-1` after that, not before —
+      `handle_retune()` now checks this field instead of `dev->input->state`.
+    - Adds `input_t::centerfreq_retune_failure_count`, incremented inside
+      `input_set_centerfreq()`'s failure branch (covers both call paths with one line) and exposed
+      via the stats/metrics endpoint (items 8/22) alongside `buffer_underrun_count`, so a
+      recurring hardware tuning fault is visible without grepping syslog across this fork's ~12
+      concurrent instances.
+    - Unit tested in `src/test_live_reconfig.cpp` (`device_apply_retune()`'s failure path leaves
+      `input->state` at `INPUT_RUNNING` and increments the new counter; a background-thread test
+      proves the request/apply ordering itself, not just the state removal; a gain-failure case
+      for `input_set_gain()`) and `src/test_control_socket.cpp` (`handle_retune()` returns an
+      error keyed off `centerfreq_apply_failed`, not `input->state`, plus the success mirror).
+      `controller_thread()`'s own retry-not-abandon behavior is not unit-tested — it's a real
+      pthread loop with no existing test harness for it (see item 20's stated scope). A system
+      test against a fault-injecting input driver is a documented follow-up, not yet implemented —
+      no driver in `system_tests/helpers/` currently supports simulating a `set_centerfreq`
+      failure (the only one exercised end-to-end, `type = "file"`, has a hard no-op
+      `set_centerfreq()` that always succeeds).
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

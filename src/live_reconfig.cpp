@@ -163,7 +163,7 @@ bool mixer_request_disable(mixer_t* mixer, int timeout_us) {
     return post_request_and_wait(&mixer->pending_enable_request, 0, timeout_us);
 }
 
-void device_apply_retune(device_t* dev, int new_centerfreq) {
+bool device_apply_retune(device_t* dev, int new_centerfreq) {
     // Runs inside the demod thread that exclusively owns dev - same thread as AFC's own per-bin
     // adjustments (see the AFC class in rtl_airband.cpp), so plain assignments here are safe
     // without any lock: there is only ever one writer to bins/base_bins/dm_dphi at a time.
@@ -176,7 +176,7 @@ void device_apply_retune(device_t* dev, int new_centerfreq) {
             channel->dm_phi = 0;
         }
     }
-    input_set_centerfreq(dev->input, new_centerfreq);
+    return input_set_centerfreq(dev->input, new_centerfreq) == 0;
 }
 
 namespace {

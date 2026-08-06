@@ -47,6 +47,10 @@ struct input_t {
     size_t buf_size, bufs, bufe;
     size_t overflow_count;
     size_t underrun_count;
+    // Failed input_set_centerfreq() calls (transient hardware errors on an already-running
+    // device) - does not affect input->state, unlike overflow/underrun which are informational
+    // only. See input_set_centerfreq()'s comment (input-common.cpp).
+    size_t centerfreq_retune_failure_count;
     input_state_t state;
     sample_format_t sfmt;
     float fullscale;

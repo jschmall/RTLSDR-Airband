@@ -991,10 +991,12 @@ int parse_devices(libconfig::Setting& devs) {
         dev->input->bufs = dev->input->bufe = 0;
         dev->input->overflow_count = 0;
         dev->input->underrun_count = 0;
+        dev->input->centerfreq_retune_failure_count = 0;
         dev->output_overrun_count = 0;
         dev->waveend = dev->waveavail = dev->row = dev->tq_head = dev->tq_tail = 0;
         dev->last_frequency = -1;
         dev->pending_centerfreq_request = -1;
+        dev->centerfreq_apply_failed = false;
 
         libconfig::Setting& chans = devs[i]["channels"];
         if (chans.getLength() < 1) {

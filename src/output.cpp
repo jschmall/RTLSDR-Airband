@@ -903,6 +903,20 @@ static void output_device_buffer_underruns(FILE* f) {
     fprintf(f, "\n");
 }
 
+static void output_device_centerfreq_retune_failures(FILE* f) {
+    fprintf(f,
+            "# HELP centerfreq_retune_failure_count Number of times a live centerfreq retune (dynamic_reload "
+            "control socket, or R_SCAN's automatic frequency-hopping) failed at the hardware level. Does not "
+            "indicate the device stopped running - only that this specific retune attempt did not take effect.\n"
+            "# TYPE centerfreq_retune_failure_count counter\n");
+
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        fprintf(f, "centerfreq_retune_failure_count{device=\"%d\"}\t%zu\n", i, dev->input->centerfreq_retune_failure_count);
+    }
+    fprintf(f, "\n");
+}
+
 static void output_process_cpu_seconds(FILE* f) {
     struct rusage ru;
     if (getrusage(RUSAGE_SELF, &ru) != 0) {
@@ -1232,6 +1246,7 @@ void write_stats_file(timeval* last_stats_write) {
     output_channel_no_ctcss_counter(file);
     output_device_buffer_overflows(file);
     output_device_buffer_underruns(file);
+    output_device_centerfreq_retune_failures(file);
     output_output_overruns(file);
     output_input_overruns(file);
     output_process_cpu_seconds(file);

@@ -41,8 +41,13 @@ bool device_request_retune(device_t* dev, int new_centerfreq);
 // it observes a pending request. Recomputes bins/base_bins/dm_dphi for every channel on this
 // device in place (plain assignments - no locking needed, same single-writer-thread invariant
 // AFC's own per-bin adjustments already rely on) and retunes the hardware via
-// input_set_centerfreq().
-void device_apply_retune(device_t* dev, int new_centerfreq);
+// input_set_centerfreq(). Returns true on success, false if input_set_centerfreq() failed (e.g. a
+// transient hardware error) - the caller is responsible for publishing this into
+// dev->centerfreq_apply_failed before clearing dev->pending_centerfreq_request, so a control
+// socket thread waiting on the request sees the real outcome, not just "request consumed". A
+// failure here does not mark the device dead - see input_set_centerfreq()'s comment
+// (input-common.cpp).
+bool device_apply_retune(device_t* dev, int new_centerfreq);
 
 // Channel enable/disable, split into request (control socket thread) / apply (output thread)
 // halves - see channel_t::pending_enable_request's comment (rtl_airband.h) for why: a channel's

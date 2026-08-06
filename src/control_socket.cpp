@@ -195,6 +195,10 @@ string handle_retune(const map<string, string>& fields) {
     // Poll for the owning demod thread to consume the request, so the response reflects actual
     // hardware-retune success/failure rather than just "request accepted". The demod loop visits
     // every device on its slice at least every WAVE_BATCH-ish interval, well under this budget.
+    // The demod thread publishes centerfreq_apply_failed BEFORE clearing pending_centerfreq_request
+    // (see both fields' comments, rtl_airband.h) - do not "simplify" this back to a single
+    // exchange()-based check, that would reintroduce a TOCTOU race where this loop could observe
+    // "consumed" before the hardware call (and its result) actually happened.
     const int poll_interval_us = 5000;
     const int max_wait_us = 500000;
     int waited_us = 0;
@@ -205,8 +209,8 @@ string handle_retune(const map<string, string>& fields) {
     if (dev->pending_centerfreq_request.load(std::memory_order_acquire) != -1) {
         return error_response("retune request timed out waiting for the demod thread");
     }
-    if (dev->input->state == INPUT_FAILED) {
-        return error_response("hardware retune failed - device marked failed, see logs");
+    if (dev->centerfreq_apply_failed.load(std::memory_order_acquire)) {
+        return error_response("hardware retune failed, see logs");
     }
     return ok_response();
 }

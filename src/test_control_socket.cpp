@@ -17,6 +17,8 @@
 
 #include "test_base_class.h"
 
+#include <thread>
+
 #include "control_socket.h"
 #include "rtl_airband.h"
 
@@ -148,6 +150,93 @@ TEST_F(ControlSocketDispatchTest, retune_rejects_missing_freq) {
     string response = control_socket_dispatch_command({{"cmd", "retune"}, {"device", "0"}});
     EXPECT_NE(response.find("\"ok\":false"), string::npos);
     EXPECT_NE(response.find("'freq'"), string::npos);
+}
+
+static int fake_retune_set_centerfreq_ok(input_t* const, int const) {
+    return 0;
+}
+
+static int fake_retune_set_centerfreq_fails(input_t* const, int const) {
+    return -1;
+}
+
+// Simulates demodulate()'s consumption block (rtl_airband.cpp) closely enough to exercise
+// handle_retune()'s poll loop end-to-end, without needing device_apply_retune()'s full
+// channels/bins fixture (that's covered directly in test_live_reconfig.cpp). Publishes
+// centerfreq_apply_failed BEFORE clearing pending_centerfreq_request, matching the fixed
+// ordering - see both fields' comments (rtl_airband.h).
+static std::thread start_retune_consumer(device_t* dev, std::atomic<bool>* stop_consumer) {
+    return std::thread([dev, stop_consumer]() {
+        while (!stop_consumer->load()) {
+            int pending = dev->pending_centerfreq_request.load(std::memory_order_acquire);
+            if (pending >= 0) {
+                int ret = dev->input->set_centerfreq(dev->input, pending);
+                dev->centerfreq_apply_failed.store(ret != 0, std::memory_order_release);
+                dev->pending_centerfreq_request.store(-1, std::memory_order_release);
+            }
+            std::this_thread::yield();
+        }
+    });
+}
+
+TEST_F(ControlSocketDispatchTest, retune_reports_error_on_hardware_failure_without_touching_input_state) {
+    // The regression this test guards against: handle_retune() used to check
+    // dev->input->state == INPUT_FAILED, which input_set_centerfreq() (input-common.cpp) no
+    // longer sets on a transient hardware failure - it must key off centerfreq_apply_failed
+    // instead, and must never require/imply input->state changing.
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.state = INPUT_RUNNING;
+    input.set_centerfreq = &fake_retune_set_centerfreq_fails;
+    input.dev_data = &fake_dev_data;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.pending_centerfreq_request = -1;
+    dev.centerfreq_apply_failed = false;
+    devices = &dev;
+    device_count = 1;
+
+    std::atomic<bool> stop_consumer{false};
+    std::thread consumer = start_retune_consumer(&dev, &stop_consumer);
+
+    string response = control_socket_dispatch_command({{"cmd", "retune"}, {"device", "0"}, {"freq", "100000000"}});
+
+    stop_consumer.store(true);
+    consumer.join();
+
+    EXPECT_NE(response.find("\"ok\":false"), string::npos) << "response: " << response;
+    EXPECT_NE(response.find("hardware retune failed"), string::npos) << "response: " << response;
+    EXPECT_EQ(input.state, INPUT_RUNNING);
+}
+
+TEST_F(ControlSocketDispatchTest, retune_reports_ok_on_hardware_success) {
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.state = INPUT_RUNNING;
+    input.set_centerfreq = &fake_retune_set_centerfreq_ok;
+    input.dev_data = &fake_dev_data;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.pending_centerfreq_request = -1;
+    dev.centerfreq_apply_failed = false;
+    devices = &dev;
+    device_count = 1;
+
+    std::atomic<bool> stop_consumer{false};
+    std::thread consumer = start_retune_consumer(&dev, &stop_consumer);
+
+    string response = control_socket_dispatch_command({{"cmd", "retune"}, {"device", "0"}, {"freq", "100000000"}});
+
+    stop_consumer.store(true);
+    consumer.join();
+
+    EXPECT_NE(response.find("\"ok\":true"), string::npos) << "response: " << response;
 }
 
 TEST_F(ControlSocketDispatchTest, channel_enable_rejects_missing_device) {

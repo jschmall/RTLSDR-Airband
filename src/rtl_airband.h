@@ -442,6 +442,14 @@ struct device_t {
     // and consumes this once per pass, so the actual bins/base_bins/dm_dphi recompute happens
     // in-thread with plain assignments - no cross-thread synchronization needed on those fields.
     std::atomic<int> pending_centerfreq_request;
+    // Set by the demod thread (device_apply_retune()'s caller, rtl_airband.cpp) to the actual
+    // outcome of the request above - true on failure, false on success - and published BEFORE
+    // pending_centerfreq_request is reset to -1, not concurrently with it. Mirrors why
+    // channel_t::pending_remove_request is a field separate from pending_enable_request (see its
+    // comment below): a control-socket thread polling for "request consumed" must see a result
+    // that already reflects whether the hardware call actually succeeded, not just that the
+    // demod thread picked the request up.
+    std::atomic<bool> centerfreq_apply_failed;
     enum rec_modes mode;
     size_t output_overrun_count;
 };

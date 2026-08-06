@@ -138,7 +138,11 @@ void* controller_thread(void* params) {
                 dev->channels[0].freq_idx = i;
                 new_centerfreq = dev->channels[0].freqlist[i].frequency + 20 * (double)(dev->input->sample_rate / fft_size);
                 if (input_set_centerfreq(dev->input, new_centerfreq) < 0) {
-                    break;
+                    // A transient hardware retune failure doesn't mean scanning should stop
+                    // permanently for this device - see input_set_centerfreq()'s comment
+                    // (input-common.cpp). Stay in the loop; the next hop attempt in ~200ms is
+                    // the retry.
+                    log(LOG_WARNING, "Failed to retune to %d Hz during frequency scan, will retry on next hop\n", new_centerfreq);
                 }
             }
         } else {
@@ -439,9 +443,14 @@ void* demodulate(void* params) {
             continue;
         }
 
-        int pending_retune = dev->pending_centerfreq_request.exchange(-1, std::memory_order_acq_rel);
+        int pending_retune = dev->pending_centerfreq_request.load(std::memory_order_acquire);
         if (pending_retune >= 0) {
-            device_apply_retune(dev, pending_retune);
+            // Not consumed via exchange(): a control socket thread polling pending_centerfreq_request
+            // must not observe "consumed" until centerfreq_apply_failed already reflects this
+            // attempt's actual result - see both fields' comments (rtl_airband.h).
+            bool ok = device_apply_retune(dev, pending_retune);
+            dev->centerfreq_apply_failed.store(!ok, std::memory_order_release);
+            dev->pending_centerfreq_request.store(-1, std::memory_order_release);
         }
 
         // number of input bytes per output wave sample (x 2 for I and Q)

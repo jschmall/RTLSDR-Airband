@@ -123,7 +123,12 @@ int input_set_centerfreq(input_t* const input, int const centerfreq) {
     }
     int ret = input->set_centerfreq(input, centerfreq);
     if (ret != 0) {
-        input->state = INPUT_FAILED;
+        // A single failed retune does not mean the RX stream died - the device may still be
+        // running fine at its previous centerfreq. INPUT_FAILED is reserved for the stream
+        // itself dying (rx_thread's async-read failure, input_stop()'s failure path); setting it
+        // here would make demodulate() treat a transient hardware error identically to "device
+        // never came up" and, on the last running device, exit the whole process.
+        input->centerfreq_retune_failure_count++;
         return -1;
     }
     input->centerfreq = centerfreq;
@@ -142,7 +147,8 @@ int input_set_gain(input_t* const input, float const gain) {
     }
     int ret = input->set_gain(input, gain);
     if (ret != 0) {
-        input->state = INPUT_FAILED;
+        // See input_set_centerfreq()'s comment - a failed gain change doesn't mean the RX stream
+        // died, so it must not be treated as fatal here either.
         return -1;
     }
     return 0;
@@ -160,7 +166,8 @@ int input_set_bandwidth(input_t* const input, int const bandwidth) {
     }
     int ret = input->set_bandwidth(input, bandwidth);
     if (ret != 0) {
-        input->state = INPUT_FAILED;
+        // See input_set_centerfreq()'s comment - a failed bandwidth change doesn't mean the RX
+        // stream died, so it must not be treated as fatal here either.
         return -1;
     }
     return 0;

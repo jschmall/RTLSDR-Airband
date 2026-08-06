@@ -129,6 +129,137 @@ TEST_F(LiveReconfigTest, device_request_retune_rejects_r_scan) {
     EXPECT_EQ(dev.pending_centerfreq_request.load(), -1);
 }
 
+int fake_set_centerfreq_ok(input_t* const, int const) {
+    return 0;
+}
+
+int fake_set_centerfreq_fails(input_t* const, int const) {
+    return -1;
+}
+
+TEST_F(LiveReconfigTest, device_apply_retune_succeeds_and_updates_centerfreq) {
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.state = INPUT_RUNNING;
+    input.set_centerfreq = &fake_set_centerfreq_ok;
+    input.dev_data = &fake_dev_data;
+
+    freq_t freq = {};
+    freq.frequency = 120050000;
+    channel_t channel = {};
+    channel.freqlist = &freq;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.channel_count = 1;
+    dev.channels = &channel;
+    size_t bins[1] = {0}, base_bins[1] = {0};
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+
+    bool ok = device_apply_retune(&dev, 121000000);
+
+    EXPECT_TRUE(ok);
+    EXPECT_EQ(input.centerfreq, 121000000);
+    EXPECT_EQ(input.state, INPUT_RUNNING);
+}
+
+TEST_F(LiveReconfigTest, device_apply_retune_returns_false_and_does_not_mark_input_failed_on_hardware_error) {
+    // The regression this test guards against: a single failed retune (e.g. a transient i2c
+    // error) used to unconditionally set input->state = INPUT_FAILED, which demodulate()
+    // (rtl_airband.cpp) treats identically to "device never came up" - on the last running
+    // device, that cascaded into exiting the whole process. See input_set_centerfreq()'s comment
+    // (input-common.cpp).
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.state = INPUT_RUNNING;
+    input.set_centerfreq = &fake_set_centerfreq_fails;
+    input.dev_data = &fake_dev_data;
+    input.centerfreq_retune_failure_count = 0;
+
+    freq_t freq = {};
+    freq.frequency = 120050000;
+    channel_t channel = {};
+    channel.freqlist = &freq;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.channel_count = 1;
+    dev.channels = &channel;
+    size_t bins[1] = {0}, base_bins[1] = {0};
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+
+    bool ok = device_apply_retune(&dev, 121000000);
+
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(input.state, INPUT_RUNNING);
+    EXPECT_EQ(input.centerfreq, 120000000);  // unchanged on failure
+    EXPECT_EQ(input.centerfreq_retune_failure_count, 1u);
+}
+
+TEST_F(LiveReconfigTest, retune_consumption_publishes_failure_before_clearing_request) {
+    // Mirrors demodulate()'s consumption block (rtl_airband.cpp) - a control socket thread
+    // polling pending_centerfreq_request must never observe "consumed" (-1) before
+    // centerfreq_apply_failed already reflects the real result. This is the TOCTOU fix itself
+    // (a separate bug from the INPUT_FAILED removal above): the old code cleared the request via
+    // a plain exchange() before device_apply_retune() had even run.
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.state = INPUT_RUNNING;
+    input.set_centerfreq = &fake_set_centerfreq_fails;
+    input.dev_data = &fake_dev_data;
+
+    freq_t freq = {};
+    freq.frequency = 120050000;
+    channel_t channel = {};
+    channel.freqlist = &freq;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.channel_count = 1;
+    dev.channels = &channel;
+    size_t bins[1] = {0}, base_bins[1] = {0};
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    dev.centerfreq_apply_failed = false;
+
+    std::atomic<bool> stop_consumer{false};
+    std::thread consumer([&]() {
+        while (!stop_consumer.load()) {
+            int pending = dev.pending_centerfreq_request.load(std::memory_order_acquire);
+            if (pending >= 0) {
+                bool ok = device_apply_retune(&dev, pending);
+                dev.centerfreq_apply_failed.store(!ok, std::memory_order_release);
+                dev.pending_centerfreq_request.store(-1, std::memory_order_release);
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    dev.pending_centerfreq_request.store(121000000, std::memory_order_release);
+    // Poll the same way handle_retune() does (control_socket.cpp).
+    while (dev.pending_centerfreq_request.load(std::memory_order_acquire) != -1) {
+        std::this_thread::yield();
+    }
+    bool failed = dev.centerfreq_apply_failed.load(std::memory_order_acquire);
+
+    stop_consumer.store(true);
+    consumer.join();
+
+    EXPECT_TRUE(failed);
+}
+
 TEST_F(LiveReconfigTest, channel_apply_disable_sets_enabled_false) {
     // channel_apply_disable()/channel_apply_enable() are the apply-side halves, exercised
     // directly here as pure functions (see channel_t::pending_enable_request's comment,
@@ -630,6 +761,48 @@ TEST_F(DiffApplyTest, gain_applied_via_input_set_gain_is_reported) {
 
     ASSERT_EQ(result.applied.size(), 1u);
     EXPECT_NE(result.applied[0].find("gain"), std::string::npos);
+}
+
+int fake_set_gain_fails(input_t* const, float const) {
+    return -1;
+}
+
+TEST_F(DiffApplyTest, gain_set_hardware_failure_does_not_mark_input_failed) {
+    // The regression this test guards against - see input_set_gain()'s comment
+    // (input-common.cpp): a failed gain change must not mark the device dead, unlike the old
+    // behavior that set input->state = INPUT_FAILED on any driver error.
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.state = INPUT_RUNNING;
+    input.set_gain = &fake_set_gain_fails;
+    input.dev_data = &fake_dev_data;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 0;
+    devices = &dev;
+    device_count = 1;
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 0;
+    dsnap.centerfreq = 120000000;
+    dsnap.sample_rate = 2000000;
+    dsnap.has_gain = true;
+    dsnap.gain = 30.0f;
+    snapshot.devices.push_back(dsnap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(input.state, INPUT_RUNNING);
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("gain"), std::string::npos);
 }
 
 TEST_F(DiffApplyTest, mixer_count_mismatch_is_requires_restart) {
