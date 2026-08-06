@@ -2662,11 +2662,10 @@ TEST_F(ChannelAppendTest, replaces_tail_channel_with_edited_mixer_output) {
     mixer.pending_enable_request = -1;
     mixer.input_count = 0;
     mixer.input_capacity = 0;
-    // Room for the replacement's own reconnect - see mixer_disable_input()'s comment (mixer.cpp)
-    // for the known caveat this relies on: a replaced channel's old mixer input slot is never
-    // released back to input_capacity, so every edit of a mixer-connected channel consumes one
-    // more reserve_inputs slot, permanently.
-    mixer.reserve_inputs = 1;
+    // No reserve_inputs headroom needed for the edit itself - the replaced channel's old mixer
+    // input slot is reclaimed by mixer_disable_input(..., permanent=true) and reused by the
+    // replacement's mixer_connect_input() call (see input_removed's comment, rtl_airband.h).
+    mixer.reserve_inputs = 0;
     mixers = &mixer;
     mixer_count = 1;
 
@@ -2716,13 +2715,11 @@ devices:
     ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
 
     // Services pending_remove_request, standing in for output_thread() - the replaced channel's
-    // teardown needs this or the request times out. Note: channel_teardown_for_removal() calls
-    // disable_channel_outputs() (src/output.cpp), which is stubbed to a no-op in this test binary
-    // (see test_mixer.cpp's file-scope stub comment) since output.cpp itself - shout/lame/real
-    // file I/O - isn't linked into unittests. That means mixer_disable_input() genuinely never
-    // runs here, so input_mask[0] can't be asserted on in this test; what CAN be verified here is
-    // everything downstream of the real (not stubbed) mixer_connect_input() call the replacement
-    // channel makes.
+    // teardown needs this or the request times out. channel_teardown_for_removal() calls
+    // disable_channel_outputs() (src/output.cpp), which test_mixer.cpp's file-scope stub
+    // reproduces the real O_MIXER branch of (mixer_disable_input() is real mixer.cpp code, not
+    // stubbed - only icecast/file/pulse teardown is skipped), so the slot-reclaim path below is
+    // genuinely exercised, not simulated.
     std::atomic<bool> stop_consumer{false};
     std::thread consumer([&]() {
         while (!stop_consumer.load()) {
@@ -2742,16 +2739,14 @@ devices:
 
     EXPECT_EQ(dev.channel_count.load(), 1);
     EXPECT_TRUE(result.skipped_requires_restart.empty());
-    // The edit works, but demonstrates the documented caveat: mixer_disable_input() (mixer.cpp,
-    // called from the real disable_channel_outputs() in production - stubbed out in this test
-    // binary, see above) only masks the old slot; it never releases it back to input_capacity. So
-    // the replacement channel's fresh mixer_connect_input() call consumes a NEW slot (index 1,
-    // the reserve_inputs headroom) rather than reusing index 0 - input_count is 2, not 1.
-    EXPECT_EQ(mixer.input_count.load(), 2);
+    // The old slot (index 0) is reclaimed and reused by the replacement channel's
+    // mixer_connect_input() call - input_count stays at 1, no reserve_inputs headroom consumed.
+    EXPECT_EQ(mixer.input_count.load(), 1);
     ASSERT_EQ(chans[0].output_count, 1);
     mixer_data* mdata = (mixer_data*)chans[0].outputs[0].data;
     EXPECT_EQ(mdata->mixer, &mixer);
-    EXPECT_EQ(mdata->input, 1);
-    EXPECT_TRUE(mixer.input_mask[1]);
+    EXPECT_EQ(mdata->input, 0);
+    EXPECT_TRUE(mixer.input_mask[0]);
+    EXPECT_FALSE(mixer.input_removed[0]);
     EXPECT_FLOAT_EQ(mixer.inputs[mdata->input].ampl, fminf(1.0f, 1.0f - 0.7f));
 }

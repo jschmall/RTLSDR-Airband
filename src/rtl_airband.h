@@ -540,6 +540,15 @@ struct mixer_t {
     mixinput_t* inputs;
     bool* inputs_todo;
     bool* input_mask;
+    // Parallel to input_mask, but permanent-removal-only: set by mixer_disable_input(...,
+    // permanent=true) (a channel actually being torn down, not just disabled) and cleared only
+    // when mixer_connect_input() reclaims that slot for a new input. input_mask alone can't carry
+    // this distinction - it's also flipped false/true by ordinary temporary disable/re-enable
+    // (mixer_disable()/mixer_enable(), channel_apply_disable()/channel_apply_enable()), which must
+    // NOT free the slot, since the same channel is expected to reconnect to the same index later.
+    // Without this, every live-edited mixer-connected channel (item 30) permanently burned a new
+    // reserve_inputs slot instead of reusing the one its previous definition vacated.
+    bool* input_removed;
     channel_t channel;
 };
 
@@ -570,7 +579,10 @@ extern char const* RTL_AIRBAND_VERSION;
 lame_t airlame_init(mix_modes mixmode, int highpass, int lowpass);
 void shout_setup(icecast_data* icecast, mix_modes mixmode);
 void disable_device_outputs(device_t* dev);
-void disable_channel_outputs(channel_t* channel);
+// permanent=true means the owning channel is being torn down for good (channel_teardown_for_
+// removal(), live_reconfig.cpp), not just temporarily disabled - see mixer_disable_input()'s
+// comment (mixer.cpp) for why that distinction matters for its O_MIXER-type outputs.
+void disable_channel_outputs(channel_t* channel, bool permanent = false);
 void* output_check_thread(void* params);
 void* output_thread(void* params);
 
@@ -633,7 +645,11 @@ extern bool mixer_capacity_finalized;
 void mixer_finalize_capacity();
 mixer_t* getmixerbyname(const char* name);
 int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance);
-void mixer_disable_input(mixer_t* mixer, int input_idx);
+// permanent=true (channel_teardown_for_removal(), via disable_channel_outputs()) tombstones the
+// slot in input_removed so a later mixer_connect_input() can reclaim it instead of consuming new
+// reserve_inputs headroom; permanent=false (ordinary disable) leaves the slot bound to the same
+// channel for a later mixer_enable_input() to re-arm.
+void mixer_disable_input(mixer_t* mixer, int input_idx, bool permanent = false);
 void mixer_enable_input(mixer_t* mixer, int input_idx);
 // mixer_disable()/mixer_enable() do the real work behind the dynamic_reload control socket's
 // mixer_disable/mixer_enable commands (and the shutdown-time/auto "all inputs died" path) - only

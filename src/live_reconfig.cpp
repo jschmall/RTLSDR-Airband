@@ -142,7 +142,7 @@ void channel_apply_disable(channel_t* channel) {
 // relies on.
 void channel_teardown_for_removal(channel_t* channel) {
     channel->enabled = false;
-    disable_channel_outputs(channel);
+    disable_channel_outputs(channel, /*permanent=*/true);
     for (int k = 0; k < channel->output_count; k++) {
         output_t* output = channel->outputs + k;
         if (output->lame) {

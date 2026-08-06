@@ -651,7 +651,7 @@ void process_outputs(channel_t* channel, int cur_scan_freq) {
     }
 }
 
-void disable_channel_outputs(channel_t* channel) {
+void disable_channel_outputs(channel_t* channel, bool permanent) {
     for (int k = 0; k < channel->output_count; k++) {
         output_t* output = channel->outputs + k;
         output->enabled = false;
@@ -667,7 +667,7 @@ void disable_channel_outputs(channel_t* channel) {
             close_file(&channel->outputs[k]);
         } else if (output->type == O_MIXER) {
             mixer_data* mdata = (mixer_data*)(output->data);
-            mixer_disable_input(mdata->mixer, mdata->input);
+            mixer_disable_input(mdata->mixer, mdata->input, permanent);
         } else if (output->type == O_UDP_STREAM) {
             udp_stream_data* sdata = (udp_stream_data*)output->data;
             udp_stream_shutdown(sdata);

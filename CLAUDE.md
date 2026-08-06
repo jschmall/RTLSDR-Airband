@@ -1087,6 +1087,54 @@ Keep the local delta small and well understood.
       race - which is precisely and directly exercised by the unit tests' simulated stuck/working
       consumer threads instead).
 
+39. **Mixer: reclaim an input slot on permanent channel removal, not just temporary disable**
+    (`src/rtl_airband.h`, `src/mixer.cpp`, `src/output.cpp`, `src/live_reconfig.cpp`) — the third
+    of the four pre-merge-review findings, and the last of item 30's own documented caveats still
+    open: `mixer_disable_input()` only ever masked a slot off (`input_mask[idx] = false`); it never
+    released the slot back to `input_capacity`. That's correct for an *ordinary* temporary disable
+    (`mixer_disable()`'s "all inputs died" auto-cascade, `channel_apply_disable()`'s control-socket
+    `channel_disable` command) — the same channel is expected to reconnect to the same index later
+    via `mixer_enable_input()` — but item 30's live channel *edit* tears the old channel down and
+    appends a fresh replacement, so every single live edit of a mixer-connected channel was
+    permanently burning a new `reserve_inputs` slot it could never get back, exactly as item 30
+    flagged but left unfixed at the time.
+    - **The fix**: `disable_channel_outputs()` (`output.cpp`) and `mixer_disable_input()`
+      (`mixer.cpp`) both gained a `permanent` bool parameter (default `false`, so every pre-existing
+      call site is unchanged). `channel_teardown_for_removal()` (`live_reconfig.cpp` — used by both
+      item 29's removal and item 30's tail-replace edit) is the only caller that passes `true`. A
+      new parallel array, `mixer_t::input_removed` (`rtl_airband.h`), is tombstoned by
+      `mixer_disable_input(..., permanent=true)` and checked first thing in `mixer_connect_input()`
+      — a tombstoned slot is reused (fields reset, `input_mask`/`inputs_todo` republished, same
+      "publish `input_mask` last" discipline the fresh-slot path already used) before any capacity
+      check or growth is attempted, so reuse never touches `input_capacity`/`reserve_inputs` at all.
+      The slot's `pthread_mutex_t` is deliberately never re-initialized or destroyed on reuse — only
+      ever set up once, at the slot's first real allocation — since `mixer_thread()` locks every
+      slot's mutex unconditionally every pass regardless of `input_mask` (see its per-input loop),
+      so the mutex object must always remain valid for the mixer's entire lifetime.
+    - **Reuse-scan safety**: the scan and reuse both run inside `mixer_connect_input()`, which is
+      only ever called from the single control-socket thread's `reload_diff`-driven live-append
+      path (`control_socket.cpp`'s accept loop handles one connection at a time — see item 26's own
+      comment on this) — so there's no concurrent-writer race on the scan itself, matching every
+      other live-reconfig primitive's single-writer-thread invariant.
+    - Unit tested directly in `src/test_mixer.cpp` (`MixerCapacityTest`: permanent disable
+      tombstones without disturbing other inputs, non-permanent disable does not tombstone, reuse
+      pre- and post-`mixer_finalize_capacity()` without growing capacity, and a
+      `mixer_put_samples()` round-trip through a reused slot proving the un-reinitialized mutex is
+      still genuinely usable) and end-to-end through `test_live_reconfig.cpp`'s existing
+      `replaces_tail_channel_with_edited_mixer_output` test, updated to assert the now-fixed
+      behavior (`input_count` stays at 1, the old slot is reused, no `reserve_inputs` needed) rather
+      than the old caveat it used to document. That test's coverage required upgrading
+      `test_mixer.cpp`'s file-scope `disable_channel_outputs()` stub (previously a total no-op,
+      since the real one in `output.cpp` needs shout/lame/real file I/O this test binary doesn't
+      link in) to reproduce just the `O_MIXER` branch — pure `mixer.cpp` logic, already linked —
+      so the reclaim path is genuinely exercised through the same call chain production uses, not
+      simulated. All 220 tests (5 net new) pass across Debug, Debug+NFM, `-DRDIO_SCANNER=OFF`, and
+      ASan/UBSan. No hardware interaction in this fix (pure in-process mixer bookkeeping), so
+      verification was unit/system-test-only — `system_tests/tests/test_channel_add.py`,
+      `test_channel_edit.py`, `test_channel_remove.py`, and `test_control_socket.py` all still pass
+      against rebuilt `Release`/`Release_nfm` binaries, confirming no regression in the mixer output
+      paths those tests already exercise end-to-end.
+
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
 

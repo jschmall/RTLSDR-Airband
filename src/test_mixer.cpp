@@ -32,7 +32,21 @@ using namespace std;
 mixer_t* mixers = nullptr;
 int mixer_count = 0;
 volatile int do_exit = 0;
-void disable_channel_outputs(channel_t*) {}
+// Only the O_MIXER branch of the real disable_channel_outputs() (src/output.cpp) is reproduced
+// here - icecast/file/pulse teardown needs shout/lame/real file I/O this test binary doesn't
+// link in, but the O_MIXER branch is pure mixer.cpp, which is linked. Without this, a test that
+// live-removes a mixer-connected channel (test_live_reconfig.cpp) could never exercise the real
+// mixer_disable_input()/permanent-reclaim path at all.
+void disable_channel_outputs(channel_t* channel, bool permanent) {
+    for (int k = 0; k < channel->output_count; k++) {
+        output_t* output = channel->outputs + k;
+        output->enabled = false;
+        if (output->type == O_MIXER) {
+            mixer_data* mdata = (mixer_data*)(output->data);
+            mixer_disable_input(mdata->mixer, mdata->input, permanent);
+        }
+    }
+}
 
 class MixerTest : public TestBaseClass {};
 
@@ -212,4 +226,113 @@ TEST_F(MixerCapacityTest, finalize_on_empty_mixer_with_reserve_allocates_fresh_z
     int idx = mixer_connect_input(&mixer, 1.0f, 0.0f);
     EXPECT_EQ(idx, 0);
     EXPECT_EQ(mixer.input_count.load(), 1);
+}
+
+// item 39: mixer_disable_input(..., permanent=true) tombstones the slot so mixer_connect_input()
+// can reclaim it, instead of every live channel edit/removal permanently burning a fresh
+// reserve_inputs slot (item 30's documented caveat).
+TEST_F(MixerCapacityTest, disable_input_permanent_marks_removed_and_masks_without_disturbing_others) {
+    mixer_t mixer = {};
+    mixer.input_count = 0;
+    mixer.input_capacity = 0;
+    mixer.reserve_inputs = 0;
+
+    mixer_connect_input(&mixer, 1.0f, 0.0f);
+    mixer_connect_input(&mixer, 1.0f, 0.0f);
+
+    mixer_disable_input(&mixer, 0, /*permanent=*/true);
+
+    EXPECT_FALSE(mixer.input_mask[0]);
+    EXPECT_TRUE(mixer.input_removed[0]);
+    // The other input is untouched - still active and not tombstoned.
+    EXPECT_TRUE(mixer.input_mask[1]);
+    EXPECT_FALSE(mixer.input_removed[1]);
+    EXPECT_TRUE(mixer.enabled);  // one input still alive
+}
+
+TEST_F(MixerCapacityTest, disable_input_non_permanent_does_not_tombstone_the_slot) {
+    mixer_t mixer = {};
+    mixer.input_count = 0;
+    mixer.input_capacity = 0;
+    mixer.reserve_inputs = 0;
+    mixer.name = "mix1";
+
+    mixer_connect_input(&mixer, 1.0f, 0.0f);
+    mixer_connect_input(&mixer, 1.0f, 0.0f);
+
+    mixer_disable_input(&mixer, 0);  // ordinary temporary disable - permanent defaults to false
+
+    EXPECT_FALSE(mixer.input_mask[0]);
+    EXPECT_FALSE(mixer.input_removed[0]);
+}
+
+TEST_F(MixerCapacityTest, connect_input_reuses_a_permanently_removed_slot_pre_finalize) {
+    mixer_t mixer = {};
+    mixer.input_count = 0;
+    mixer.input_capacity = 0;
+    mixer.reserve_inputs = 0;
+
+    int idx0 = mixer_connect_input(&mixer, 1.0f, 0.0f);
+    mixer_connect_input(&mixer, 1.0f, 0.0f);
+    EXPECT_EQ(mixer.input_capacity, 2);
+
+    mixer_disable_input(&mixer, idx0, /*permanent=*/true);
+
+    int idx_reused = mixer_connect_input(&mixer, 2.5f, 0.3f);
+
+    EXPECT_EQ(idx_reused, idx0);  // slot 0 reclaimed, not a new slot
+    EXPECT_EQ(mixer.input_count.load(), 2);
+    EXPECT_EQ(mixer.input_capacity, 2);  // no growth needed
+    EXPECT_TRUE(mixer.input_mask[0]);
+    EXPECT_FALSE(mixer.input_removed[0]);
+    EXPECT_FLOAT_EQ(mixer.inputs[0].ampfactor, 2.5f);
+    EXPECT_FLOAT_EQ(mixer.inputs[0].ampl, fminf(1.0f, 1.0f - 0.3f));
+    EXPECT_FALSE(mixer.inputs[0].ready);
+    EXPECT_FALSE(mixer.inputs[0].has_signal);
+}
+
+TEST_F(MixerCapacityTest, connect_input_reuses_a_removed_slot_post_finalize_without_exceeding_capacity) {
+    mixer_t mixer = {};
+    mixer.input_count = 0;
+    mixer.input_capacity = 0;
+    mixer.reserve_inputs = 0;
+
+    mixer_connect_input(&mixer, 1.0f, 0.0f);
+
+    mixers = &mixer;
+    mixer_count = 1;
+    mixer_finalize_capacity();
+    ASSERT_EQ(mixer.input_capacity, 1);  // no reserve headroom
+
+    mixer_disable_input(&mixer, 0, /*permanent=*/true);
+
+    // Post-finalize, growth is rejected - but reuse doesn't grow, so this must still succeed.
+    int idx = mixer_connect_input(&mixer, 1.0f, 0.0f);
+
+    EXPECT_EQ(idx, 0);
+    EXPECT_EQ(mixer.input_count.load(), 1);
+    EXPECT_EQ(mixer.input_capacity, 1);
+    EXPECT_TRUE(mixer.input_mask[0]);
+    EXPECT_FALSE(mixer.input_removed[0]);
+}
+
+TEST_F(MixerCapacityTest, connect_input_reused_slot_still_works_through_mixer_put_samples) {
+    // Confirms the reused slot's mutex (never re-initialized on reuse - see mixer_connect_input()'s
+    // comment) is still a valid, usable mutex, not just that the bookkeeping fields look right.
+    mixer_t mixer = {};
+    mixer.input_count = 0;
+    mixer.input_capacity = 0;
+    mixer.reserve_inputs = 0;
+
+    int idx0 = mixer_connect_input(&mixer, 1.0f, 0.0f);
+    mixer_disable_input(&mixer, idx0, /*permanent=*/true);
+    int idx_reused = mixer_connect_input(&mixer, 1.0f, 0.0f);
+    ASSERT_EQ(idx_reused, idx0);
+
+    float samples[WAVE_LEN] = {0};
+    samples[0] = 0.42f;
+    mixer_put_samples(&mixer, idx_reused, samples, /*has_signal=*/true, WAVE_LEN);
+
+    EXPECT_TRUE(mixer.inputs[idx_reused].ready);
+    EXPECT_FLOAT_EQ(mixer.inputs[idx_reused].wavein[0], 0.42f);
 }
