@@ -1135,6 +1135,77 @@ Keep the local delta small and well understood.
       against rebuilt `Release`/`Release_nfm` binaries, confirming no regression in the mixer output
       paths those tests already exercise end-to-end.
 
+40. **Channel teardown: safely reclaim leaked outputs/freqlist memory** (`src/live_reconfig.{cpp,h}`,
+    `src/output.cpp`, `src/test_live_reconfig.cpp`) — the fourth and hardest of the pre-merge-review
+    findings. `channel_teardown_for_removal()` (used by both item 29's removal and item 30's tail-
+    replace edit) deliberately left `channel->outputs`/`freqlist`/`config_signature` and each
+    output's own `data` struct allocated forever, because freeing them immediately risked a real
+    use-after-free: `output_check_thread()` and the demod thread's per-channel loop both gate their
+    access on `channel->enabled` (`std::atomic<bool>`, set false first) before touching this memory,
+    but that only narrows the risk window, it doesn't close it — a reader that already observed
+    `enabled == true` and is mid-access when the free happens has no synchronization stopping it.
+    Investigating this surfaced a **third, unguarded reader** beyond the two originally scoped:
+    `write_stats_file()`'s (`output.cpp`) per-channel metrics loop iterates `channel->freqlist`
+    unconditionally, with no `enabled` check at all — the widest, least-protected exposure of the
+    three, on a 15-second cycle (`STATS_FILE_TIMING`).
+    - **Rejected approach**: a generation/epoch counter synchronized against every reader thread
+      (demod, `output_check_thread`, `write_stats_file`, each with a different cadence and, for the
+      stats writer, no existing gate to build on) — correct in principle, but would have required
+      touching multiple hot-path loops for a fix whose entire point is closing a memory-safety gap,
+      not a performance-critical primitive.
+    - **The fix**: a deferred, time-based reclamation queue, entirely private to `live_reconfig.cpp`
+      and drained by `output_thread()` (`output.cpp`) — the same thread that already exclusively
+      owns this memory via `channel_teardown_for_removal()`. Teardown now captures
+      `outputs`/`output_count`/`freqlist`/`freq_count`/`config_signature` into a
+      `PendingChannelFree` entry (timestamped, pushed under a small `pthread_mutex_t`) instead of
+      freeing them — `channel->outputs`/`freqlist`/`config_signature` are deliberately left pointing
+      at this still-valid memory in the meantime, so a slot reused by a later `parse_channel()` call
+      (an edit, not just a removal) simply overwrites the pointers with fresh ones; the old values
+      are already safely captured. `reclaim_pending_channel_frees()`, called once per
+      `output_thread()` pass (a lock-free `std::atomic<size_t>` size check makes this a no-op on the
+      overwhelming majority of passes, when nothing is queued), actually frees anything whose
+      `reclaim_grace_period_sec` (30s in production — comfortably more than double
+      `STATS_FILE_TIMING`, since `write_stats_file()` itself runs to completion in well under a
+      second, so any invocation in flight when a channel is torn down is long finished by the time
+      this elapses) has passed. `lame`/`lamebuf` are unaffected — those still free immediately, as
+      before this item, since neither `output_check_thread()` nor `write_stats_file()` ever touches
+      them.
+    - **`free_output_data()`** (`live_reconfig.cpp`, anonymous namespace) mirrors, in reverse, every
+      heap allocation `parse_outputs()` (`config.cpp`) makes per output type: `icecast_data`/
+      `udp_stream_data`/`pulse_data` are `XCALLOC`'d with individually `strdup()`'d string fields
+      (plain `free()`, `const_cast` needed since the struct fields are `const char*`); `file_data`
+      (and its nested `rdio_scanner_data`, if configured) are `new`'d with `std::string` members
+      (`delete`, not `free()` — a free()/delete mismatch here would itself be a heap-corruption bug
+      this fix exists to prevent); `mixer_data` owns no nested pointers (`mixer_t*` points at the
+      process-wide `mixers[]` array, never freed here). `freqlist[k].label` (`strdup()`'d,
+      `config.cpp`) is freed per-entry before the `freqlist` array itself.
+    - Unit tested in `src/test_live_reconfig.cpp`'s new `ReclaimPendingChannelFreesTest` fixture:
+      one test proves the queue/timing contract directly (`pending_channel_free_backlog()` — a new
+      test-only introspection hook, `reclaim_grace_period_sec` — a new test-only overridable global,
+      same rationale as `mixer_capacity_finalized`'s existing one — shrunk to make the grace period
+      deterministic instead of a real 30-second sleep); a second builds a channel with real,
+      fully-populated `icecast_data`/`file_data` (with nested `rdio_scanner_data`)/`udp_stream_data`/
+      `pulse_data` outputs — everything except `O_MIXER`, whose reclaim path has no type-specific
+      logic and is already covered by item 39's tests — and tears it down for real, with no
+      explicit memory assertion needed: a double-free, an allocator mismatch, or a buffer overflow
+      anywhere in `free_output_data()` would abort the whole test binary under ASan before reaching
+      the final `EXPECT`. Confirmed clean under ASan/UBSan **with LeakSanitizer enabled** (the full
+      suite otherwise runs with `detect_leaks=0` — unrelated pre-existing fixture leaks elsewhere —
+      but these two tests specifically were run leak-detection-on and reported none, positively
+      confirming the fix, not just "doesn't crash"). Existing tests that call
+      `channel_teardown_for_removal()` directly (`ChannelRemoveTest`) needed their `TearDown()`
+      updated to drain the pending-free queue (grace period forced to 0) before their own direct
+      `free()` calls, to avoid a cross-test double-free once a later test (this item's own) shrinks
+      `reclaim_grace_period_sec` and drains everything still queued from earlier tests in the same
+      process. All 222 tests (7 net new across items 39–40) pass across Debug, Debug+NFM,
+      `-DRDIO_SCANNER=OFF`, and ASan/UBSan. No hardware interaction (pure in-process memory
+      management), so verification was unit/system-test-only —
+      `system_tests/tests/test_channel_add.py`, `test_channel_edit.py`, `test_channel_remove.py`,
+      `test_control_socket.py`, `test_icecast_output.py`, and `test_rdio_scanner_output.py` all
+      still pass against rebuilt `Release`/`Release_nfm` binaries with `reclaim_pending_channel_
+      frees()` now running on every `output_thread()` pass in the real binary, not just the test
+      harness.
+
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
 

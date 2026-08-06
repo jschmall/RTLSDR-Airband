@@ -133,13 +133,123 @@ void channel_apply_disable(channel_t* channel) {
     disable_channel_outputs(channel);
 }
 
+namespace {
+
+// Mirrors, in reverse, every heap allocation parse_outputs() (config.cpp) makes for this output
+// type - see reclaim_pending_channel_frees()'s comment below for why this only ever runs well
+// after the output is provably no longer in use, never inline during teardown. output->lame/
+// lamebuf are NOT this function's concern - channel_teardown_for_removal() already frees those
+// immediately, since output_check_thread()/write_stats_file() never touch them.
+void free_output_data(output_t* output) {
+    switch (output->type) {
+        case O_ICECAST: {
+            // XCALLOC'd (config.cpp) - every string field is strdup()'d individually, plain
+            // free() is correct. shout/shout_free() already ran in disable_channel_outputs().
+            icecast_data* d = (icecast_data*)output->data;
+            free(const_cast<char*>(d->hostname));
+            free(const_cast<char*>(d->username));
+            free(const_cast<char*>(d->password));
+            free(const_cast<char*>(d->mountpoint));
+            free(const_cast<char*>(d->name));
+            free(const_cast<char*>(d->genre));
+            free(const_cast<char*>(d->description));
+            free(d);
+            break;
+        }
+        case O_FILE:
+        case O_RAWFILE: {
+            // `new file_data()` (config.cpp) - std::string members free themselves via the
+            // destructor delete runs; only the nested `new rdio_scanner_data()` needs its own
+            // explicit delete first. close_file() (output.cpp) already closed/nulled `f`.
+            file_data* d = (file_data*)output->data;
+#ifdef WITH_RDIO_SCANNER
+            delete d->rdio_scanner;
+#endif /* WITH_RDIO_SCANNER */
+            delete d;
+            break;
+        }
+        case O_UDP_STREAM: {
+            // XCALLOC'd (config.cpp); dest_address/dest_port strdup'd there, the four
+            // conversion/resample buffers XCALLOC'd lazily by udp_stream_init() (possibly NULL if
+            // init was never reached) - free() is safe on NULL. udp_stream_shutdown() (already run
+            // by disable_channel_outputs()) only closes the socket, not these buffers.
+            udp_stream_data* d = (udp_stream_data*)output->data;
+            free(const_cast<char*>(d->dest_address));
+            free(const_cast<char*>(d->dest_port));
+            free(d->convert_buffer);
+            free(d->resample_buffer);
+            free(d->resample_left_buffer);
+            free(d->resample_right_buffer);
+            free(d->stereo_buffer);
+            free(d);
+            break;
+        }
+#ifdef WITH_PULSEAUDIO
+        case O_PULSE: {
+            // XCALLOC'd (config.cpp), strdup'd string fields - pulse_shutdown() (already run by
+            // disable_channel_outputs()) tears down the PulseAudio-internal context/streams, not
+            // these.
+            pulse_data* d = (pulse_data*)output->data;
+            free(const_cast<char*>(d->server));
+            free(const_cast<char*>(d->name));
+            free(const_cast<char*>(d->sink));
+            free(const_cast<char*>(d->stream_name));
+            free(d);
+            break;
+        }
+#endif /* WITH_PULSEAUDIO */
+        case O_MIXER:
+        default:
+            // mixer_data::mixer points at the process-wide mixers[] array - not owned here.
+            // XCALLOC'd, no other owned pointers.
+            free(output->data);
+            break;
+    }
+}
+
+struct PendingChannelFree {
+    output_t* outputs;
+    int output_count;
+    freq_t* freqlist;
+    int freq_count;
+    char* config_signature;
+    struct timeval retired_at;
+};
+
+pthread_mutex_t pending_channel_free_mutex = PTHREAD_MUTEX_INITIALIZER;
+std::vector<PendingChannelFree> pending_channel_frees;
+// Lock-free fast-path check for reclaim_pending_channel_frees(), called once per output_thread()
+// pass - relaxed is enough since it's only ever used to decide whether to take the mutex at all;
+// the mutex itself (taken on both the rare push side and the drain side) is what actually
+// synchronizes access to the vector.
+std::atomic<size_t> pending_channel_free_count{0};
+
+}  // namespace
+
+// How long a torn-down channel's outputs/freqlist/config_signature sit in pending_channel_frees
+// before reclaim_pending_channel_frees() actually frees them. Must comfortably exceed the widest
+// window any reader could still be using a captured pointer from before teardown -
+// write_stats_file()'s (src/output.cpp) 15-second STATS_FILE_TIMING throttle is the longest-period
+// unsynchronized reader of this memory (it has no `enabled` gate at all, unlike the demod thread's
+// and output_check_thread's per-channel loops), so this is set to comfortably more than double
+// that: any write_stats_file() call already in flight when a channel is torn down is long finished
+// (that function runs to completion in well under a second) by the time this elapses. A plain
+// externally-linked global rather than a file-local const, same rationale as
+// mixer_capacity_finalized (rtl_airband.h): unit tests need to shrink this to something that
+// doesn't make the test suite take 30+ seconds per case; production code never touches it.
+double reclaim_grace_period_sec = 30.0;
+
+size_t pending_channel_free_backlog() {
+    return pending_channel_free_count.load(std::memory_order_relaxed);
+}
+
 // See channel_t::pending_remove_request's comment (rtl_airband.h) and channel_request_remove()'s
-// declaration (live_reconfig.h) for the full rationale of what this does and does not free.
-// `enabled = false` is set first (before anything is touched or freed) for the same reason
-// channel_apply_disable() sets it first: output_check_thread() (src/output.cpp) gates its own
-// per-channel output access on this flag - setting it first is what keeps that thread from
-// reaching in while this teardown runs, same protection the pre-existing disable feature already
-// relies on.
+// declaration (live_reconfig.h) for the full rationale of what this does and does not free
+// immediately vs. defer. `enabled = false` is set first (before anything is touched or freed) for
+// the same reason channel_apply_disable() sets it first: output_check_thread() (src/output.cpp)
+// gates its own per-channel output access on this flag - setting it first is what keeps that
+// thread from reaching in while this teardown runs, same protection the pre-existing disable
+// feature already relies on.
 void channel_teardown_for_removal(channel_t* channel) {
     channel->enabled = false;
     disable_channel_outputs(channel, /*permanent=*/true);
@@ -154,9 +264,65 @@ void channel_teardown_for_removal(channel_t* channel) {
             output->lamebuf = NULL;
         }
     }
+    // Queued, not freed here - see reclaim_grace_period_sec's comment above. channel->outputs/
+    // freqlist/config_signature are deliberately left pointing at this (still-valid, not-yet-freed)
+    // memory: if this slot gets reused by a later parse_channel() call (a live edit, not just a
+    // removal), those fields are simply overwritten with fresh pointers - the old ones are already
+    // safely captured here and will be freed on schedule regardless of what happens to the channel
+    // struct itself afterward.
+    PendingChannelFree pending;
+    pending.outputs = channel->outputs;
+    pending.output_count = channel->output_count;
+    pending.freqlist = channel->freqlist;
+    pending.freq_count = channel->freq_count;
+    pending.config_signature = channel->config_signature;
+    gettimeofday(&pending.retired_at, NULL);
+    pthread_mutex_lock(&pending_channel_free_mutex);
+    pending_channel_frees.push_back(pending);
+    pending_channel_free_count.store(pending_channel_frees.size(), std::memory_order_relaxed);
+    pthread_mutex_unlock(&pending_channel_free_mutex);
+
     // Permanent - see channel_t::removed's comment (rtl_airband.h) for why this must never be
     // reset except by parse_channel() populating a fresh channel into this slot.
     channel->removed.store(true, std::memory_order_release);
+}
+
+void reclaim_pending_channel_frees() {
+    if (pending_channel_free_count.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    std::vector<PendingChannelFree> ready;
+    pthread_mutex_lock(&pending_channel_free_mutex);
+    auto it = pending_channel_frees.begin();
+    while (it != pending_channel_frees.end()) {
+        if (delta_sec(&it->retired_at, &now) >= reclaim_grace_period_sec) {
+            ready.push_back(*it);
+            it = pending_channel_frees.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    pending_channel_free_count.store(pending_channel_frees.size(), std::memory_order_relaxed);
+    pthread_mutex_unlock(&pending_channel_free_mutex);
+
+    for (PendingChannelFree& pending : ready) {
+        for (int k = 0; k < pending.output_count; k++) {
+            free_output_data(pending.outputs + k);
+        }
+        free(pending.outputs);
+        // Only ever queued by channel_teardown_for_removal(), which output_thread() only ever
+        // calls on a real device channel (dev->channels[j], never mixer->channel) - freqlist is
+        // always mk_freqlist()-allocated (config.cpp) and non-NULL here by construction.
+        for (int k = 0; k < pending.freq_count; k++) {
+            free(pending.freqlist[k].label);
+        }
+        free(pending.freqlist);
+        free(pending.config_signature);
+    }
 }
 
 namespace {

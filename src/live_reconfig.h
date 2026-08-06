@@ -111,17 +111,36 @@ void channel_apply_disable(channel_t* channel);
 // apply split as enable/disable above, but with a stronger completion guarantee - see
 // channel_t::pending_remove_request's comment (rtl_airband.h). channel_request_remove() is safe
 // to call from the control socket thread; channel_teardown_for_removal() must only run inside the
-// output thread that owns this channel. Deliberately narrower than a full free: closes
-// connections (disable_channel_outputs()) and frees each output's LAME encoder/lamebuf - the one
-// resource that scales meaningfully with channel count (see LAMEBUF_SIZE) - but leaves
-// channel->outputs/freqlist and each output's own `data` struct allocated. Freeing those would
-// touch memory output_check_thread() (src/output.cpp) reads with no synchronization beyond the
-// same `enabled` check this teardown already sets first, and they're comparatively small (a few
-// hundred bytes to low KB per channel) - the same "leaked, not unwound" tradeoff item 27 already
-// accepts for a batch-append failure, applied here to every removal rather than only a rare
-// failure path.
+// output thread that owns this channel. Closes connections (disable_channel_outputs()) and frees
+// each output's LAME encoder/lamebuf immediately (the one resource that scales meaningfully with
+// channel count - see LAMEBUF_SIZE), then hands channel->outputs/freqlist/config_signature and
+// each output's own `data` struct off to reclaim_pending_channel_frees() (below) rather than
+// freeing them immediately: output_check_thread() (src/output.cpp), the demod thread, and
+// write_stats_file() (src/output.cpp) all read this memory with no synchronization beyond, at
+// best, the same `enabled` check this teardown already sets first - write_stats_file() has no
+// gate on it at all. Freeing on a delay closes that window without touching any of those threads'
+// hot-path code.
 bool channel_request_remove(channel_t* channel, int timeout_us = 500000);
 void channel_teardown_for_removal(channel_t* channel);
+
+// Actually frees channel->outputs/freqlist/config_signature (and each output's own `data`
+// struct) for every channel_teardown_for_removal() call whose reclaim_grace_period_sec (see
+// live_reconfig.cpp) has elapsed since teardown - see channel_teardown_for_removal()'s comment
+// above for why teardown itself only queues rather than frees directly. Called once per pass from
+// output_thread() (src/output.cpp), the same thread that already owns this memory via
+// channel_teardown_for_removal() - a fast, lock-free size check makes this effectively free when
+// nothing is queued, which is true for the overwhelming majority of passes on any instance that
+// isn't actively being live-edited.
+void reclaim_pending_channel_frees();
+
+// Test-only hooks (live_reconfig.cpp): reclaim_grace_period_sec defaults to 30.0 in production and
+// is never touched by production code - tests shrink it (e.g. to 0.0) so
+// reclaim_pending_channel_frees() can be exercised deterministically without a real 30-second
+// sleep. pending_channel_free_backlog() exposes the otherwise-encapsulated queue depth so a test
+// can assert a teardown queued exactly what it expected, and that a reclaim pass actually drained
+// it.
+extern double reclaim_grace_period_sec;
+size_t pending_channel_free_backlog();
 
 // Connection-establishing half of init_output() (rtl_airband.cpp), redone for every output on an
 // already-initialized channel (lame/lamebuf already allocated once at startup, not touched again

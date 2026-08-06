@@ -2170,10 +2170,24 @@ class ChannelRemoveTest : public ChannelAppendTest {
     }
 
     void TearDown() override {
+        // Drain whatever channel_teardown_for_removal() (called via start_consumer() in the tests
+        // below) queued for deferred free - see reclaim_grace_period_sec's comment
+        // (live_reconfig.h). Without this, a later test that shrinks the grace period to reclaim
+        // deterministically (ReclaimPendingChannelFreesTest) would double-free memory this
+        // fixture's own direct frees below already freed.
+        double saved_grace_period = reclaim_grace_period_sec;
+        reclaim_grace_period_sec = 0.0;
+        reclaim_pending_channel_frees();
+        reclaim_grace_period_sec = saved_grace_period;
+
         free(freq0);
-        free(freq1);
         free(chans[0].config_signature);
-        free(chans[1].config_signature);
+        if (!chans[1].removed.load()) {
+            // Never torn down (e.g. the timeout test, which runs no consumer thread) - the drain
+            // above had nothing queued for it, so this still needs a direct free.
+            free(freq1);
+            free(chans[1].config_signature);
+        }
         ChannelAppendTest::TearDown();
     }
 
@@ -2749,4 +2763,150 @@ devices:
     EXPECT_TRUE(mixer.input_mask[0]);
     EXPECT_FALSE(mixer.input_removed[0]);
     EXPECT_FLOAT_EQ(mixer.inputs[mdata->input].ampl, fminf(1.0f, 1.0f - 0.7f));
+}
+
+// item 40: channel_teardown_for_removal() used to deliberately leak channel->outputs/freqlist/
+// config_signature and each output's own `data` struct, because write_stats_file() (no `enabled`
+// gate at all) and, more weakly, the demod thread's and output_check_thread's `enabled`-gated
+// loops could still be mid-access when a channel is torn down. reclaim_pending_channel_frees()
+// defers the actual free by reclaim_grace_period_sec (production: 30s, comfortably longer than
+// write_stats_file()'s 15s throttle) instead of freeing inline, closing that window without
+// touching any hot-path reader's code at all.
+class ReclaimPendingChannelFreesTest : public TestBaseClass {
+   protected:
+    void TearDown() override {
+        // Whatever a given test left queued, make sure nothing lingers for a LATER test's own
+        // drain to trip over - same concern as ChannelRemoveTest::TearDown() (this file, above).
+        reclaim_grace_period_sec = 0.0;
+        reclaim_pending_channel_frees();
+        reclaim_grace_period_sec = 30.0;
+        TestBaseClass::TearDown();
+    }
+};
+
+TEST_F(ReclaimPendingChannelFreesTest, teardown_queues_without_freeing_immediately) {
+    channel_t channel = {};
+    channel.pending_remove_request = -1;
+    channel.freqlist = (freq_t*)calloc(1, sizeof(freq_t));
+    channel.freqlist[0].frequency = 120000000;
+    channel.freqlist[0].label = strdup("test-freq");
+    channel.freq_count = 1;
+    channel.config_signature = strdup("test-signature");
+    channel.output_count = 0;
+    channel.outputs = nullptr;
+
+    ASSERT_EQ(pending_channel_free_backlog(), 0u);
+    // Effectively "never", so the immediate reclaim attempt below is guaranteed to find nothing
+    // ready, regardless of how much wall-clock time this process has already been running.
+    reclaim_grace_period_sec = 3600.0;
+
+    channel_teardown_for_removal(&channel);
+    EXPECT_EQ(pending_channel_free_backlog(), 1u);
+    EXPECT_TRUE(channel.removed.load());
+
+    reclaim_pending_channel_frees();
+    EXPECT_EQ(pending_channel_free_backlog(), 1u) << "grace period hasn't elapsed - nothing should free yet";
+
+    reclaim_grace_period_sec = 0.0;
+    reclaim_pending_channel_frees();
+    EXPECT_EQ(pending_channel_free_backlog(), 0u);
+}
+
+// Real allocations matching parse_outputs()'s (config.cpp) exact shape for every output type
+// except O_MIXER (mixer_data's slot-reclaim path is already covered end-to-end by test_mixer.cpp
+// and the mixer-edit test above; free_output_data()'s O_MIXER branch is a plain free() with no
+// nested pointers, so there's nothing type-specific left to prove here). The actual assertion is
+// implicit: a double-free, a free()/delete mismatch, or a heap-buffer-overflow anywhere in
+// free_output_data() aborts the whole test binary under ASan before reaching the final EXPECT.
+TEST_F(ReclaimPendingChannelFreesTest, frees_every_non_mixer_output_type_without_corrupting_the_heap) {
+    channel_t channel = {};
+    channel.pending_remove_request = -1;
+    channel.freqlist = (freq_t*)calloc(2, sizeof(freq_t));
+    channel.freqlist[0].frequency = 120000000;
+    channel.freqlist[0].label = strdup("freq-a");
+    channel.freqlist[1].frequency = 120050000;
+    channel.freqlist[1].label = nullptr;  // labels are optional - must tolerate NULL
+    channel.freq_count = 2;
+    channel.config_signature = strdup("test-signature");
+
+    const int kOutputCount = 3
+#ifdef WITH_PULSEAUDIO
+                             + 1
+#endif /* WITH_PULSEAUDIO */
+        ;
+    channel.output_count = kOutputCount;
+    channel.outputs = (output_t*)XCALLOC(kOutputCount, sizeof(output_t));
+    int idx = 0;
+
+    // O_ICECAST - every string field strdup'd (config.cpp).
+    channel.outputs[idx].type = O_ICECAST;
+    icecast_data* idata = (icecast_data*)XCALLOC(1, sizeof(icecast_data));
+    idata->hostname = strdup("icecast.example.com");
+    idata->username = strdup("source");
+    idata->password = strdup("hunter2");
+    idata->mountpoint = strdup("/test");
+    idata->name = strdup("Test Stream");
+    idata->genre = strdup("Scanner");
+    idata->description = strdup("A test stream");
+    channel.outputs[idx].data = idata;
+    idx++;
+
+    // O_FILE with a nested rdio_scanner block - both `new`'d (config.cpp).
+    channel.outputs[idx].type = O_FILE;
+    file_data* fdata = new file_data();
+    fdata->type = O_FILE;
+    fdata->basedir = "/tmp";
+    fdata->basename = "test";
+    fdata->suffix = ".mp3";
+    fdata->post_write_script = "/usr/bin/true";
+#ifdef WITH_RDIO_SCANNER
+    rdio_scanner_data* rsdata = new rdio_scanner_data();
+    rsdata->server = "rdio.example.com";
+    rsdata->api_key = "test-key";
+    rsdata->system_label = "Test System";
+    rsdata->talkgroup_label = "Test TG";
+    rsdata->talkgroup_tag = "Tag";
+    rsdata->talkgroup_group = "Group";
+    fdata->rdio_scanner = rsdata;
+#endif /* WITH_RDIO_SCANNER */
+    channel.outputs[idx].data = fdata;
+    idx++;
+
+    // O_UDP_STREAM - dest_address/dest_port strdup'd; buffers XCALLOC'd exactly as
+    // udp_stream_init() (udp_stream.cpp) would for a resampled, non-float, stereo output.
+    channel.outputs[idx].type = O_UDP_STREAM;
+    udp_stream_data* sdata = (udp_stream_data*)XCALLOC(1, sizeof(udp_stream_data));
+    sdata->dest_address = strdup("127.0.0.1");
+    sdata->dest_port = strdup("9001");
+    sdata->convert_buffer = XCALLOC(100, sizeof(int16_t));
+    sdata->resample_buffer = (float*)XCALLOC(100, sizeof(float));
+    sdata->resample_left_buffer = (float*)XCALLOC(100, sizeof(float));
+    sdata->resample_right_buffer = (float*)XCALLOC(100, sizeof(float));
+    sdata->stereo_buffer = (float*)XCALLOC(200, sizeof(float));
+    sdata->send_socket = -1;
+    channel.outputs[idx].data = sdata;
+    idx++;
+
+#ifdef WITH_PULSEAUDIO
+    // O_PULSE - strdup'd string fields; pa_context/pa_stream stay NULL (never opened by this
+    // test), matching a channel whose pulse_shutdown() already ran during disable_channel_
+    // outputs().
+    channel.outputs[idx].type = O_PULSE;
+    pulse_data* pdata = (pulse_data*)XCALLOC(1, sizeof(pulse_data));
+    pdata->server = strdup("pulse.example.com");
+    pdata->name = strdup("rtl_airband");
+    pdata->sink = strdup("test-sink");
+    pdata->stream_name = strdup("Test Channel");
+    channel.outputs[idx].data = pdata;
+    idx++;
+#endif /* WITH_PULSEAUDIO */
+
+    ASSERT_EQ(idx, kOutputCount);
+
+    channel_teardown_for_removal(&channel);
+    EXPECT_EQ(pending_channel_free_backlog(), 1u);
+
+    reclaim_grace_period_sec = 0.0;
+    reclaim_pending_channel_frees();
+    EXPECT_EQ(pending_channel_free_backlog(), 0u);
 }

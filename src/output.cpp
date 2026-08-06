@@ -1357,6 +1357,11 @@ void* output_thread(void* param) {
         if (output_param->device_start == 0) {
             write_stats_file(&last_stats_write);
         }
+        // Frees whatever channel_teardown_for_removal() (live_reconfig.cpp) queued at least
+        // RECLAIM_GRACE_PERIOD_SEC ago - see that function's comment for why the actual free is
+        // deferred this long instead of running inline during teardown. Cheap no-op on every pass
+        // where nothing is queued, which is the common case.
+        reclaim_pending_channel_frees();
     }
 
     // waveavail=1 set by the demod just before do_exit may have been missed if
