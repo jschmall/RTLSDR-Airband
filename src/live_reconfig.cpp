@@ -154,6 +154,9 @@ void channel_teardown_for_removal(channel_t* channel) {
             output->lamebuf = NULL;
         }
     }
+    // Permanent - see channel_t::removed's comment (rtl_airband.h) for why this must never be
+    // reset except by parse_channel() populating a fresh channel into this slot.
+    channel->removed.store(true, std::memory_order_release);
 }
 
 namespace {
@@ -610,7 +613,7 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
             // channel that used to be at this index isn't there anymore").
             int compare_limit = min((int)dev->channel_count, snap.channel_count);
             int common_prefix = 0;
-            while (common_prefix < compare_limit && dev->channels[common_prefix].config_signature != nullptr &&
+            while (common_prefix < compare_limit && !dev->channels[common_prefix].removed.load(std::memory_order_acquire) && dev->channels[common_prefix].config_signature != nullptr &&
                    snap.channel_signature[common_prefix] == dev->channels[common_prefix].config_signature) {
                 common_prefix++;
             }

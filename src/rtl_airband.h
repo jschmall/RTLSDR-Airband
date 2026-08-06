@@ -390,6 +390,25 @@ struct channel_t {
     // dev->channel_count as soon as it sees an early completion signal would be doing so while
     // frees are potentially still in flight.
     std::atomic<int> pending_remove_request;
+    // Permanent tombstone, set by channel_teardown_for_removal() (live_reconfig.cpp) once a
+    // removal has actually completed (LAME encoder freed) - reset to false only by parse_channel()
+    // (config.cpp), when a fresh channel is parsed into this slot (startup, or a later live
+    // append reusing this index after a successful removal). Exists because
+    // try_remove_channels() (live_reconfig.cpp) can give up waiting on a slow/stuck output thread
+    // and return without decrementing dev->channel_count, leaving this index looking "still live"
+    // to anything bounds-checking against channel_count (get_device_and_channel(),
+    // control_socket.cpp) even though the removal is either in flight or has already actually
+    // completed. Checked together with pending_remove_request (!= -1 means a removal is currently
+    // in flight) so a direct channel_enable/channel_disable command can never be issued against a
+    // channel whose removal was requested, whether or not the output thread has gotten to it yet
+    // - the alternative (letting it through) is a real crash: channel_apply_enable() never
+    // reallocates the LAME encoder channel_teardown_for_removal() already freed, so the next
+    // process_outputs() pass calls into LAME with a null encoder. Also checked by
+    // compute_and_apply_diff()'s common-prefix signature walk (live_reconfig.cpp), so reverting a
+    // config edit back to a tombstoned channel's exact original definition doesn't look like "no
+    // change" and get silently skipped - a tombstoned index is always treated as diverged,
+    // forcing it to be retried rather than left permanently dead.
+    std::atomic<bool> removed;
     int output_count;
     output_t* outputs;
     int highpass;  // highpass filter cutoff

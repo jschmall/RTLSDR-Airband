@@ -502,6 +502,7 @@ bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx,
     channel->enabled = chan_setting.exists("enabled") ? (bool)chan_setting["enabled"] : true;
     channel->pending_enable_request = -1;
     channel->pending_remove_request = -1;
+    channel->removed = false;
     channel->highpass = chan_setting.exists("highpass") ? (int)chan_setting["highpass"] : 100;
     channel->lowpass = chan_setting.exists("lowpass") ? (int)chan_setting["lowpass"] : 2500;
 #ifdef NFM

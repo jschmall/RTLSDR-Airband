@@ -247,6 +247,97 @@ TEST_F(ControlSocketDispatchTest, channel_enable_rejects_missing_device) {
     EXPECT_NE(response.find("'device'"), string::npos);
 }
 
+// Regression tests for a real crash: get_device_and_channel() used to bounds-check purely on
+// dev->channel_count, which try_remove_channels() (live_reconfig.cpp) can leave stale after a
+// timed-out removal - a channel index can be "still counted as live" while its removal is
+// actually in flight or has already completed (LAME encoder freed). Letting channel_enable
+// through in that window would reconnect outputs without ever reallocating LAME
+// (channel_apply_enable() doesn't - only init_output() does, at startup/append time), so the
+// next process_outputs() pass calls into LAME with a null encoder and crashes the whole output
+// thread. See channel_t::removed's comment (rtl_airband.h) for the full scenario.
+
+TEST_F(ControlSocketDispatchTest, channel_enable_rejects_channel_with_removal_in_flight) {
+    channel_t chan = {};
+    chan.pending_enable_request = -1;
+    chan.pending_remove_request = 1;  // removal requested, not yet consumed by output_thread()
+    chan.removed = false;
+
+    device_t dev = {};
+    dev.channel_count = 1;
+    dev.channels = &chan;
+    devices = &dev;
+    device_count = 1;
+
+    string response = control_socket_dispatch_command({{"cmd", "channel_enable"}, {"device", "0"}, {"channel", "0"}});
+
+    EXPECT_NE(response.find("\"ok\":false"), string::npos) << "response: " << response;
+    EXPECT_NE(response.find("being removed"), string::npos) << "response: " << response;
+    EXPECT_EQ(chan.pending_enable_request.load(), -1) << "must never post an enable request against this index";
+}
+
+TEST_F(ControlSocketDispatchTest, channel_enable_rejects_already_removed_channel) {
+    channel_t chan = {};
+    chan.pending_enable_request = -1;
+    chan.pending_remove_request = -1;  // removal already completed and consumed
+    chan.removed = true;               // ...but dev->channel_count was never decremented for it
+
+    device_t dev = {};
+    dev.channel_count = 1;
+    dev.channels = &chan;
+    devices = &dev;
+    device_count = 1;
+
+    string response = control_socket_dispatch_command({{"cmd", "channel_enable"}, {"device", "0"}, {"channel", "0"}});
+
+    EXPECT_NE(response.find("\"ok\":false"), string::npos) << "response: " << response;
+    EXPECT_NE(response.find("already been removed"), string::npos) << "response: " << response;
+    EXPECT_EQ(chan.pending_enable_request.load(), -1) << "must never post an enable request against this index";
+}
+
+TEST_F(ControlSocketDispatchTest, channel_disable_also_rejects_removed_channel) {
+    // Same bounds-check helper (get_device_and_channel()) backs channel_disable too - one test to
+    // confirm the fix isn't specific to channel_enable's call site.
+    channel_t chan = {};
+    chan.pending_remove_request = -1;
+    chan.removed = true;
+
+    device_t dev = {};
+    dev.channel_count = 1;
+    dev.channels = &chan;
+    devices = &dev;
+    device_count = 1;
+
+    string response = control_socket_dispatch_command({{"cmd", "channel_disable"}, {"device", "0"}, {"channel", "0"}});
+
+    EXPECT_NE(response.find("\"ok\":false"), string::npos) << "response: " << response;
+    EXPECT_NE(response.find("already been removed"), string::npos) << "response: " << response;
+}
+
+TEST_F(ControlSocketDispatchTest, channel_enable_accepts_a_normal_never_removed_channel) {
+    // Confirms the new check doesn't over-reject a channel that was never touched by removal -
+    // no consumer thread here, so channel_request_enable() will time out waiting for
+    // confirmation (nothing resets pending_enable_request back to -1), same as a real "output
+    // thread is busy" case. What matters for this test is that get_device_and_channel() let the
+    // request through at all (pending_enable_request actually got posted), not full end-to-end
+    // application - that path is already covered by the retune consumer-thread tests above.
+    channel_t chan = {};
+    chan.pending_remove_request = -1;
+    chan.removed = false;
+
+    device_t dev = {};
+    dev.channel_count = 1;
+    dev.channels = &chan;
+    devices = &dev;
+    device_count = 1;
+
+    string response = control_socket_dispatch_command({{"cmd", "channel_enable"}, {"device", "0"}, {"channel", "0"}});
+
+    EXPECT_EQ(response.find("being removed"), string::npos) << "response: " << response;
+    EXPECT_EQ(response.find("already been removed"), string::npos) << "response: " << response;
+    EXPECT_EQ(response.find("out of range"), string::npos) << "response: " << response;
+    EXPECT_EQ(chan.pending_enable_request.load(), 1) << "request should have been posted (even if not yet confirmed)";
+}
+
 TEST_F(ControlSocketDispatchTest, mixer_enable_rejects_unknown_mixer_name) {
     string response = control_socket_dispatch_command({{"cmd", "mixer_enable"}, {"mixer", "does_not_exist"}});
     EXPECT_NE(response.find("\"ok\":false"), string::npos);

@@ -161,7 +161,20 @@ bool get_device_and_channel(const map<string, string>& fields, channel_t** chann
         *err = "channel index out of range";
         return false;
     }
-    *channel = dev->channels + idx;
+    channel_t* candidate = dev->channels + idx;
+    // A removal request against this index may still be in flight (try_remove_channels(),
+    // live_reconfig.cpp, gave up waiting on a slow output thread without decrementing
+    // dev->channel_count) or may have already completed (channel_teardown_for_removal() already
+    // freed this channel's LAME encoder) - dev->channel_count alone can't distinguish either case
+    // from "still a normal, live channel". Either way this index must be rejected: applying a
+    // channel_enable here would reconnect outputs without ever reallocating LAME, and the next
+    // process_outputs() pass would call into it with a null encoder. See channel_t::removed's
+    // comment (rtl_airband.h) for the full rationale.
+    if (candidate->pending_remove_request.load(std::memory_order_acquire) != -1 || candidate->removed.load(std::memory_order_acquire)) {
+        *err = "channel is being removed or has already been removed";
+        return false;
+    }
+    *channel = candidate;
     return true;
 }
 

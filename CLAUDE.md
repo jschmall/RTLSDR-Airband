@@ -1026,6 +1026,66 @@ Keep the local delta small and well understood.
       Debug+NFM, and ASan/UBSan. Verified end-to-end against real RTL-SDR hardware: a normal
       `retune` command still works, and a stuck client no longer wedges a second client's request
       past the new timeout.
+38. **Channel removal: tombstone to prevent a real crash on a stale index** (`src/rtl_airband.h`,
+    `src/config.cpp`, `src/live_reconfig.cpp`, `src/control_socket.cpp`) — the second, harder
+    finding from the same pre-merge review pass as item 37, and the highest-severity of the four:
+    a genuine crash path, not just tech debt.
+    - **The bug**: `try_remove_channels()` (`live_reconfig.cpp`) only decrements
+      `dev->channel_count` after `channel_request_remove()` confirms the output thread has
+      finished tearing a channel down. If that confirmation times out (plausible under real load —
+      a congested Icecast connection, exactly this fork's actual Broadcastify-over-the-internet
+      deployment shape), `try_remove_channels()` gives up and reports the channel as not removed —
+      but the request it already posted is still live and *will* be processed by the output thread
+      whenever it next catches up, asynchronously, with no further correlation back to the caller.
+      `dev->channel_count` is never decremented for that index. In that window (which can be
+      arbitrarily long, not just the ~500ms request timeout, if the output thread was genuinely
+      stuck), the channel index looks "still live" to `get_device_and_channel()`
+      (`control_socket.cpp`), the sole bounds check backing the standalone `channel_enable`/
+      `channel_disable` commands — but the removal is either in flight or has already actually
+      completed, freeing the channel's LAME encoder (`channel_teardown_for_removal()`). If a
+      `channel_enable` command lands on that same index in this window, `channel_apply_enable()`
+      reopens the channel's connections but never reallocates LAME (only `init_output()` does,
+      called only at startup or for a freshly-appended channel) — the next `process_outputs()`
+      pass then calls into LAME with a null encoder and crashes the entire `output_thread()`,
+      taking down **every feed on that instance**, not just the one channel being edited.
+    - **A second, quieter bug from the same root cause**: `channel_teardown_for_removal()` never
+      updates `channel->config_signature`. If an operator reverts a channel deletion in the config
+      file (restoring the exact original definition), `compute_and_apply_diff()`'s common-prefix
+      signature match (item 30) would previously see "signature unchanged" and never re-diff that
+      index again — the channel stays permanently, silently dead (torn down, `enabled = false`)
+      with no way for `reload_diff` to ever revive it short of a full restart.
+    - **The fix**: a new permanent tombstone, `channel_t::removed` (`rtl_airband.h`), set by
+      `channel_teardown_for_removal()` once a removal has actually completed, and reset to `false`
+      only by `parse_channel()` (`config.cpp`) populating a fresh channel into a reused slot
+      (mirroring exactly how `pending_enable_request`/`pending_remove_request` are already reset
+      there). Checked in two places:
+      - `get_device_and_channel()` (`control_socket.cpp`) now rejects any index where
+        `pending_remove_request != -1` (a removal is currently in flight - closes the window
+        *before* teardown completes too, not just after) or `removed == true` (already torn
+        down) — closing the crash path entirely, with a clear error instead of a silent time bomb.
+      - `compute_and_apply_diff()`'s common-prefix walk (`live_reconfig.cpp`) now treats a
+        tombstoned channel as always diverged, regardless of signature match — forcing a reverted
+        delete to be correctly retried and revived instead of silently skipped forever.
+    - Investigated and deliberately did *not* tombstone at the moment a removal is merely
+      *requested* (i.e., inside `channel_request_remove()` itself) as a simpler alternative:
+      checking `pending_remove_request != -1` already covers that entire in-flight window, so a
+      separate request-time tombstone would be redundant - the two checks together (in-flight OR
+      already-removed) close the full window with no gap, using one new field rather than two.
+    - Unit tested in `src/test_control_socket.cpp`'s `ControlSocketDispatchTest` (four new cases:
+      rejects a channel with a removal in flight, rejects an already-removed channel, confirms
+      `channel_disable` is covered by the same fix, confirms a normal never-removed channel is
+      unaffected — each asserting `pending_enable_request` is never posted against a rejected
+      index, the actual mechanism that would otherwise lead to the crash) and
+      `src/test_live_reconfig.cpp`'s new `ChannelAppendTest.tombstoned_channel_is_revived_even_
+      when_its_signature_still_matches` (the full revert-a-delete scenario: a channel tombstoned
+      with a config_signature that still matches the file is correctly torn down and re-appended,
+      not silently skipped, and the tombstone is cleared on revival). All 215 tests (5 net new)
+      pass across Debug, Debug+NFM, and ASan/UBSan. Verified end-to-end against real RTL-SDR
+      hardware: normal `channel_enable`/`channel_disable`/`retune` all confirmed unaffected by the
+      new check (this fix is pure software bounds-checking logic with no new hardware interaction,
+      so hardware verification was scoped to confirming no regression, not reproducing the exact
+      race - which is precisely and directly exercised by the unit tests' simulated stuck/working
+      consumer threads instead).
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

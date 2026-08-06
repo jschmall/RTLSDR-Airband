@@ -2343,6 +2343,98 @@ devices:
     EXPECT_EQ(chans[0].output_count, 1);
 }
 
+// Regression test for the "silent permanent death" half of the tombstone fix: a channel whose
+// removal previously timed out (try_remove_channels() gave up without decrementing
+// dev->channel_count - see channel_t::removed's comment, rtl_airband.h) but has since actually
+// been torn down by output_thread() is left with config_signature unchanged. If the operator
+// reverts their config edit back to that channel's exact original definition, the file's
+// signature at that index now MATCHES the live (stale) one - before this fix,
+// compute_and_apply_diff()'s common-prefix walk would see "signature matches" and conclude
+// nothing needs to happen, permanently skipping re-diffing this index on every future
+// reload_diff, even though the live channel is actually dead (enabled=false, LAME freed).
+// Marking `removed` channels as always-diverged (regardless of signature) forces this index to
+// be retried and correctly revived.
+TEST_F(ChannelAppendTest, tombstoned_channel_is_revived_even_when_its_signature_still_matches) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    freq_t* freq_a = (freq_t*)calloc(1, sizeof(freq_t));
+    freq_a->frequency = 120000000;
+
+    channel_t chans[1] = {};
+    chans[0].freqlist = freq_a;
+    chans[0].freq_count = 1;
+    chans[0].pending_remove_request = -1;
+    size_t bins[1] = {0};
+    size_t base_bins[1] = {0};
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 1;
+    dev.channel_capacity = 1;
+    dev.channels = chans;
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    std::string path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "a"; } ); }
+  );
+});
+)");
+    ConfigSnapshot snapshot;
+    std::string parse_error;
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+
+    // Simulates the exact bug scenario: chans[0]'s signature matches the (reverted) config
+    // exactly, but it was already torn down by a previous, timed-out-from-the-caller's-
+    // perspective removal - channel_count was never decremented for it.
+    chans[0].config_signature = strdup(snapshot.devices[0].channel_signature[0].c_str());
+    chans[0].enabled = false;  // already torn down
+    chans[0].removed = true;   // the tombstone
+
+    std::atomic<bool> stop_consumer{false};
+    std::thread consumer([&]() {
+        while (!stop_consumer.load()) {
+            if (chans[0].pending_remove_request.load(std::memory_order_acquire) == 1) {
+                channel_teardown_for_removal(&chans[0]);
+                chans[0].pending_remove_request.store(-1, std::memory_order_release);
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+    stop_consumer.store(true);
+    consumer.join();
+
+    ASSERT_EQ(dev.channel_count.load(), 1);
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+    bool saw_removed = false, saw_added = false;
+    for (const auto& s : result.applied) {
+        if (s.find("removed 1 channel") != std::string::npos)
+            saw_removed = true;
+        if (s.find("added 1 channel") != std::string::npos)
+            saw_added = true;
+    }
+    EXPECT_TRUE(saw_removed) << "a tombstoned channel must still be retried, not silently skipped";
+    EXPECT_TRUE(saw_added) << "and successfully revived";
+    EXPECT_TRUE(chans[0].enabled.load()) << "channel should be live again";
+    EXPECT_FALSE(chans[0].removed.load()) << "tombstone must be cleared by parse_channel() on revival";
+}
+
 TEST_F(ChannelRemoveTest, removal_timeout_leaves_a_valid_partially_reduced_count) {
     // No consumer thread running - channel_request_remove() must time out (this fixture's default
     // 500ms timeout makes this test slow but deterministic) rather than hang forever, and
