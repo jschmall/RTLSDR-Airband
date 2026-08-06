@@ -28,5 +28,6 @@ typedef struct {
     int index;          // dongle index
     int correction;     // PPM correction
     int gain;           // gain in tenths of dB
+    int bandwidth;      // tuner bandwidth in Hz, 0 = automatic (librtlsdr default)
     int bufcnt;         // libusb buffer count
 } rtlsdr_dev_data_t;

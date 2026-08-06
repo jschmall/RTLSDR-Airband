@@ -756,6 +756,63 @@ Keep the local delta small and well understood.
       during this session's hardware testing — `src/ctcss.h:68`, "load of value 240, which is not
       a valid value for type 'bool'" (an uninitialized-read UB, not a new regression from this
       fix). Flagged as a discovered-but-out-of-scope follow-up per this fork's usual practice.
+33. **Live RTL-SDR tuner bandwidth control** (`src/input-rtlsdr.{cpp,h}`, `src/input-common.h`,
+    `src/live_reconfig.{cpp,h}`) — closes a gap found while scoping a live-bandwidth-adjustment
+    request: `input->set_bandwidth` was hardcoded NULL for the rtlsdr driver with a comment
+    claiming "this driver has no tuner-bandwidth API call anywhere" — verified false against the
+    actual installed dependency (`librtlsdr2 2.0.1`, Ubuntu Noble's `rtl-sdr` package,
+    osmocom-derived): `rtlsdr_set_tuner_bandwidth()` exists and returned success across the full
+    practical range (0=auto, 200kHz-8MHz) against the R820T dongle used to develop and test this.
+    Neither driver (rtlsdr or soapysdr) previously had a *startup*-time bandwidth config option
+    either — only soapysdr had a live hook, reachable solely via the standalone `set_bandwidth`
+    control-socket command, never via `reload_diff` (the only mechanism rtl-airband-panel's
+    `dynamic_reload` branch actually uses).
+    - New optional `bandwidth` device-level config key for rtlsdr (`rtlsdr_parse_config()`,
+      integer Hz, 0 = automatic — librtlsdr's own convention), applied once at `rtlsdr_init()`
+      right after `correction`. Omitting it is fully backward compatible: `dev_data->bandwidth`
+      defaults to 0 (XCALLOC-zeroed), and explicitly calling `rtlsdr_set_tuner_bandwidth(rtl, 0)`
+      at startup is the same "automatic" behavior this driver already had before this existed.
+      Startup failure is fatal, matching item 16's precedent for other tuning parameters
+      (centerfreq/sample_rate/correction) — no special-casing beyond that, since the real-hardware
+      test above found no case where this call failed.
+    - `rtlsdr_set_bandwidth()` implements the pre-existing nullable `input_t::set_bandwidth` hook
+      (item 26) via the same API, so the pre-existing `set_bandwidth` control-socket command
+      (`handle_set_bandwidth`, `input_set_bandwidth()`) now works for rtlsdr with zero changes
+      needed there — only the driver-side NULL was ever missing.
+    - `DeviceConfigSnapshot` gains `has_bandwidth`/`bandwidth` (`live_reconfig.h`), populated in
+      `parse_config_snapshot()` and diffed/applied in `compute_and_apply_diff()` following the
+      exact same pattern gain already uses: `input_t` has no generic live-readable "current
+      bandwidth" (each driver's tracking, where it exists at all, is private to its own
+      `dev_data`), so a `bandwidth` key present in the config file is reapplied unconditionally
+      on every `reload_diff` rather than truly diffed — harmless/idempotent, matching gain's own
+      documented tradeoff. Unlike centerfreq, `input_set_bandwidth()` is synchronous (no
+      `pending_*`/apply-thread split), so its return value is already the real outcome and gets
+      reported accurately (`applied` on success, `skipped_requires_restart` with a
+      not-actually-restart-needed message on a transient hardware failure, silently skipped on
+      `ENOTSUP` for drivers without the hook) — this is what actually makes it usable through the
+      config-edit-then-`reload_diff` workflow the panel and this fork's own deployment rely on,
+      not just the standalone command.
+    - New default member initializers on `DeviceConfigSnapshot::has_bandwidth`/`bandwidth`
+      (`= false`/`= 0`) — a real regression this addition hit during testing: several pre-existing
+      hand-built `DeviceConfigSnapshot` test fixtures only set the fields they cared about, so the
+      new fields were left as indeterminate garbage and intermittently tripped
+      `input_set_bandwidth()`'s `assert(input->dev_data != NULL)` in unrelated tests. The other,
+      pre-existing scalar fields on this struct don't have default initializers and were
+      deliberately left alone (out of scope for this change) — every test that already touches
+      them already sets them explicitly.
+    - Deliberately rtlsdr-only: this fork's actual deployment is exclusively RTL-SDR, one device
+      per instance (see the "Deployment Context" section), and soapysdr already had a live hook;
+      adding soapysdr startup config was left out as unrequested scope.
+    - Unit tested: `DiffApplyTest.bandwidth_not_supported_by_driver_is_silently_skipped_not_reported`/
+      `_applied_via_input_set_bandwidth_is_reported`/`_set_hardware_failure_does_not_mark_input_failed`
+      (mirroring the equivalent gain tests exactly) and `ConfigSnapshotTest.parses_basic_multichannel_device`
+      (extended)/`bandwidth_absent_from_config_reports_has_bandwidth_false`
+      (`src/test_live_reconfig.cpp`). All 190 tests (4 net new) pass across Debug and Debug+NFM.
+      Verified end-to-end against real RTL-SDR hardware: startup `bandwidth = 2000000;` applied
+      cleanly, a live `set_bandwidth` control-socket command changed it to 1000000 Hz, and a
+      config-file edit + `reload_diff` picked up a further change to 3000000 Hz — all three
+      confirmed via log output ("Device #0: bandwidth set to ... Hz") with no crash or sanitizer
+      report.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

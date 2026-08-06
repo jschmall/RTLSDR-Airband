@@ -121,6 +121,16 @@ int rtlsdr_init(input_t* const input) {
         return -1;
     }
 
+    // dev_data->bandwidth defaults to 0 (XCALLOC-zeroed) when "bandwidth" is absent from config,
+    // which librtlsdr treats as "automatic BW selection" - the same behavior this driver already
+    // had before bandwidth control existed here, so omitting the config key is fully backward
+    // compatible.
+    r = rtlsdr_set_tuner_bandwidth(rtl, (uint32_t)dev_data->bandwidth);
+    if (r < 0) {
+        log(LOG_ERR, "Failed to set tuner bandwidth for device #%d. Error %d.\n", dev_data->index, r);
+        return -1;
+    }
+
     // Fitipower FC0012 gain needs to be initialized to its lowest value before setting it to the desired value
     if (rtlsdr_get_tuner_type(rtl) == RTLSDR_TUNER_FC0012) {
         int initialGain = 0;
@@ -212,6 +222,20 @@ int rtlsdr_set_gain(input_t* const input, float const gain) {
     return 0;
 }
 
+int rtlsdr_set_bandwidth(input_t* const input, int const bandwidth) {
+    rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
+    assert(dev_data->dev != NULL);
+
+    int r = rtlsdr_set_tuner_bandwidth(dev_data->dev, (uint32_t)bandwidth);
+    if (r < 0) {
+        log(LOG_ERR, "Failed to set bandwidth for RTLSDR device #%d: error %d\n", dev_data->index, r);
+        return -1;
+    }
+    dev_data->bandwidth = bandwidth;
+    log(LOG_INFO, "Device #%d: bandwidth set to %d Hz\n", dev_data->index, bandwidth);
+    return 0;
+}
+
 int rtlsdr_parse_config(input_t* const input, libconfig::Setting& cfg) {
     rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
     if (cfg.exists("serial")) {
@@ -234,6 +258,13 @@ int rtlsdr_parse_config(input_t* const input, libconfig::Setting& cfg) {
     }
     if (cfg.exists("correction")) {
         dev_data->correction = (int)cfg["correction"];
+    }
+    if (cfg.exists("bandwidth")) {
+        dev_data->bandwidth = (int)cfg["bandwidth"];
+        if (dev_data->bandwidth < 0) {
+            cerr << "RTLSDR configuration error: bandwidth must be >= 0 (0 = automatic)\n";
+            error();
+        }
     }
     if (cfg.exists("buffers")) {
         dev_data->bufcnt = (int)(cfg["buffers"]);
@@ -274,8 +305,7 @@ MODULE_EXPORT input_t* rtlsdr_input_new() {
     input->run_rx_thread = &rtlsdr_rx_thread;
     input->set_centerfreq = &rtlsdr_set_centerfreq;
     input->set_gain = &rtlsdr_set_gain;
-    // set_bandwidth intentionally left NULL - this driver has no tuner-bandwidth API call
-    // anywhere; input_set_bandwidth() will correctly report ENOTSUP for rtlsdr devices.
+    input->set_bandwidth = &rtlsdr_set_bandwidth;
     input->stop = &rtlsdr_stop;
     return input;
 }

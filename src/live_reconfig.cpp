@@ -391,6 +391,8 @@ bool parse_config_snapshot(const string& config_path, ConfigSnapshot* out, strin
         dev.sample_rate = devs[i].exists("sample_rate") ? snapshot_parse_anynum2int(devs[i]["sample_rate"]) : 0;
         dev.centerfreq = (dev.mode == R_MULTICHANNEL && devs[i].exists("centerfreq")) ? snapshot_parse_anynum2int(devs[i]["centerfreq"]) : 0;
         dev.has_gain = snapshot_get_numeric_gain(devs[i], &dev.gain);
+        dev.has_bandwidth = devs[i].exists("bandwidth");
+        dev.bandwidth = dev.has_bandwidth ? snapshot_parse_anynum2int(devs[i]["bandwidth"]) : 0;
 
         dev.channel_enabled.clear();
         dev.channel_signature.clear();
@@ -537,6 +539,21 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
                     result.applied.push_back(label + ": gain -> " + to_string(snap.gain));
                 } else if (errno != ENOTSUP) {
                     result.skipped_requires_restart.push_back(label + ": gain present in config but failed to apply live, see logs");
+                }
+            }
+
+            if (snap.has_bandwidth) {
+                // Same "no live-readable current value" situation as gain above - input_t has no
+                // generic bandwidth field (each driver's tuner-bandwidth state, where tracked at
+                // all, is private to its own dev_data), so this reapplies unconditionally rather
+                // than truly diffing. Unlike centerfreq, input_set_bandwidth() is synchronous (no
+                // pending_*/apply-thread split - see input-common.cpp), so its return value is
+                // already the real outcome, not just "request posted".
+                errno = 0;
+                if (input_set_bandwidth(dev->input, snap.bandwidth) == 0) {
+                    result.applied.push_back(label + ": bandwidth -> " + to_string(snap.bandwidth));
+                } else if (errno != ENOTSUP) {
+                    result.skipped_requires_restart.push_back(label + ": bandwidth present in config but failed to apply live, see logs");
                 }
             }
         }

@@ -62,9 +62,9 @@ struct input_t {
     void* (*run_rx_thread)(void* input_ptr);  // to be launched via pthread_create()
     int (*set_centerfreq)(input_t* const input, int const centerfreq);
     // set_gain/set_bandwidth are nullable, unlike set_centerfreq - not every driver has a live
-    // hook for these (e.g. rtlsdr has no tuner bandwidth API at all). input_set_gain()/
-    // input_set_bandwidth() return -1/ENOTSUP when the driver's pointer is NULL, so callers get
-    // a clear "not supported by this driver" result instead of a silent no-op.
+    // hook for these (e.g. mirisdr has neither). input_set_gain()/input_set_bandwidth() return
+    // -1/ENOTSUP when the driver's pointer is NULL, so callers get a clear "not supported by this
+    // driver" result instead of a silent no-op.
     int (*set_gain)(input_t* const input, float const gain);
     int (*set_bandwidth)(input_t* const input, int const bandwidth);
     int (*stop)(input_t* const input);

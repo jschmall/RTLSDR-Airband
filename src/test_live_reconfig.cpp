@@ -390,6 +390,7 @@ devices:
   gain = 30;
   centerfreq = 120000000;
   sample_rate = 2048000;
+  bandwidth = 2000000;
   channels: ( { freq = 120.000000; enabled = true; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); } );
 });
 )");
@@ -404,8 +405,29 @@ devices:
     EXPECT_EQ(snapshot.devices[0].sample_rate, 2048000);
     ASSERT_TRUE(snapshot.devices[0].has_gain);
     EXPECT_FLOAT_EQ(snapshot.devices[0].gain, 30.0f);
+    ASSERT_TRUE(snapshot.devices[0].has_bandwidth);
+    EXPECT_EQ(snapshot.devices[0].bandwidth, 2000000);
     ASSERT_EQ(snapshot.devices[0].channel_enabled.size(), 1u);
     EXPECT_TRUE(snapshot.devices[0].channel_enabled[0]);
+}
+
+TEST_F(ConfigSnapshotTest, bandwidth_absent_from_config_reports_has_bandwidth_false) {
+    std::string path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  gain = 30;
+  centerfreq = 120000000;
+  channels: ( { freq = 120.000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); } );
+});
+)");
+    ConfigSnapshot snapshot;
+    std::string error;
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &error)) << error;
+
+    ASSERT_EQ(snapshot.devices.size(), 1u);
+    EXPECT_FALSE(snapshot.devices[0].has_bandwidth);
 }
 
 TEST_F(ConfigSnapshotTest, channel_enabled_defaults_true_when_absent) {
@@ -965,6 +987,122 @@ TEST_F(DiffApplyTest, gain_set_hardware_failure_does_not_mark_input_failed) {
     EXPECT_EQ(input.state, INPUT_RUNNING);
     ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
     EXPECT_NE(result.skipped_requires_restart[0].find("gain"), std::string::npos);
+}
+
+TEST_F(DiffApplyTest, bandwidth_not_supported_by_driver_is_silently_skipped_not_reported) {
+    // set_bandwidth == NULL - input_set_bandwidth() returns ENOTSUP, which reload_diff treats as
+    // "nothing to report", not a failure worth flagging on every single reload. Mirrors the
+    // equivalent gain test above.
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.state = INPUT_RUNNING;
+    input.set_bandwidth = nullptr;
+    input.dev_data = &fake_dev_data;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 0;
+    devices = &dev;
+    device_count = 1;
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 0;
+    dsnap.centerfreq = 120000000;
+    dsnap.sample_rate = 2000000;
+    dsnap.has_bandwidth = true;
+    dsnap.bandwidth = 2000000;
+    snapshot.devices.push_back(dsnap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_TRUE(result.applied.empty());
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+}
+
+int fake_set_bandwidth_ok(input_t* const, int const) {
+    return 0;
+}
+
+TEST_F(DiffApplyTest, bandwidth_applied_via_input_set_bandwidth_is_reported) {
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.state = INPUT_RUNNING;
+    input.set_bandwidth = &fake_set_bandwidth_ok;
+    input.dev_data = &fake_dev_data;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 0;
+    devices = &dev;
+    device_count = 1;
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 0;
+    dsnap.centerfreq = 120000000;
+    dsnap.sample_rate = 2000000;
+    dsnap.has_bandwidth = true;
+    dsnap.bandwidth = 2000000;
+    snapshot.devices.push_back(dsnap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    ASSERT_EQ(result.applied.size(), 1u);
+    EXPECT_NE(result.applied[0].find("bandwidth -> 2000000"), std::string::npos);
+}
+
+int fake_set_bandwidth_fails(input_t* const, int const) {
+    return -1;
+}
+
+TEST_F(DiffApplyTest, bandwidth_set_hardware_failure_does_not_mark_input_failed) {
+    // Mirrors gain_set_hardware_failure_does_not_mark_input_failed above - a failed bandwidth
+    // change must not mark the device dead (input_set_bandwidth()'s comment, input-common.cpp).
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.state = INPUT_RUNNING;
+    input.set_bandwidth = &fake_set_bandwidth_fails;
+    input.dev_data = &fake_dev_data;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 0;
+    devices = &dev;
+    device_count = 1;
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 0;
+    dsnap.centerfreq = 120000000;
+    dsnap.sample_rate = 2000000;
+    dsnap.has_bandwidth = true;
+    dsnap.bandwidth = 2000000;
+    snapshot.devices.push_back(dsnap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(input.state, INPUT_RUNNING);
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("bandwidth"), std::string::npos);
 }
 
 TEST_F(DiffApplyTest, mixer_count_mismatch_is_requires_restart) {
