@@ -107,9 +107,9 @@ bool mixer_request_disable(mixer_t* mixer, int timeout_us = 500000);
 
 // A read-only snapshot of the fields reload_diff can act on - deliberately not a full mirror of
 // parse_devices()/parse_channels()/parse_mixers(); it only captures what has a live-apply
-// primitive (centerfreq, numeric gain, bandwidth, channel/mixer enabled) plus what's needed to
-// detect out-of-v1-scope changes (counts, type, mode, sample_rate). Parsing this never touches
-// devices[]/mixers[] or any other live state - re-invoking the real parse_* functions against
+// primitive (centerfreq, numeric gain, bandwidth, correction, channel/mixer enabled) plus what's
+// needed to detect out-of-v1-scope changes (counts, type, mode, sample_rate). Parsing this never
+// touches devices[]/mixers[] or any other live state - re-invoking the real parse_* functions against
 // already-running state would corrupt it (they assume a pristine, XCALLOC'd array).
 struct DeviceConfigSnapshot {
     std::string type;
@@ -125,6 +125,8 @@ struct DeviceConfigSnapshot {
     // DeviceConfigSnapshot and only set the fields they care about.
     bool has_bandwidth = false;  // false if "bandwidth" is absent from the device's config block
     int bandwidth = 0;
+    bool has_correction = false;  // false if "correction" is absent from the device's config block
+    int correction = 0;
     std::vector<bool> channel_enabled;  // size == channel_count
     // Per-channel canonical config signature (build_channel_identity_signature(), config.cpp),
     // built from the same raw Setting parse_channel() itself would see. compute_and_apply_diff()

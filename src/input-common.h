@@ -61,12 +61,14 @@ struct input_t {
     int (*init)(input_t* const input);
     void* (*run_rx_thread)(void* input_ptr);  // to be launched via pthread_create()
     int (*set_centerfreq)(input_t* const input, int const centerfreq);
-    // set_gain/set_bandwidth are nullable, unlike set_centerfreq - not every driver has a live
-    // hook for these (e.g. mirisdr has neither). input_set_gain()/input_set_bandwidth() return
-    // -1/ENOTSUP when the driver's pointer is NULL, so callers get a clear "not supported by this
-    // driver" result instead of a silent no-op.
+    // set_gain/set_bandwidth/set_correction are nullable, unlike set_centerfreq - not every driver
+    // has a live hook for these (e.g. mirisdr has none of the three). input_set_gain()/
+    // input_set_bandwidth()/input_set_correction() return -1/ENOTSUP when the driver's pointer is
+    // NULL, so callers get a clear "not supported by this driver" result instead of a silent
+    // no-op.
     int (*set_gain)(input_t* const input, float const gain);
     int (*set_bandwidth)(input_t* const input, int const bandwidth);
+    int (*set_correction)(input_t* const input, int const correction);
     int (*stop)(input_t* const input);
     pthread_t rx_thread;
     pthread_mutex_t buffer_lock;
@@ -79,6 +81,7 @@ int input_start(input_t* const input);
 int input_set_centerfreq(input_t* const input, int const centerfreq);
 int input_set_gain(input_t* const input, float const gain);
 int input_set_bandwidth(input_t* const input, int const bandwidth);
+int input_set_correction(input_t* const input, int const correction);
 int input_stop(input_t* const input);
 
 #endif /* _INPUT_COMMON_H */

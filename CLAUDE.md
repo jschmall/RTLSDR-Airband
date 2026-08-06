@@ -813,6 +813,42 @@ Keep the local delta small and well understood.
       config-file edit + `reload_diff` picked up a further change to 3000000 Hz — all three
       confirmed via log output ("Device #0: bandwidth set to ... Hz") with no crash or sanitizer
       report.
+34. **Live RTL-SDR frequency correction (PPM) control** (`src/input-rtlsdr.cpp`,
+    `src/input-common.{cpp,h}`, `src/control_socket.cpp`, `src/live_reconfig.{cpp,h}`) — the
+    cheapest item on a user-prioritized live-reconfiguration to-do list scoped in this same
+    session (bandwidth done in item 33; live `sample_rate` change is the remaining, most
+    expensive item — needs RX-thread stop/restart plus buffer/FFT-plan resizing, a different
+    class of change from anything built so far, deliberately not started yet). Unlike bandwidth,
+    `correction` already had startup config support (`rtlsdr_parse_config()`/`rtlsdr_init()`) —
+    this only adds the *live* half, following the exact same three-layer template item 33
+    established: driver hook, standalone control-socket command, `reload_diff` wiring.
+    - New nullable `input_t::set_correction` hook (mirrors `set_gain`/`set_bandwidth` exactly) and
+      `input_set_correction()` (`input-common.{cpp,h}`) — same "failed correction change doesn't
+      mean the RX stream died" non-fatal handling as its siblings.
+    - `rtlsdr_set_correction()` (`input-rtlsdr.cpp`) calls the same `rtlsdr_set_freq_correction()`
+      API `rtlsdr_init()` already uses at startup, including that function's `-2` return code
+      ("already at this value") being treated as success, not failure — matching the startup
+      path's existing handling of the same quirk.
+    - New standalone `set_correction` control-socket command (`handle_set_correction`,
+      `device`/`correction` fields), matching `set_gain`/`set_bandwidth`'s shape exactly.
+    - `DeviceConfigSnapshot` gains `has_correction`/`correction` (defaulted, same rationale as
+      item 33's `has_bandwidth`/`bandwidth` — hand-built test fixtures that predate a field must
+      not see indeterminate garbage), diffed/applied in `compute_and_apply_diff()` following
+      gain/bandwidth's identical "no live-readable current value, reapply unconditionally,
+      synchronous call so the return value is already the real outcome" pattern.
+    - Unit tested: `DiffApplyTest.correction_not_supported_by_driver_is_silently_skipped_not_reported`/
+      `_applied_via_input_set_correction_is_reported`/`_set_hardware_failure_does_not_mark_input_failed`
+      and `ConfigSnapshotTest.parses_basic_multichannel_device` (further extended)/
+      `bandwidth_absent_from_config_reports_has_bandwidth_false` (further extended to also assert
+      `has_correction`) (`src/test_live_reconfig.cpp`). All 193 tests (3 net new) pass across
+      Debug and Debug+NFM. Verified end-to-end against real RTL-SDR hardware: a live
+      `set_correction` command changed correction to 50 ppm, and a config-file edit +
+      `reload_diff` picked up a further change to 65 ppm — both confirmed via log output
+      ("Device #0: freq correction set to ... ppm") with no crash or sanitizer report.
+    - Deliberately out of scope, per explicit user direction when this to-do list was scoped:
+      live `buffers`/`serial`/`index` changes, R_SCAN live reconfiguration, device/mixer count
+      changes, driver `type`/`mode` changes, and all top-level (non-device) settings — none of
+      these are planned.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

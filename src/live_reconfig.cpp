@@ -393,6 +393,8 @@ bool parse_config_snapshot(const string& config_path, ConfigSnapshot* out, strin
         dev.has_gain = snapshot_get_numeric_gain(devs[i], &dev.gain);
         dev.has_bandwidth = devs[i].exists("bandwidth");
         dev.bandwidth = dev.has_bandwidth ? snapshot_parse_anynum2int(devs[i]["bandwidth"]) : 0;
+        dev.has_correction = devs[i].exists("correction");
+        dev.correction = dev.has_correction ? snapshot_parse_anynum2int(devs[i]["correction"]) : 0;
 
         dev.channel_enabled.clear();
         dev.channel_signature.clear();
@@ -554,6 +556,18 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
                     result.applied.push_back(label + ": bandwidth -> " + to_string(snap.bandwidth));
                 } else if (errno != ENOTSUP) {
                     result.skipped_requires_restart.push_back(label + ": bandwidth present in config but failed to apply live, see logs");
+                }
+            }
+
+            if (snap.has_correction) {
+                // Same pattern as bandwidth immediately above - no live-readable current value,
+                // reapplies unconditionally, input_set_correction() is synchronous so its return
+                // value is already the real outcome.
+                errno = 0;
+                if (input_set_correction(dev->input, snap.correction) == 0) {
+                    result.applied.push_back(label + ": correction -> " + to_string(snap.correction));
+                } else if (errno != ENOTSUP) {
+                    result.skipped_requires_restart.push_back(label + ": correction present in config but failed to apply live, see logs");
                 }
             }
         }

@@ -172,3 +172,22 @@ int input_set_bandwidth(input_t* const input, int const bandwidth) {
     }
     return 0;
 }
+
+int input_set_correction(input_t* const input, int const correction) {
+    assert(input != NULL);
+    assert(input->dev_data != NULL);
+    if (input->set_correction == NULL) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    if (input->state != INPUT_RUNNING) {
+        return -1;
+    }
+    int ret = input->set_correction(input, correction);
+    if (ret != 0) {
+        // See input_set_centerfreq()'s comment - a failed correction change doesn't mean the RX
+        // stream died, so it must not be treated as fatal here either.
+        return -1;
+    }
+    return 0;
+}

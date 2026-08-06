@@ -236,6 +236,22 @@ int rtlsdr_set_bandwidth(input_t* const input, int const bandwidth) {
     return 0;
 }
 
+int rtlsdr_set_correction(input_t* const input, int const correction) {
+    rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
+    assert(dev_data->dev != NULL);
+
+    // -2 means "already at this value" (see rtlsdr_init()'s identical handling above) - not a
+    // real failure, just a no-op.
+    int r = rtlsdr_set_freq_correction(dev_data->dev, correction);
+    if (r < 0 && r != -2) {
+        log(LOG_ERR, "Failed to set freq correction for RTLSDR device #%d: error %d\n", dev_data->index, r);
+        return -1;
+    }
+    dev_data->correction = correction;
+    log(LOG_INFO, "Device #%d: freq correction set to %d ppm\n", dev_data->index, correction);
+    return 0;
+}
+
 int rtlsdr_parse_config(input_t* const input, libconfig::Setting& cfg) {
     rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
     if (cfg.exists("serial")) {
@@ -306,6 +322,7 @@ MODULE_EXPORT input_t* rtlsdr_input_new() {
     input->set_centerfreq = &rtlsdr_set_centerfreq;
     input->set_gain = &rtlsdr_set_gain;
     input->set_bandwidth = &rtlsdr_set_bandwidth;
+    input->set_correction = &rtlsdr_set_correction;
     input->stop = &rtlsdr_stop;
     return input;
 }

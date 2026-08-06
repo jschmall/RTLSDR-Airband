@@ -246,6 +246,26 @@ string handle_set_bandwidth(const map<string, string>& fields) {
     return ok_response();
 }
 
+string handle_set_correction(const map<string, string>& fields) {
+    string err;
+    device_t* dev;
+    if (!get_device(fields, &dev, &err)) {
+        return error_response(err);
+    }
+    int correction;
+    if (!get_int_field(fields, "correction", &correction)) {
+        return error_response("missing or invalid 'correction'");
+    }
+    errno = 0;
+    if (input_set_correction(dev->input, correction) != 0) {
+        if (errno == ENOTSUP) {
+            return error_response("correction not supported by this driver");
+        }
+        return error_response("failed to set correction, see logs");
+    }
+    return ok_response();
+}
+
 string handle_channel_enable(const map<string, string>& fields) {
     string err;
     channel_t* channel;
@@ -483,6 +503,8 @@ string control_socket_dispatch_command(const map<string, string>& fields) {
         return handle_set_gain(fields);
     } else if (cmd == "set_bandwidth") {
         return handle_set_bandwidth(fields);
+    } else if (cmd == "set_correction") {
+        return handle_set_correction(fields);
     } else if (cmd == "channel_enable") {
         return handle_channel_enable(fields);
     } else if (cmd == "channel_disable") {

@@ -391,6 +391,7 @@ devices:
   centerfreq = 120000000;
   sample_rate = 2048000;
   bandwidth = 2000000;
+  correction = 80;
   channels: ( { freq = 120.000000; enabled = true; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); } );
 });
 )");
@@ -407,6 +408,8 @@ devices:
     EXPECT_FLOAT_EQ(snapshot.devices[0].gain, 30.0f);
     ASSERT_TRUE(snapshot.devices[0].has_bandwidth);
     EXPECT_EQ(snapshot.devices[0].bandwidth, 2000000);
+    ASSERT_TRUE(snapshot.devices[0].has_correction);
+    EXPECT_EQ(snapshot.devices[0].correction, 80);
     ASSERT_EQ(snapshot.devices[0].channel_enabled.size(), 1u);
     EXPECT_TRUE(snapshot.devices[0].channel_enabled[0]);
 }
@@ -428,6 +431,7 @@ devices:
 
     ASSERT_EQ(snapshot.devices.size(), 1u);
     EXPECT_FALSE(snapshot.devices[0].has_bandwidth);
+    EXPECT_FALSE(snapshot.devices[0].has_correction);
 }
 
 TEST_F(ConfigSnapshotTest, channel_enabled_defaults_true_when_absent) {
@@ -1103,6 +1107,121 @@ TEST_F(DiffApplyTest, bandwidth_set_hardware_failure_does_not_mark_input_failed)
     EXPECT_EQ(input.state, INPUT_RUNNING);
     ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
     EXPECT_NE(result.skipped_requires_restart[0].find("bandwidth"), std::string::npos);
+}
+
+TEST_F(DiffApplyTest, correction_not_supported_by_driver_is_silently_skipped_not_reported) {
+    // Mirrors bandwidth_not_supported_by_driver_is_silently_skipped_not_reported above.
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.state = INPUT_RUNNING;
+    input.set_correction = nullptr;
+    input.dev_data = &fake_dev_data;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 0;
+    devices = &dev;
+    device_count = 1;
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 0;
+    dsnap.centerfreq = 120000000;
+    dsnap.sample_rate = 2000000;
+    dsnap.has_correction = true;
+    dsnap.correction = 80;
+    snapshot.devices.push_back(dsnap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_TRUE(result.applied.empty());
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+}
+
+int fake_set_correction_ok(input_t* const, int const) {
+    return 0;
+}
+
+TEST_F(DiffApplyTest, correction_applied_via_input_set_correction_is_reported) {
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.state = INPUT_RUNNING;
+    input.set_correction = &fake_set_correction_ok;
+    input.dev_data = &fake_dev_data;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 0;
+    devices = &dev;
+    device_count = 1;
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 0;
+    dsnap.centerfreq = 120000000;
+    dsnap.sample_rate = 2000000;
+    dsnap.has_correction = true;
+    dsnap.correction = 80;
+    snapshot.devices.push_back(dsnap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    ASSERT_EQ(result.applied.size(), 1u);
+    EXPECT_NE(result.applied[0].find("correction -> 80"), std::string::npos);
+}
+
+int fake_set_correction_fails(input_t* const, int const) {
+    return -1;
+}
+
+TEST_F(DiffApplyTest, correction_set_hardware_failure_does_not_mark_input_failed) {
+    // Mirrors bandwidth_set_hardware_failure_does_not_mark_input_failed above - a failed
+    // correction change must not mark the device dead (input_set_correction()'s comment,
+    // input-common.cpp).
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.state = INPUT_RUNNING;
+    input.set_correction = &fake_set_correction_fails;
+    input.dev_data = &fake_dev_data;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 0;
+    devices = &dev;
+    device_count = 1;
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 0;
+    dsnap.centerfreq = 120000000;
+    dsnap.sample_rate = 2000000;
+    dsnap.has_correction = true;
+    dsnap.correction = 80;
+    snapshot.devices.push_back(dsnap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(input.state, INPUT_RUNNING);
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("correction"), std::string::npos);
 }
 
 TEST_F(DiffApplyTest, mixer_count_mismatch_is_requires_restart) {
