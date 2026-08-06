@@ -977,6 +977,23 @@ Keep the local delta small and well understood.
       instance deployment (see "Deployment Context"), where this concern doesn't arise at all, but
       worth reconsidering before this feature is used in a genuinely multi-device-per-thread
       deployment.
+36. **`reload_diff` wording consistency: gain/bandwidth/correction failures now say "no restart
+    needed" too** (`src/live_reconfig.cpp`) — found while checking rtl-airband-panel's
+    `LiveApplyBanner` (which classifies `skipped_requires_restart` entries by matching the "no
+    restart needed" substring, added for items 32/35's centerfreq/sample_rate wording) against
+    every field that can land in that array. `gain`/`bandwidth`/`correction` failures (items
+    26/33/34) are the *same* kind of transient, retryable failure as a failed centerfreq/sample_rate
+    change — no live-readable current value, reapplied unconditionally next `reload_diff`, no
+    restart actually required — but their messages just said "present in config but failed to
+    apply live, see logs", with no indication of that. A caller (this panel, or any other control-
+    socket consumer) had no way to distinguish these from a genuinely restart-required entry other
+    than by field name. Appended "- no restart needed, retry reload_diff" to all three messages,
+    matching centerfreq/sample_rate's existing wording exactly. `gain_set_hardware_failure_does_
+    not_mark_input_failed`/`bandwidth_set_hardware_failure_does_not_mark_input_failed`/`correction_
+    set_hardware_failure_does_not_mark_input_failed` (`src/test_live_reconfig.cpp`) each gained an
+    assertion locking in the new substring, mirroring item 32's regression test. All 207 tests
+    pass; not separately re-verified against real hardware since this is a string-only change to
+    an already-hardware-tested failure path (items 26/33/34).
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.

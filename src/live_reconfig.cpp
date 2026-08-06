@@ -725,7 +725,7 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
                 if (input_set_gain(dev->input, snap.gain) == 0) {
                     result.applied.push_back(label + ": gain -> " + to_string(snap.gain));
                 } else if (errno != ENOTSUP) {
-                    result.skipped_requires_restart.push_back(label + ": gain present in config but failed to apply live, see logs");
+                    result.skipped_requires_restart.push_back(label + ": gain present in config but failed to apply live, see logs - no restart needed, retry reload_diff");
                 }
             }
 
@@ -740,7 +740,7 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
                 if (input_set_bandwidth(dev->input, snap.bandwidth) == 0) {
                     result.applied.push_back(label + ": bandwidth -> " + to_string(snap.bandwidth));
                 } else if (errno != ENOTSUP) {
-                    result.skipped_requires_restart.push_back(label + ": bandwidth present in config but failed to apply live, see logs");
+                    result.skipped_requires_restart.push_back(label + ": bandwidth present in config but failed to apply live, see logs - no restart needed, retry reload_diff");
                 }
             }
 
@@ -752,7 +752,7 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
                 if (input_set_correction(dev->input, snap.correction) == 0) {
                     result.applied.push_back(label + ": correction -> " + to_string(snap.correction));
                 } else if (errno != ENOTSUP) {
-                    result.skipped_requires_restart.push_back(label + ": correction present in config but failed to apply live, see logs");
+                    result.skipped_requires_restart.push_back(label + ": correction present in config but failed to apply live, see logs - no restart needed, retry reload_diff");
                 }
             }
         }

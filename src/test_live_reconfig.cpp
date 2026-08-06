@@ -1410,6 +1410,10 @@ TEST_F(DiffApplyTest, gain_set_hardware_failure_does_not_mark_input_failed) {
     EXPECT_EQ(input.state, INPUT_RUNNING);
     ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
     EXPECT_NE(result.skipped_requires_restart[0].find("gain"), std::string::npos);
+    // Same "retryable, not a real restart requirement" wording centerfreq/sample_rate use -
+    // consumers (e.g. rtl-airband-panel's LiveApplyBanner) key off this exact substring to
+    // separate genuinely-restart-required entries from ones that just need a retry.
+    EXPECT_NE(result.skipped_requires_restart[0].find("no restart needed"), std::string::npos);
 }
 
 TEST_F(DiffApplyTest, bandwidth_not_supported_by_driver_is_silently_skipped_not_reported) {
@@ -1526,6 +1530,7 @@ TEST_F(DiffApplyTest, bandwidth_set_hardware_failure_does_not_mark_input_failed)
     EXPECT_EQ(input.state, INPUT_RUNNING);
     ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
     EXPECT_NE(result.skipped_requires_restart[0].find("bandwidth"), std::string::npos);
+    EXPECT_NE(result.skipped_requires_restart[0].find("no restart needed"), std::string::npos);
 }
 
 TEST_F(DiffApplyTest, correction_not_supported_by_driver_is_silently_skipped_not_reported) {
@@ -1641,6 +1646,7 @@ TEST_F(DiffApplyTest, correction_set_hardware_failure_does_not_mark_input_failed
     EXPECT_EQ(input.state, INPUT_RUNNING);
     ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
     EXPECT_NE(result.skipped_requires_restart[0].find("correction"), std::string::npos);
+    EXPECT_NE(result.skipped_requires_restart[0].find("no restart needed"), std::string::npos);
 }
 
 TEST_F(DiffApplyTest, mixer_count_mismatch_is_requires_restart) {
