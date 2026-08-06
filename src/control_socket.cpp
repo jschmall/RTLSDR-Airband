@@ -192,24 +192,15 @@ string handle_retune(const map<string, string>& fields) {
     if (!device_request_retune(dev, freq)) {
         return error_response("device is not R_MULTICHANNEL - R_SCAN devices retune automatically via their own controller thread");
     }
-    // Poll for the owning demod thread to consume the request, so the response reflects actual
+    // Wait for the owning demod thread to consume the request, so the response reflects actual
     // hardware-retune success/failure rather than just "request accepted". The demod loop visits
     // every device on its slice at least every WAVE_BATCH-ish interval, well under this budget.
-    // The demod thread publishes centerfreq_apply_failed BEFORE clearing pending_centerfreq_request
-    // (see both fields' comments, rtl_airband.h) - do not "simplify" this back to a single
-    // exchange()-based check, that would reintroduce a TOCTOU race where this loop could observe
-    // "consumed" before the hardware call (and its result) actually happened.
-    const int poll_interval_us = 5000;
-    const int max_wait_us = 500000;
-    int waited_us = 0;
-    while (dev->pending_centerfreq_request.load(std::memory_order_acquire) != -1 && waited_us < max_wait_us) {
-        usleep(poll_interval_us);
-        waited_us += poll_interval_us;
-    }
-    if (dev->pending_centerfreq_request.load(std::memory_order_acquire) != -1) {
+    bool timed_out = false;
+    bool ok = device_confirm_retune(dev, /*timeout_us=*/500000, &timed_out);
+    if (timed_out) {
         return error_response("retune request timed out waiting for the demod thread");
     }
-    if (dev->centerfreq_apply_failed.load(std::memory_order_acquire)) {
+    if (!ok) {
         return error_response("hardware retune failed, see logs");
     }
     return ok_response();

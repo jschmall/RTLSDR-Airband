@@ -62,6 +62,25 @@ bool device_request_retune(device_t* dev, int new_centerfreq) {
     return true;
 }
 
+bool device_confirm_retune(device_t* dev, int timeout_us, bool* timed_out) {
+    // Not consumed via exchange(): a caller polling pending_centerfreq_request must not observe
+    // "consumed" until centerfreq_apply_failed already reflects this attempt's actual result - see
+    // both fields' comments (rtl_airband.h) and device_apply_retune()'s TOCTOU-avoiding
+    // request/apply split (rtl_airband.cpp's demod loop).
+    const int poll_interval_us = 5000;
+    int waited_us = 0;
+    while (dev->pending_centerfreq_request.load(std::memory_order_acquire) != -1 && waited_us < timeout_us) {
+        usleep(poll_interval_us);
+        waited_us += poll_interval_us;
+    }
+    if (dev->pending_centerfreq_request.load(std::memory_order_acquire) != -1) {
+        *timed_out = true;
+        return false;
+    }
+    *timed_out = false;
+    return !dev->centerfreq_apply_failed.load(std::memory_order_acquire);
+}
+
 void reconnect_channel_outputs(channel_t* channel) {
     for (int k = 0; k < channel->output_count; k++) {
         output_t* output = channel->outputs + k;
@@ -167,6 +186,17 @@ bool device_apply_retune(device_t* dev, int new_centerfreq) {
     // Runs inside the demod thread that exclusively owns dev - same thread as AFC's own per-bin
     // adjustments (see the AFC class in rtl_airband.cpp), so plain assignments here are safe
     // without any lock: there is only ever one writer to bins/base_bins/dm_dphi at a time.
+    //
+    // Hardware retune is attempted FIRST, before touching bins/base_bins/dm_dphi: on failure the
+    // radio is still physically on the old centerfreq (input_set_centerfreq() only updates
+    // input->centerfreq on success), so recomputing bins for new_centerfreq first would leave the
+    // demod math and the actual RF tuning disagreeing - every channel on this device would
+    // demodulate the wrong bin offset relative to what the hardware is really receiving, until the
+    // next successful retune. Bins are only ever recomputed for a frequency the hardware actually
+    // reached.
+    if (input_set_centerfreq(dev->input, new_centerfreq) != 0) {
+        return false;
+    }
     for (int j = 0; j < dev->channel_count; j++) {
         channel_t* channel = dev->channels + j;
         int channel_freq = channel->freqlist[0].frequency;
@@ -176,7 +206,7 @@ bool device_apply_retune(device_t* dev, int new_centerfreq) {
             channel->dm_phi = 0;
         }
     }
-    return input_set_centerfreq(dev->input, new_centerfreq) == 0;
+    return true;
 }
 
 namespace {
@@ -479,7 +509,20 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
 
             if (dev->mode == R_MULTICHANNEL && snap.centerfreq != 0 && snap.centerfreq != dev->input->centerfreq) {
                 if (device_request_retune(dev, snap.centerfreq)) {
-                    result.applied.push_back(label + ": centerfreq -> " + to_string(snap.centerfreq));
+                    // Wait for the demod thread's real outcome instead of just reporting "request
+                    // posted" as success - a failed hardware retune (e.g. a transient i2c error)
+                    // otherwise looked identical to a successful one in this response, with no way
+                    // for a caller to know the device was left on its old centerfreq.
+                    bool timed_out = false;
+                    bool ok = device_confirm_retune(dev, /*timeout_us=*/500000, &timed_out);
+                    if (ok) {
+                        result.applied.push_back(label + ": centerfreq -> " + to_string(snap.centerfreq));
+                    } else if (timed_out) {
+                        result.applied.push_back(label + ": centerfreq -> " + to_string(snap.centerfreq) + " (request posted, not yet confirmed applied)");
+                    } else {
+                        result.skipped_requires_restart.push_back(
+                            label + ": centerfreq change failed (transient hardware error, device still on its previous centerfreq, see logs) - no restart needed, retry reload_diff");
+                    }
                 } else {
                     result.skipped_requires_restart.push_back(label + ": centerfreq changed but retune request was rejected");
                 }

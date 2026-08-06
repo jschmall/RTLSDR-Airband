@@ -202,6 +202,12 @@ TEST_F(LiveReconfigTest, device_apply_retune_returns_false_and_does_not_mark_inp
     EXPECT_EQ(input.state, INPUT_RUNNING);
     EXPECT_EQ(input.centerfreq, 120000000);  // unchanged on failure
     EXPECT_EQ(input.centerfreq_retune_failure_count, 1u);
+    // Bins/base_bins must stay at their pre-retune values on a failed hardware call - the radio is
+    // still physically on the OLD centerfreq (input.centerfreq above proves that), so recomputing
+    // them for the new, never-reached centerfreq would make the demod math and the actual RF
+    // tuning disagree until the next successful retune.
+    EXPECT_EQ(bins[0], 0u);
+    EXPECT_EQ(base_bins[0], 0u);
 }
 
 TEST_F(LiveReconfigTest, retune_consumption_publishes_failure_before_clearing_request) {
@@ -258,6 +264,42 @@ TEST_F(LiveReconfigTest, retune_consumption_publishes_failure_before_clearing_re
     consumer.join();
 
     EXPECT_TRUE(failed);
+}
+
+TEST_F(LiveReconfigTest, device_confirm_retune_reports_success) {
+    device_t dev = {};
+    dev.pending_centerfreq_request = -1;  // already consumed
+    dev.centerfreq_apply_failed = false;
+
+    bool timed_out = true;  // pre-set to a non-default value to confirm it's actually written
+    bool ok = device_confirm_retune(&dev, /*timeout_us=*/50000, &timed_out);
+
+    EXPECT_TRUE(ok);
+    EXPECT_FALSE(timed_out);
+}
+
+TEST_F(LiveReconfigTest, device_confirm_retune_reports_hardware_failure) {
+    device_t dev = {};
+    dev.pending_centerfreq_request = -1;  // already consumed
+    dev.centerfreq_apply_failed = true;
+
+    bool timed_out = false;
+    bool ok = device_confirm_retune(&dev, /*timeout_us=*/50000, &timed_out);
+
+    EXPECT_FALSE(ok);
+    EXPECT_FALSE(timed_out);
+}
+
+TEST_F(LiveReconfigTest, device_confirm_retune_reports_timeout_when_never_consumed) {
+    device_t dev = {};
+    dev.pending_centerfreq_request = 121000000;  // never consumed by anything in this test
+
+    bool timed_out = false;
+    bool ok = device_confirm_retune(&dev, /*timeout_us=*/20000, &timed_out);
+
+    EXPECT_FALSE(ok);
+    EXPECT_TRUE(timed_out);
+    EXPECT_EQ(dev.pending_centerfreq_request.load(), 121000000);  // untouched
 }
 
 TEST_F(LiveReconfigTest, channel_apply_disable_sets_enabled_false) {
@@ -577,7 +619,126 @@ TEST_F(DiffApplyTest, channel_enabled_diff_calls_channel_enable_disable) {
     EXPECT_EQ(dev.pending_centerfreq_request.load(), -1);  // centerfreq unchanged, no request posted
 }
 
-TEST_F(DiffApplyTest, centerfreq_diff_posts_a_retune_request) {
+TEST_F(DiffApplyTest, centerfreq_diff_posts_a_retune_request_and_waits_for_confirmation) {
+    // A background thread stands in for the demod thread's consumption loop
+    // (demodulate(), rtl_airband.cpp), so this exercises the full request -> apply round trip
+    // rather than just the posting half, matching the enable/disable tests above.
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.state = INPUT_RUNNING;
+    input.set_centerfreq = &fake_set_centerfreq_ok;
+    input.dev_data = &fake_dev_data;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 0;
+    dev.pending_centerfreq_request = -1;
+    dev.centerfreq_apply_failed = false;
+    devices = &dev;
+    device_count = 1;
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 0;
+    dsnap.centerfreq = 120050000;  // changed
+    dsnap.sample_rate = 2000000;
+    dsnap.has_gain = false;
+    snapshot.devices.push_back(dsnap);
+
+    std::atomic<bool> stop_consumer{false};
+    std::thread consumer([&]() {
+        while (!stop_consumer.load()) {
+            int pending = dev.pending_centerfreq_request.load(std::memory_order_acquire);
+            if (pending != -1) {
+                bool ok = device_apply_retune(&dev, pending);
+                dev.centerfreq_apply_failed.store(!ok, std::memory_order_release);
+                dev.pending_centerfreq_request.store(-1, std::memory_order_release);
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+    stop_consumer.store(true);
+    consumer.join();
+
+    EXPECT_EQ(input.centerfreq, 120050000);
+    ASSERT_EQ(result.applied.size(), 1u);
+    EXPECT_NE(result.applied[0].find("centerfreq -> 120050000"), std::string::npos);
+    EXPECT_EQ(result.applied[0].find("not yet confirmed"), std::string::npos);
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+}
+
+TEST_F(DiffApplyTest, centerfreq_diff_reports_transient_hardware_failure_instead_of_claiming_success) {
+    // Regression test for the reload_diff under-reporting bug: previously this branch reported
+    // "applied: centerfreq -> X" purely because device_request_retune() posted the request, with
+    // no check of whether the demod thread's actual hardware call succeeded - so a real, ongoing
+    // i2c retune failure (matching production symptoms) looked identical to success in the
+    // response, and the device was silently left on its old centerfreq.
+    int fake_dev_data;
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+    input.state = INPUT_RUNNING;
+    input.set_centerfreq = &fake_set_centerfreq_fails;
+    input.dev_data = &fake_dev_data;
+    input.centerfreq_retune_failure_count = 0;
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 0;
+    dev.pending_centerfreq_request = -1;
+    dev.centerfreq_apply_failed = false;
+    devices = &dev;
+    device_count = 1;
+
+    ConfigSnapshot snapshot;
+    DeviceConfigSnapshot dsnap;
+    dsnap.type = "rtlsdr";
+    dsnap.mode = R_MULTICHANNEL;
+    dsnap.channel_count = 0;
+    dsnap.centerfreq = 120050000;  // changed
+    dsnap.sample_rate = 2000000;
+    dsnap.has_gain = false;
+    snapshot.devices.push_back(dsnap);
+
+    std::atomic<bool> stop_consumer{false};
+    std::thread consumer([&]() {
+        while (!stop_consumer.load()) {
+            int pending = dev.pending_centerfreq_request.load(std::memory_order_acquire);
+            if (pending != -1) {
+                bool ok = device_apply_retune(&dev, pending);
+                dev.centerfreq_apply_failed.store(!ok, std::memory_order_release);
+                dev.pending_centerfreq_request.store(-1, std::memory_order_release);
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+    stop_consumer.store(true);
+    consumer.join();
+
+    EXPECT_EQ(input.centerfreq, 120000000);  // still on the old centerfreq
+    EXPECT_TRUE(result.applied.empty());
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("centerfreq"), std::string::npos);
+    EXPECT_NE(result.skipped_requires_restart[0].find("no restart needed"), std::string::npos);
+}
+
+TEST_F(DiffApplyTest, centerfreq_diff_reports_pending_when_not_yet_confirmed) {
+    // No consumer thread here - the request is never picked up, so this exercises
+    // device_confirm_retune()'s timeout branch. Deliberately slow (~500ms, the default timeout)
+    // rather than mocked away, matching how the equivalent channel-enable/disable timeout paths
+    // are already exercised elsewhere in this file.
     input_t input = {};
     input.driver_type = "rtlsdr";
     input.sample_rate = 2000000;
@@ -603,9 +764,10 @@ TEST_F(DiffApplyTest, centerfreq_diff_posts_a_retune_request) {
 
     DiffResult result = compute_and_apply_diff(snapshot);
 
-    EXPECT_EQ(dev.pending_centerfreq_request.load(), 120050000);
+    EXPECT_EQ(dev.pending_centerfreq_request.load(), 120050000);  // still pending, never consumed
     ASSERT_EQ(result.applied.size(), 1u);
-    EXPECT_NE(result.applied[0].find("centerfreq"), std::string::npos);
+    EXPECT_NE(result.applied[0].find("centerfreq -> 120050000"), std::string::npos);
+    EXPECT_NE(result.applied[0].find("not yet confirmed"), std::string::npos);
 }
 
 TEST_F(DiffApplyTest, driver_type_change_is_requires_restart) {

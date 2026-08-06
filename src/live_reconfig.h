@@ -37,6 +37,17 @@ uint32_t compute_channel_dm_dphi(int channel_freq, int centerfreq, int sample_ra
 // owns this device - see device_apply_retune().
 bool device_request_retune(device_t* dev, int new_centerfreq);
 
+// Polls dev->pending_centerfreq_request until the demod thread consumes it (see
+// device_apply_retune()) or timeout_us elapses, then reports the real outcome. Returns true only
+// if the request was consumed AND the hardware retune actually succeeded
+// (!centerfreq_apply_failed). Sets *timed_out and returns false if the request is still pending
+// at the timeout - callers should treat that as "posted, not yet confirmed" (the same semantics
+// post_request_and_wait() already uses for enable/disable/remove requests), not a hard failure.
+// Shared by handle_retune() (control_socket.cpp) and compute_and_apply_diff() below - both post
+// via device_request_retune() and need the same wait-and-check logic to report a real result
+// instead of just "request accepted".
+bool device_confirm_retune(device_t* dev, int timeout_us, bool* timed_out);
+
 // Called from demodulate() (rtl_airband.cpp), in the demod thread that exclusively owns dev, once
 // it observes a pending request. Recomputes bins/base_bins/dm_dphi for every channel on this
 // device in place (plain assignments - no locking needed, same single-writer-thread invariant

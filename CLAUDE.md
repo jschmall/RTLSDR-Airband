@@ -704,6 +704,58 @@ Keep the local delta small and well understood.
       no driver in `system_tests/helpers/` currently supports simulating a `set_centerfreq`
       failure (the only one exercised end-to-end, `type = "file"`, has a hard no-op
       `set_centerfreq()` that always succeeds).
+32. **Live retune bins/dm_dphi correctness + `reload_diff` failure reporting fix**
+    (`src/live_reconfig.{cpp,h}`, `src/control_socket.cpp`) — found while investigating a
+    production report of "the same failure" persisting after item 31's fix. Extensive
+    fault-injection and real-hardware stress testing (9,500+ forced consecutive retune failures;
+    700+ real `reload_diff` channel-add/remove-plus-retune cycles, including a run that
+    organically reproduced the actual production i2c fault) never reproduced a crash or a race in
+    the request/apply/confirm machinery items 26/28/31 already built — the actual bugs were both
+    correctness/reporting issues, not crashes or races:
+    - `device_apply_retune()` previously recomputed every channel's `bins`/`base_bins`/`dm_dphi`
+      for the *new* centerfreq unconditionally, before attempting the hardware retune. On a
+      failed `input_set_centerfreq()` call, the radio stays physically on its old centerfreq (see
+      item 31 — `input->centerfreq` is only updated on success), but the demod math had already
+      moved on to the new, never-reached frequency: every channel on that device would demodulate
+      the wrong bin offset relative to what the hardware was actually receiving, until the next
+      successful retune. Fixed by reordering: attempt `input_set_centerfreq()` first, only
+      recompute bins/`dm_dphi` on success.
+    - Separately, `compute_and_apply_diff()`'s centerfreq branch (used by `reload_diff` — the
+      only way rtl-airband-panel's `dynamic_reload` branch applies live changes) reported
+      "applied" based solely on `device_request_retune()` successfully *posting* the request,
+      never checking whether the demod thread's actual hardware call succeeded — unlike the
+      standalone `retune` control-socket command, which already polled
+      `pending_centerfreq_request`/`centerfreq_apply_failed` and reported real failures. A caller
+      using `reload_diff` had no way to know a centerfreq change silently failed to reach the
+      hardware. Fixed by extracting the poll-and-check logic `handle_retune()` already had into a
+      shared `device_confirm_retune()`, used by both `handle_retune()` and
+      `compute_and_apply_diff()` — a real hardware failure now surfaces in
+      `skipped_requires_restart` with a message clarifying no restart is actually needed (retry
+      `reload_diff`), matching the wording convention the channel-append failure case already
+      used for the same "attempted and failed, not out-of-scope" distinction.
+    - Unit tested: extended `device_apply_retune_returns_false_...` to assert bins/`base_bins`
+      are left untouched on a failed retune (the existing test only checked `input->centerfreq`,
+      never bins — the actual gap this bug lived in); new
+      `device_confirm_retune_reports_success`/`_hardware_failure`/`_timeout_when_never_consumed`
+      and `centerfreq_diff_posts_a_retune_request_and_waits_for_confirmation`/
+      `_reports_transient_hardware_failure_instead_of_claiming_success`/
+      `_reports_pending_when_not_yet_confirmed` (`src/test_live_reconfig.cpp`, the last superseding
+      the old posts-and-returns-immediately test). All 186 tests (5 net new) pass across Debug and
+      Debug+NFM. Verified end-to-end against real RTL-SDR hardware (temporary, reverted
+      fault-injection build): a genuinely failing `retune` and `reload_diff` command both now
+      correctly report failure instead of false success, with the device's live `centerfreq`
+      confirmed unchanged; no crash or sanitizer report under either a real-hardware i2c fault
+      (reproduced organically during this session's stress testing) or forced/injected failures.
+    - Worth recording as a negative result: item 26/28/31's design (single-threaded control
+      socket, blocking confirm-before-advance, no double-post hazard) held up under everything
+      short of the actual production incident being reproduced end-to-end. If a genuine *crash*
+      (not a wrong-frequency or under-reported-failure symptom) is seen again, it's unlikely to be
+      in this code path — check the OS/systemd level first (OOM killer, watchdog, resource
+      limits) before re-auditing this machinery.
+    - Also noted, not fixed here: an unrelated pre-existing UBSan finding surfaced incidentally
+      during this session's hardware testing — `src/ctcss.h:68`, "load of value 240, which is not
+      a valid value for type 'bool'" (an uninitialized-read UB, not a new regression from this
+      fix). Flagged as a discovered-but-out-of-scope follow-up per this fork's usual practice.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
