@@ -70,6 +70,7 @@ def write_config(
     stats_filepath: Path | None = None,
     control_socket_path: Path | None = None,
     reserve_channels: int | None = None,
+    shout_metadata_delay: int | None = None,
 ) -> None:
     """
     Write a minimal libconfig++-format .conf file for rtl_airband.
@@ -90,6 +91,8 @@ def write_config(
               (used only when mp3_tmp_dir is provided).
             - mixer_output (dict|None): {"name": str, "balance": float}, omitted if None.
             - scan_freqs_hz (list[int]): Scan mode only — list of frequencies in Hz.
+            - label (str|None): Channel label (send_scan_freq_tags/send_tx_tags/
+              rdio_scanner metadata content), omitted if None.
             - extra_output_blocks (list[str]): Fully-formed "{ ... }" output
               config entries appended verbatim after the file/mixer outputs,
               for output types (icecast, rdio_scanner) this helper doesn't
@@ -108,6 +111,9 @@ def write_config(
               without a restart - see rtl_airband.h's mixer_t::input_capacity
               comment. Omitted (defaults to 0, no live-append headroom) if
               not given.
+            - extra_output_blocks (list[str]): Fully-formed "{ ... }" output
+              config entries appended after the mixer's file output, same
+              purpose as the channel-level key of the same name.
             Output files are written to output_dir.
         mp3_tmp_dir: If provided, each channel gets a "file" (MP3) output
             written to this directory using output_filename_template. The
@@ -122,6 +128,8 @@ def write_config(
             startup) channel array slots on the device, letting a later
             reload_diff append up to that many new channels live without a
             restart - see rtl_airband.h's device_t::channel_capacity comment.
+        shout_metadata_delay: If provided, overrides the default (3s) real-time delay
+            send_scan_freq_tags/send_tx_tags wait before applying a metadata update.
 
         Channel dicts also accept:
             - enabled (bool): "enabled" keyword (declare-then-toggle for the
@@ -146,12 +154,22 @@ def write_config(
                 lines.append(f"    reserve_inputs = {mx['reserve_inputs']};")
             lines.append("    outputs:")
             lines.append("    (")
-            lines.append("      {")
-            lines.append('        type = "file";')
-            lines.append(f'        directory = "{output_dir}";')
-            lines.append(f'        filename_template = "{mx["label"]}";')
-            lines.append("        continuous = false;")
-            lines.append("      }")
+            mixer_output_entries: list[str] = [
+                "\n".join(
+                    [
+                        "      {",
+                        '        type = "file";',
+                        f'        directory = "{output_dir}";',
+                        f'        filename_template = "{mx["label"]}";',
+                        "        continuous = false;",
+                        "      }",
+                    ]
+                )
+            ]
+            mixer_output_entries.extend(mx.get("extra_output_blocks", []))
+            for k, entry in enumerate(mixer_output_entries):
+                is_last_entry = k == len(mixer_output_entries) - 1
+                lines.append(entry + ("" if is_last_entry else ","))
             lines.append("    );")
             lines.append("  };")
         lines.append("};")
@@ -186,6 +204,9 @@ def write_config(
         if ch.get("modulation") is not None:
             lines.append(f'      modulation = "{ch["modulation"]}";')
 
+        if ch.get("label") is not None:
+            lines.append(f'      label = "{ch["label"]}";')
+
         if ch.get("ctcss") is not None:
             lines.append(f"      ctcss = {ch['ctcss']:.1f};")
 
@@ -213,5 +234,8 @@ def write_config(
 
     if control_socket_path is not None:
         lines.append(f'control_socket_path = "{control_socket_path}";')
+
+    if shout_metadata_delay is not None:
+        lines.append(f"shout_metadata_delay = {shout_metadata_delay};")
 
     config_path.write_text("\n".join(lines) + "\n")

@@ -96,6 +96,30 @@ TEST_F(MixerTest, successive_calls_accumulate_multiple_inputs) {
     EXPECT_FLOAT_EQ(sum[1], 2.0f);
 }
 
+TEST_F(MixerTest, select_active_tag_input_none_active) {
+    mixinput_t inputs[3] = {};
+    EXPECT_EQ(mixer_select_active_tag_input(inputs, 3), -1);
+}
+
+TEST_F(MixerTest, select_active_tag_input_single_active) {
+    mixinput_t inputs[3] = {};
+    inputs[1].has_signal = true;
+    EXPECT_EQ(mixer_select_active_tag_input(inputs, 3), 1);
+}
+
+TEST_F(MixerTest, select_active_tag_input_lowest_index_wins) {
+    mixinput_t inputs[4] = {};
+    inputs[2].has_signal = true;
+    inputs[3].has_signal = true;
+    EXPECT_EQ(mixer_select_active_tag_input(inputs, 4), 2);
+}
+
+TEST_F(MixerTest, select_active_tag_input_zero_input_count) {
+    mixinput_t inputs[1] = {};
+    inputs[0].has_signal = true;
+    EXPECT_EQ(mixer_select_active_tag_input(inputs, 0), -1);
+}
+
 // mixer_finalize_capacity() operates on the global mixers/mixer_count (like production code
 // does, via main()), so each test points those globals at its own local mixer_t(s) and resets
 // mixer_capacity_finalized - otherwise a prior test's finalize would leak into the next one, since

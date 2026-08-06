@@ -517,8 +517,11 @@ static bool output_file_ready(channel_t* channel, output_t* output) {
     return true;
 }
 
-// Create all the output for a particular channel.
-void process_outputs(channel_t* channel, int cur_scan_freq) {
+// Create all the output for a particular channel. tx_tag is the desired send_tx_tags content
+// for this tick (the caller has context process_outputs() itself doesn't - device channel vs.
+// mixer channel - needed to compute it; see compute_tx_tag_content()/mixer_select_active_tag_input()
+// at the call sites in output_thread()).
+void process_outputs(channel_t* channel, int cur_scan_freq, const std::string& tx_tag) {
     if (!channel->enabled) {
         return;
     }
@@ -573,6 +576,22 @@ void process_outputs(channel_t* channel, int cur_scan_freq) {
                     log(LOG_WARNING, "Failed to add shout metadata\n");
                 }
                 shout_metadata_free(meta);
+            } else if (icecast->send_tx_tags) {
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                std::string out_value;
+                if (icecast_tx_tag_step(&icecast->tx_tag_state, tx_tag, now, shout_metadata_delay, &out_value)) {
+                    shout_metadata_t* meta = shout_metadata_new();
+                    if (shout_metadata_add(meta, "song", out_value.c_str()) != SHOUTERR_SUCCESS) {
+                        log(LOG_WARNING, "Failed to add shout metadata\n");
+                    }
+                    if (SHOUT_SET_METADATA(icecast->shout, meta) != SHOUTERR_SUCCESS) {
+                        log(LOG_WARNING, "Failed to set shout metadata\n");
+                    } else {
+                        icecast->tx_tag_update_count++;
+                    }
+                    shout_metadata_free(meta);
+                }
             }
         } else if (channel->outputs[k].type == O_FILE || channel->outputs[k].type == O_RAWFILE) {
             file_data* fdata = (file_data*)(channel->outputs[k].data);
@@ -1021,6 +1040,33 @@ static void output_icecast_health(FILE* f) {
         }
     }
     fprintf(f, "\n");
+
+    fprintf(f,
+            "# HELP icecast_tx_tag_update_count Number of times a send_tx_tags metadata update "
+            "(on-air label set on transmission start, cleared on transmission end) was successfully applied.\n"
+            "# TYPE icecast_tx_tag_update_count counter\n");
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        for (int j = 0; j < dev->channel_count; j++) {
+            channel_t* channel = dev->channels + j;
+            for (int k = 0; k < channel->output_count; k++) {
+                if (channel->outputs[k].type != O_ICECAST)
+                    continue;
+                icecast_data* icecast = (icecast_data*)channel->outputs[k].data;
+                fprintf(f, "icecast_tx_tag_update_count{device=\"%d\",channel=\"%d\",output=\"%d\"}\t%zu\n", i, j, k, icecast->tx_tag_update_count);
+            }
+        }
+    }
+    for (int i = 0; i < mixer_count; i++) {
+        mixer_t* mixer = mixers + i;
+        for (int k = 0; k < mixer->channel.output_count; k++) {
+            if (mixer->channel.outputs[k].type != O_ICECAST)
+                continue;
+            icecast_data* icecast = (icecast_data*)mixer->channel.outputs[k].data;
+            fprintf(f, "icecast_tx_tag_update_count{mixer=\"%d\",output=\"%d\"}\t%zu\n", i, k, icecast->tx_tag_update_count);
+        }
+    }
+    fprintf(f, "\n");
 }
 
 static void output_lame_encode_failures(FILE* f) {
@@ -1264,6 +1310,32 @@ void write_stats_file(timeval* last_stats_write) {
     fclose(file);
 }
 
+// send_tx_tags content for a device channel: on-air label (or frequency fallback) while
+// squelch is open, "" otherwise.
+static std::string channel_tx_tag(channel_t* channel) {
+    freq_t& fparms = channel->freqlist[channel->freq_idx];
+    return compute_tx_tag_content(channel->axcindicate != NO_SIGNAL, fparms.label, fparms.frequency);
+}
+
+// send_tx_tags content for a mixer channel: the label of whichever configured input is
+// currently talking (mixer_select_active_tag_input()'s lowest-index-wins tie-break), or ""
+// if none are.
+static std::string mixer_tx_tag(mixer_t* mixer) {
+    int idx = mixer_select_active_tag_input(mixer->inputs, mixer->input_count);
+    if (idx < 0) {
+        return compute_tx_tag_content(false, NULL, 0);
+    }
+    mixinput_t& input = mixer->inputs[idx];
+    if (input.source_device_idx < 0 || input.source_channel_idx < 0) {
+        // shouldn't happen for a config-time-connected input, but guard rather than index
+        // into devices[] with an unresolved index
+        return compute_tx_tag_content(false, NULL, 0);
+    }
+    channel_t& src = devices[input.source_device_idx].channels[input.source_channel_idx];
+    freq_t& fparms = src.freqlist[src.freq_idx];
+    return compute_tx_tag_content(true, fparms.label, fparms.frequency);
+}
+
 void* output_thread(void* param) {
     assert(param != NULL);
     output_params_t* output_param = (output_params_t*)param;
@@ -1296,7 +1368,7 @@ void* output_thread(void* param) {
                 continue;
             channel_t* channel = &mixers[i].channel;
             if (channel->state == CH_READY) {
-                process_outputs(channel, -1);
+                process_outputs(channel, -1, mixer_tx_tag(&mixers[i]));
                 channel->state = CH_DIRTY;
             }
         }
@@ -1345,7 +1417,7 @@ void* output_thread(void* param) {
                     } else if (pending == 0) {
                         channel_apply_disable(channel);
                     }
-                    process_outputs(channel, new_freq);
+                    process_outputs(channel, new_freq, channel_tx_tag(channel));
                     memcpy(channel->waveout, channel->waveout + WAVE_BATCH, AGC_EXTRA * sizeof(float));
                 }
                 dev->waveavail = 0;
@@ -1373,7 +1445,7 @@ void* output_thread(void* param) {
             continue;
         for (int j = 0; j < dev->channel_count; j++) {
             channel_t* channel = devices[i].channels + j;
-            process_outputs(channel, -1);
+            process_outputs(channel, -1, channel_tx_tag(channel));
             memcpy(channel->waveout, channel->waveout + WAVE_BATCH, AGC_EXTRA * sizeof(float));
         }
         dev->waveavail = 0;

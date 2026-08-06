@@ -33,10 +33,10 @@
 
 using namespace std;
 
-static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, int j, bool parsing_mixers, rec_modes dev_mode) {
-#ifndef WITH_RDIO_SCANNER
-    (void)dev_mode;
-#endif
+// dev is non-null only when called from parse_channels() (a device's own channel outputs);
+// parse_mixers() passes NULL, which is safe because parsing_mixers==true already rejects the
+// "mixer" output type below - the only branch that dereferences dev.
+static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, int j, bool parsing_mixers, rec_modes dev_mode, device_t* dev) {
     int oo = 0;
     for (int o = 0; o < channel->output_count; o++) {
         channel->outputs[oo].has_mp3_output = false;
@@ -47,7 +47,9 @@ static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, in
             continue;
         }
         if (!strncmp(outs[o]["type"], "icecast", 7)) {
-            channel->outputs[oo].data = XCALLOC(1, sizeof(struct icecast_data));
+            // new(), not XCALLOC: icecast_data now has std::string/non-POD members
+            // (icecast_tx_tag_state), which calloc'd memory would never construct
+            channel->outputs[oo].data = new icecast_data();
             channel->outputs[oo].type = O_ICECAST;
             icecast_data* idata = (icecast_data*)(channel->outputs[oo].data);
             idata->hostname = strdup(outs[o]["server"]);
@@ -65,6 +67,16 @@ static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, in
                 idata->send_scan_freq_tags = (bool)outs[o]["send_scan_freq_tags"];
             else
                 idata->send_scan_freq_tags = 0;
+            if (outs[o].exists("send_tx_tags"))
+                idata->send_tx_tags = (bool)outs[o]["send_tx_tags"];
+            else
+                idata->send_tx_tags = false;
+            if (idata->send_tx_tags && dev_mode == R_SCAN) {
+                cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: ";
+                cerr << "send_tx_tags is not supported on R_SCAN (scan mode) channels - the frequency itself changes "
+                        "at runtime there; use send_scan_freq_tags instead\n";
+                error();
+            }
 #ifdef LIBSHOUT_HAS_TLS
             if (outs[o].exists("tls")) {
                 if (outs[o]["tls"].getType() == libconfig::Setting::TypeString) {
@@ -259,6 +271,15 @@ static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, in
                      << name << ": " << mixer_get_error() << "\n";
                 error();
             }
+            // record where this input's audio comes from so send_tx_tags on the mixer's own
+            // icecast output(s) can look up the source channel's live label/freq_idx later.
+            // Store indices, not a channel_t* - dev->channels is still XREALLOC'd (by the
+            // caller, after parse_channels() returns) which can move the block, but the
+            // compaction index computed here is stable across that realloc; devices itself
+            // is never reallocated after its one-time XCALLOC in rtl_airband.cpp.
+            assert(dev != NULL);  // guaranteed: parsing_mixers rejects "mixer" outputs above
+            mdata->mixer->inputs[mdata->input].source_device_idx = (int)(dev - devices);
+            mdata->mixer->inputs[mdata->input].source_channel_idx = (int)(channel - dev->channels);
             debug_print("dev[%d].chan[%d].out[%d] connected to mixer %s as input %d (ampfactor=%.1f balance=%.1f)\n", i, j, o, name, mdata->input, ampfactor, balance);
         } else if (!strncmp(outs[o]["type"], "udp_stream", 6)) {
             channel->outputs[oo].data = XCALLOC(1, sizeof(struct udp_stream_data));
@@ -844,7 +865,7 @@ bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx,
         error();
     }
     channel->outputs = (output_t*)XCALLOC(channel->output_count, sizeof(struct output_t));
-    int outputs_enabled = parse_outputs(outputs, channel, dev_idx, chan_idx, false, dev->mode);
+    int outputs_enabled = parse_outputs(outputs, channel, dev_idx, chan_idx, false, dev->mode, dev);
     if (outputs_enabled < 1) {
         cerr << "Configuration error: devices.[" << dev_idx << "] channels.[" << chan_idx << "]: no outputs defined\n";
         error();
@@ -1094,7 +1115,7 @@ int parse_mixers(libconfig::Setting& mx) {
             error();
         }
         channel->outputs = (output_t*)XCALLOC(channel->output_count, sizeof(struct output_t));
-        int outputs_enabled = parse_outputs(outputs, channel, i, 0, true, R_MULTICHANNEL);
+        int outputs_enabled = parse_outputs(outputs, channel, i, 0, true, R_MULTICHANNEL, nullptr);
         if (outputs_enabled < 1) {
             cerr << "Configuration error: mixers.[" << i << "]: no outputs defined\n";
             error();

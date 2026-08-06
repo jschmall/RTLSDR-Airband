@@ -95,6 +95,14 @@ int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance) {
         mixer->inputs[j].ready = false;
         mixer->inputs[j].has_signal = false;
         mixer->inputs[j].input_overrun_count = 0;
+        // Reset to the same "not yet resolved" sentinel the fresh-slot path below uses -
+        // otherwise a reused slot would transiently expose the PREVIOUS occupant's source
+        // indices to process_outputs()'s send_tx_tags lookup (mixer_tx_tag()) in the brief
+        // window between this function publishing input_mask[j] and parse_outputs() (config.cpp)
+        // setting the real values for the new occupant right after. -1 is treated as "no tag" by
+        // mixer_tx_tag(), not dereferenced.
+        mixer->inputs[j].source_device_idx = -1;
+        mixer->inputs[j].source_channel_idx = -1;
         mixer->inputs_todo[j] = true;
         // Publish last, same discipline as the fresh-slot path below: mixer_thread() only reads
         // input_mask[j] first (short-circuiting before touching input->ready/wavein), so nothing
@@ -147,6 +155,8 @@ int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance) {
     mixer->inputs[i].ready = false;
     mixer->inputs[i].has_signal = false;
     mixer->inputs[i].input_overrun_count = 0;
+    mixer->inputs[i].source_device_idx = -1;
+    mixer->inputs[i].source_channel_idx = -1;
     mixer->input_mask[i] = true;
     mixer->input_removed[i] = false;
     mixer->inputs_todo[i] = true;
@@ -182,8 +192,23 @@ void mixer_finalize_capacity() {
             mixer->inputs_todo = (bool*)XREALLOC(mixer->inputs_todo, new_capacity * sizeof(bool));
             mixer->input_mask = (bool*)XREALLOC(mixer->input_mask, new_capacity * sizeof(bool));
             mixer->input_removed = (bool*)XREALLOC(mixer->input_removed, new_capacity * sizeof(bool));
-            // XREALLOC, unlike XCALLOC, does not zero the newly grown tail.
-            memset(mixer->inputs + old_count, 0, mixer->reserve_inputs * sizeof(struct mixinput_t));
+            // XREALLOC, unlike XCALLOC, does not zero the newly grown tail. mixinput_t now has a
+            // non-trivial has_signal (std::atomic<bool>) member, so it can no longer be memset -
+            // zero/reset each new slot's fields individually instead. mutex is deliberately left
+            // alone: mixer_connect_input() always pthread_mutex_init()s it the first time a slot
+            // is actually claimed (fresh-growth or reuse), so it's never relied on being
+            // pre-zeroed here.
+            for (int k = old_count; k < new_capacity; k++) {
+                mixer->inputs[k].wavein = NULL;
+                mixer->inputs[k].ampfactor = 0.0f;
+                mixer->inputs[k].ampl = 0.0f;
+                mixer->inputs[k].ampr = 0.0f;
+                mixer->inputs[k].ready = false;
+                mixer->inputs[k].has_signal = false;
+                mixer->inputs[k].input_overrun_count = 0;
+                mixer->inputs[k].source_device_idx = -1;
+                mixer->inputs[k].source_channel_idx = -1;
+            }
             memset(mixer->inputs_todo + old_count, 0, mixer->reserve_inputs * sizeof(bool));
             memset(mixer->input_mask + old_count, 0, mixer->reserve_inputs * sizeof(bool));
             memset(mixer->input_removed + old_count, 0, mixer->reserve_inputs * sizeof(bool));
@@ -249,6 +274,15 @@ void mix_waveforms(float* sum, const float* in, float mult, int size) {
     for (int s = 0; s < size; s++) {
         sum[s] += in[s] * mult;
     }
+}
+
+int mixer_select_active_tag_input(const mixinput_t* inputs, int input_count) {
+    for (int i = 0; i < input_count; i++) {
+        if (inputs[i].has_signal) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 /* Samples are delivered to mixer inputs in batches of WAVE_BATCH size (default 1000, ie. 1/8 secs

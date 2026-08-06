@@ -19,10 +19,12 @@
 
 #include <sys/stat.h>  // struct stat, S_ISDIR
 #include <cstddef>     // size_t
+#include <cstdio>      // snprintf
 #include <cstring>     // strerror
 
 #include "helper_functions.h"
 #include "logging.h"
+#include "rtl_airband.h"  // icecast_tx_tag_state, delta_sec()
 
 using namespace std;
 
@@ -91,4 +93,43 @@ string make_icecast_mountpoint(const string& mountpoint) {
 
 double rusage_cpu_seconds(const struct rusage& ru) {
     return (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6 + (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
+}
+
+string compute_tx_tag_content(bool has_signal, const char* label, int frequency_hz) {
+    if (!has_signal) {
+        return "";
+    }
+    if (label != NULL) {
+        return string(label);
+    }
+    char description[32];
+    snprintf(description, sizeof(description), "%.3f MHz", frequency_hz / 1000000.0);
+    return string(description);
+}
+
+bool icecast_tx_tag_step(icecast_tx_tag_state* state, const string& desired_tag, const struct timeval& now, int delay_sec, string* out_value) {
+    if (desired_tag == state->applied) {
+        // already live (or reverted back to it before a pending change applied) - nothing to do
+        state->pending = false;
+        return false;
+    }
+
+    if (!state->pending) {
+        // first change since the last applied value - start the deferred-apply window
+        state->pending_deadline = now;
+        state->pending_deadline.tv_sec += delay_sec;
+        state->pending = true;
+    }
+    // deliberately not reset on subsequent changes while already pending, so worst-case
+    // tag-update latency is bounded to one delay_sec window even under rapid flapping
+    state->pending_value = desired_tag;
+
+    if (delta_sec(&state->pending_deadline, &now) < 0) {
+        return false;  // deadline not reached yet
+    }
+
+    state->applied = state->pending_value;
+    state->pending = false;
+    *out_value = state->applied;
+    return true;
 }

@@ -14,6 +14,14 @@ that tracks upstream `main` and carries a small delta on top of it:
 - **Native rdio-scanner call uploads** — send completed transmissions straight to a
   [rdio-scanner](https://github.com/chuot/rdio-scanner) server for playback, no external
   script or CSV lookup required.
+- **Live reconfiguration via a local control socket** — push most config changes to an
+  already-running instance without dropping the audio feed for a full restart. See
+  [Live Reconfiguration](#live-reconfiguration), below.
+- **`send_tx_tags` Icecast output option** — push the channel's (or, for a mixer, whichever
+  source channel is currently talking) configured `label` as the Icecast "song" tag when a
+  transmission starts, and clear it when squelch closes — an on-air indicator for plain
+  (non-scanning) channels and mixers. Complements the existing `send_scan_freq_tags`, which
+  only applies in scan mode.
 - **Configurable `udp_stream` output** — choose the bit depth (32/16/8-bit PCM) and
   sample rate sent over UDP, to match what a downstream consumer like trunk-recorder
   expects.
@@ -26,12 +34,12 @@ that tracks upstream `main` and carries a small delta on top of it:
 - **Assorted stability fixes** — buffer overflow, thread-safety, and error-handling
   fixes not yet merged upstream.
 
-### 🧪 On This Branch Only (`dynamic_reload`, not yet on `main`)
+### Live Reconfiguration
 
-This branch lets you push most config changes to an already-running instance without
-dropping the audio feed for a full restart. It's still soaking on a test instance before
-being considered for `main` — see [`CLAUDE.md`](CLAUDE.md) (fork-delta items 26–35) for
-full engineering detail if you need it.
+Most day-to-day config edits — retuning a device, adjusting gain, adding or removing a
+channel, editing one, wiring a channel into a mixer — can be applied to a running instance
+without a restart. See [`CLAUDE.md`](CLAUDE.md) (fork-delta items 27–41) for full
+engineering detail if you need it.
 
 **How it works, in short:** each instance opens a small local control socket
 (`control_socket_path` in its config). Edit the instance's config file as normal, then
@@ -117,6 +125,7 @@ rather than just knowing that it is.
 |---|---|
 | `icecast_disconnect_count` | Icecast output's connection was lost (network error, exceeded send backlog, or the owning device failing) and had to be reconnected. |
 | `icecast_backlog_exceeded_count` | Subset of the above — specifically caused by the local encode rate outpacing what Icecast could drain. |
+| `icecast_tx_tag_update_count` | Number of times a `send_tx_tags` metadata update (on-air label set/cleared) was successfully applied. |
 | `lame_encode_failure_count` | `lame_encode_buffer_ieee_float()` returned an error, for any output that encodes mp3 (icecast, file). |
 | `file_write_failure_count` | Short/failed `fwrite()` on a file or rawfile output; the output is disabled immediately after, so this should stay at 0 on a healthy instance. |
 | `udp_stream_dropped_packet_count` | A `udp_stream` packet was dropped by a bounds check (length/buffer-size mismatch) instead of overrunning a buffer. |
