@@ -24,7 +24,7 @@ Parametrized over all provided binaries (non-NFM and NFM if available).
 
 from pathlib import Path
 
-from conftest import CACHE_DIR, BinaryUnderTest, run_rtl_airband
+from conftest import BinaryUnderTest, run_rtl_airband
 from helpers import config_writer, iq_generator
 from helpers.fake_icecast_server import FakeIcecastServer
 
@@ -73,6 +73,7 @@ def _icecast_block(port: int, mountpoint: str) -> str:
 def test_icecast_tx_tags_channel(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     speedup_factor: float,
 ) -> None:
     """A transmission on a plain R_MULTICHANNEL channel sets then clears the tag."""
@@ -80,7 +81,7 @@ def test_icecast_tx_tags_channel(
         offset_hz=CHANNEL_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
 
     config_path = test_output_dir / "rtl_airband.conf"
@@ -138,6 +139,7 @@ def test_icecast_tx_tags_channel(
 def test_icecast_tx_tags_mixer(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     speedup_factor: float,
 ) -> None:
     """A mixer's icecast output tags with whichever source channel is talking."""
@@ -150,7 +152,7 @@ def test_icecast_tx_tags_mixer(
         offset_hz=CHANNEL_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
 
     config_path = test_output_dir / "rtl_airband.conf"

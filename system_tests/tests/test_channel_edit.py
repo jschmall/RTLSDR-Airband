@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import CACHE_DIR, BinaryUnderTest
+from conftest import BinaryUnderTest
 from helpers import config_writer, iq_generator, output_validator
 from helpers.control_socket_client import send_command, wait_for_socket
 from helpers.interactive_runner import run_rtl_airband_interactive
@@ -64,6 +64,7 @@ def short_socket_dir():
 def test_edited_channel_keeps_capturing_after_reload_diff(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     short_socket_dir: Path,
 ) -> None:
     """Editing channel B's squelch threshold (same freq, same output) and calling reload_diff
@@ -75,7 +76,7 @@ def test_edited_channel_keeps_capturing_after_reload_diff(
         offset_b_hz=CHANNEL_B_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     config_path = test_output_dir / "rtl_airband.conf"
     socket_path = short_socket_dir / "control.sock"

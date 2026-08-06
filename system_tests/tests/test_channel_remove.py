@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import CACHE_DIR, BinaryUnderTest
+from conftest import BinaryUnderTest
 from helpers import config_writer, iq_generator, output_validator
 from helpers.control_socket_client import send_command, wait_for_socket
 from helpers.interactive_runner import run_rtl_airband_interactive
@@ -71,6 +71,7 @@ def short_socket_dir():
 def test_removed_channel_stops_capturing_after_reload_diff(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     short_socket_dir: Path,
 ) -> None:
     """Deleting the last (tail) channel from the config and calling reload_diff tears down its
@@ -80,7 +81,7 @@ def test_removed_channel_stops_capturing_after_reload_diff(
         offset_b_hz=CHANNEL_B_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     config_path = test_output_dir / "rtl_airband.conf"
     socket_path = short_socket_dir / "control.sock"
@@ -141,6 +142,7 @@ def test_removed_channel_stops_capturing_after_reload_diff(
 def test_non_tail_removal_rebuilds_from_the_point_of_divergence(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     short_socket_dir: Path,
 ) -> None:
     """Deleting a channel from the start of the config (rather than the tail) used to be flatly
@@ -155,7 +157,7 @@ def test_non_tail_removal_rebuilds_from_the_point_of_divergence(
         offset_b_hz=CHANNEL_B_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     config_path = test_output_dir / "rtl_airband.conf"
     socket_path = short_socket_dir / "control.sock"

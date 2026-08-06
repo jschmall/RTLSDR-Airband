@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import CACHE_DIR, BinaryUnderTest
+from conftest import BinaryUnderTest
 from helpers import config_writer, iq_generator, output_validator
 from helpers.control_socket_client import send_command, wait_for_socket
 from helpers.interactive_runner import run_rtl_airband_interactive
@@ -83,6 +83,7 @@ def short_socket_dir():
 def test_appended_channel_produces_audio_after_reload_diff(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     short_socket_dir: Path,
 ) -> None:
     """A channel absent at startup, appended via config edit + reload_diff, captures audio -
@@ -95,7 +96,7 @@ def test_appended_channel_produces_audio_after_reload_diff(
         offset_b_hz=CHANNEL_B_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     config_path = test_output_dir / "rtl_airband.conf"
     socket_path = short_socket_dir / "control.sock"
@@ -156,6 +157,7 @@ def test_appended_channel_produces_audio_after_reload_diff(
 def test_append_beyond_reserved_capacity_is_rejected_without_disrupting_existing_channel(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     short_socket_dir: Path,
 ) -> None:
     """Appending more channels than reserve_channels allows is reported, not applied, and
@@ -164,7 +166,7 @@ def test_append_beyond_reserved_capacity_is_rejected_without_disrupting_existing
         offset_hz=CHANNEL_A_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     config_path = test_output_dir / "rtl_airband.conf"
     socket_path = short_socket_dir / "control.sock"
@@ -223,6 +225,7 @@ def test_append_beyond_reserved_capacity_is_rejected_without_disrupting_existing
 def test_appended_channel_with_mixer_output_produces_audio_after_reload_diff(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     short_socket_dir: Path,
 ) -> None:
     """A channel appended live, whose own output is `type = "mixer"` pointing at an
@@ -233,7 +236,7 @@ def test_appended_channel_with_mixer_output_produces_audio_after_reload_diff(
         offset_b_hz=CHANNEL_B_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     config_path = test_output_dir / "rtl_airband.conf"
     socket_path = short_socket_dir / "control.sock"
@@ -306,6 +309,7 @@ def test_appended_channel_with_mixer_output_produces_audio_after_reload_diff(
 def test_append_mixer_output_beyond_reserved_inputs_is_rejected_without_disrupting_mixer(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     short_socket_dir: Path,
 ) -> None:
     """Appending a channel with a mixer output when the mixer has no reserve_inputs headroom is
@@ -317,7 +321,7 @@ def test_append_mixer_output_beyond_reserved_inputs_is_rejected_without_disrupti
         offset_hz=CHANNEL_A_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     config_path = test_output_dir / "rtl_airband.conf"
     socket_path = short_socket_dir / "control.sock"

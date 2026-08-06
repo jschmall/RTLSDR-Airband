@@ -20,7 +20,7 @@ Parametrized over all provided binaries (non-NFM and NFM if available).
 
 from pathlib import Path
 
-from conftest import CACHE_DIR, BinaryUnderTest, run_rtl_airband
+from conftest import BinaryUnderTest, run_rtl_airband
 from helpers import config_writer, iq_generator
 from helpers.fake_rdio_scanner_server import FakeRdioScannerServer
 
@@ -54,13 +54,14 @@ def pytest_generate_tests(metafunc):
 def test_rdio_scanner_output(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
 ) -> None:
     """One transmission → exactly one call-upload POST with the expected fields."""
     iq_file = iq_generator.get_or_generate_am(
         offset_hz=CHANNEL_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
 
     config_path = test_output_dir / "rtl_airband.conf"

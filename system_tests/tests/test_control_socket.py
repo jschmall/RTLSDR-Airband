@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import CACHE_DIR, BinaryUnderTest
+from conftest import BinaryUnderTest
 from helpers import config_writer, iq_generator, output_validator
 from helpers.control_socket_client import send_command, wait_for_socket
 from helpers.interactive_runner import run_rtl_airband_interactive
@@ -80,6 +80,7 @@ def pytest_generate_tests(metafunc):
 def test_channel_disable_then_enable_leaves_a_gap_in_captured_audio(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     short_socket_dir: Path,
 ) -> None:
     """channel_disable/channel_enable actually stop and resume output, live."""
@@ -87,7 +88,7 @@ def test_channel_disable_then_enable_leaves_a_gap_in_captured_audio(
         offset_hz=CHANNEL_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=TONE_DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     config_path = test_output_dir / "rtl_airband.conf"
     socket_path = short_socket_dir / "control.sock"
@@ -138,6 +139,7 @@ def test_channel_disable_then_enable_leaves_a_gap_in_captured_audio(
 def test_channel_stays_disabled_without_enable(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     short_socket_dir: Path,
 ) -> None:
     """A channel_disable with no matching channel_enable produces no audio at all."""
@@ -145,7 +147,7 @@ def test_channel_stays_disabled_without_enable(
         offset_hz=CHANNEL_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=TONE_DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     config_path = test_output_dir / "rtl_airband.conf"
     socket_path = short_socket_dir / "control.sock"
@@ -184,6 +186,7 @@ def test_channel_stays_disabled_without_enable(
 def test_mixer_disable_then_enable_leaves_a_gap_in_captured_audio(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     short_socket_dir: Path,
 ) -> None:
     """mixer_disable/mixer_enable actually stop and resume the mixer's output, live."""
@@ -191,7 +194,7 @@ def test_mixer_disable_then_enable_leaves_a_gap_in_captured_audio(
         offset_hz=CHANNEL_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=TONE_DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     config_path = test_output_dir / "rtl_airband.conf"
     socket_path = short_socket_dir / "control.sock"
@@ -239,6 +242,7 @@ def test_mixer_disable_then_enable_leaves_a_gap_in_captured_audio(
 def test_unknown_command_and_bad_index_are_rejected_without_crashing(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     short_socket_dir: Path,
 ) -> None:
     """Malformed/invalid commands get a clean error response, not a crash or hang."""
@@ -246,7 +250,7 @@ def test_unknown_command_and_bad_index_are_rejected_without_crashing(
         offset_hz=CHANNEL_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=TONE_DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     config_path = test_output_dir / "rtl_airband.conf"
     socket_path = short_socket_dir / "control.sock"
@@ -303,6 +307,7 @@ def test_unknown_command_and_bad_index_are_rejected_without_crashing(
 def test_control_socket_file_permissions(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     short_socket_dir: Path,
 ) -> None:
     """The control socket is created with owner-only (0600) permissions."""
@@ -310,7 +315,7 @@ def test_control_socket_file_permissions(
         offset_hz=CHANNEL_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=1.0,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     config_path = test_output_dir / "rtl_airband.conf"
     socket_path = short_socket_dir / "control.sock"

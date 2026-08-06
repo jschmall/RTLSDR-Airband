@@ -20,7 +20,7 @@ Parametrized over all provided binaries (non-NFM and NFM if available).
 
 from pathlib import Path
 
-from conftest import CACHE_DIR, BinaryUnderTest, run_rtl_airband
+from conftest import BinaryUnderTest, run_rtl_airband
 from helpers import config_writer, iq_generator
 from helpers.fake_icecast_server import FakeIcecastServer
 
@@ -58,6 +58,7 @@ def pytest_generate_tests(metafunc):
 def test_icecast_output(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
+    cache_dir: Path,
     speedup_factor: float,
 ) -> None:
     """A channel with an icecast output connects and streams continuous MP3 audio."""
@@ -65,7 +66,7 @@ def test_icecast_output(
         offset_hz=CHANNEL_OFFSET_HZ,
         audio_hz=AUDIO_TONE_HZ,
         duration_s=DURATION_S,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
 
     config_path = test_output_dir / "rtl_airband.conf"
