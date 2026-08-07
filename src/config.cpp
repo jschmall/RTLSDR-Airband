@@ -547,6 +547,15 @@ string build_channel_identity_signature(const libconfig::Setting& chan_setting) 
     return out;
 }
 
+string build_mixer_remote_inputs_signature(const libconfig::Setting& mixer_setting) {
+    // Distinct from "{}" (an empty-but-present remote_inputs list, a legal if pointless config)
+    // so a mixer gaining or losing its remote_inputs block entirely is also detected as changed.
+    if (!mixer_setting.exists("remote_inputs")) {
+        return "<absent>";
+    }
+    return serialize_setting(mixer_setting["remote_inputs"]);
+}
+
 bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx, int chan_idx, channel_t* channel) {
     for (int k = 0; k < AGC_EXTRA; k++) {
         channel->wavein[k] = 20;
@@ -1125,6 +1134,10 @@ int parse_mixers(libconfig::Setting& mx) {
             cerr << "Configuration error: mixers.[" << i << "]: reserve_inputs must not be negative\n";
             error();
         }
+        // Captured before remote_inputs is parsed below so reload_diff (compute_and_apply_diff(),
+        // live_reconfig.cpp) can detect a live-running mixer's remote_inputs block changing -
+        // see mixer_t::remote_inputs_signature's comment (rtl_airband.h) for why this exists.
+        mixer->remote_inputs_signature = strdup(build_mixer_remote_inputs_signature(mx[i]).c_str());
 
         // Cross-instance mixer inputs: each entry reserves a slot fed by a `mixer_remote` output
         // in a DIFFERENT rtl_airband process's config (see mixer_remote.h/mixer_remote_wire.h),

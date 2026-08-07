@@ -1440,6 +1440,56 @@ Keep the local delta small and well understood.
       still works exactly as before, with no observable behavior change (the leak was
       unreachable from any test or manual session prior to this — every previous validation
       either restarted both instances or never live-edited a `mixer_remote` output).
+    - **Third manual validation round, and a `reload_diff` reporting gap closed as a result**:
+      asked directly whether disabling/removing a mixer on the *receiving* instance (B) could
+      ever affect the *sending* instance (A). Traced and confirmed on real hardware: A has
+      zero coupling to B's mixer state under every interpretation — deleting the whole mixer
+      block from B's config is already safely rejected by the pre-existing `reload_diff` mixer-
+      count check (`"mixer count changed"` → `skipped_requires_restart`, nothing torn down);
+      restarting B entirely just reproduces the already-tested stranded-socket case; and
+      `mixer_disable` via B's control socket (the only *live* mixer-affecting operation that
+      actually exists) leaves A completely unaffected — confirmed alive, healthy, unchanged
+      CPU, log activity. On B's side, disabling revealed a real, harmless, previously-unverified
+      consequence: `mixer_thread()` skips a disabled mixer entirely (`mixer.cpp:328`), but the
+      remote_inputs listener thread never checks `mixer->enabled` at all - it keeps decoding
+      incoming packets and calling `mixer_put_samples()` regardless, so `mixer_remote_last_
+      packet_time_seconds` keeps advancing (the metric only reflects "packets are arriving," not
+      "packets are being mixed") and the pre-existing `input_overrun_count` metric climbs
+      continuously (watched it: 69 → 209, live) since the slot is never drained while disabled.
+      Re-enabling resumed mixing immediately - overrun count stabilized, a fresh output file
+      opened, confirmed via real MP3 file rotation on disk.
+    - **The actual gap this surfaced**: `MixerConfigSnapshot` (`live_reconfig.h`) only ever
+      captured a mixer's `name`/`enabled` — `remote_inputs` was invisible to `reload_diff`
+      entirely. Editing a `remote_inputs` entry (a changed `stream_id`, `listen_path`, etc.) and
+      calling `reload_diff` silently did nothing, with no signal either way in the response -
+      unlike every other unsupported live change, which is at least reported under
+      `skipped_requires_restart`. Fixed the same way item 31 already solved the analogous
+      problem for channels: a new `build_mixer_remote_inputs_signature()` (`config.cpp`, reusing
+      the same file-local `serialize_setting()` recursive serializer `build_channel_identity_
+      signature()` already uses) canonicalizes a mixer's whole `remote_inputs` subtree into one
+      comparable string - `"<absent>"` if the key doesn't exist at all, distinct from `"{}"` (a
+      present-but-empty list), so gaining or losing the block entirely is detected too, not just
+      edits within an already-present one. `mixer_t` gained `remote_inputs_signature` (set once
+      by `parse_mixers()`, mirroring `channel_t::config_signature`'s exact pattern) and
+      `MixerConfigSnapshot` gained the matching field, populated in `parse_config_snapshot()`.
+      `compute_and_apply_diff()` now compares them right after the existing `name` check; a
+      mismatch reports `"mixer[i]: remote_inputs changed"` under `skipped_requires_restart` and
+      skips the enabled-diff for that mixer that pass (same `continue`-past pattern the `name`
+      check already uses). A NULL live `remote_inputs_signature` (only possible in a hand-built
+      test fixture that predates this field - `parse_mixers()` always sets it in production)
+      skips the check entirely rather than reporting a spurious mismatch, so none of the many
+      pre-existing mixer-related `DiffApplyTest`/`ChannelAppendTest` fixtures needed updating.
+      Unit tested: `MixerRemoteInputsSignatureTest` (six cases covering identical/differing
+      `stream_id`/`listen_path`, a second route added, and the absent-vs-empty-list distinction,
+      same style as the pre-existing `ChannelIdentitySignatureTest`) and three new `DiffApplyTest`
+      cases (`remote_inputs_changed_is_requires_restart_and_applies_nothing`, `_unchanged_reports_
+      nothing`, `_signature_null_on_live_mixer_skips_the_check`). All 288 tests (9 net new) pass
+      across Debug, Debug+NFM, `-DRDIO_SCANNER=OFF`, and ASan/UBSan. Re-verified end-to-end on
+      real hardware: an unchanged config's `reload_diff` reports nothing for `remote_inputs`
+      (only the pre-existing idempotent `gain` reapply, item 34's own documented behavior);
+      editing a live mixer's `remote_inputs` `stream_id` and calling `reload_diff` now correctly
+      surfaces `"mixer[0]: remote_inputs changed"`, with the instance remaining fully healthy
+      throughout (confirmed via continued local-output file growth after the call).
     - **Still not done**: a two-instance system test (every existing system test drives
       exactly one running instance; this needs a `Popen()`-based two-process helper, closer
       to `helpers/interactive_runner.py`'s live-process pattern than

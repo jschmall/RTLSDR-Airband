@@ -705,6 +705,7 @@ bool parse_config_snapshot(const string& config_path, ConfigSnapshot* out, strin
             const char* name = mx[i].getName();
             m.name = name ? name : "";
             m.enabled = mx[i].exists("enabled") ? (bool)mx[i]["enabled"] : true;
+            m.remote_inputs_signature = build_mixer_remote_inputs_signature(mx[i]);
             out->mixers.push_back(m);
         }
     }
@@ -944,6 +945,17 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
             const MixerConfigSnapshot& snap = snapshot.mixers[i];
             if (mixer->name != nullptr && snap.name != string(mixer->name)) {
                 result.skipped_requires_restart.push_back("mixer[" + to_string(i) + "]: name changed");
+                continue;
+            }
+            // remote_inputs has no live-apply primitive at all (every route's listen_path/
+            // stream_id/ampfactor/balance/label is fixed by mixer_connect_input() calls made only
+            // during startup parsing) - previously this was silently never inspected here at all,
+            // so an operator editing remote_inputs and calling reload_diff got no signal either
+            // way. mixer->remote_inputs_signature is only ever null in a hand-built test fixture
+            // that predates this field (parse_mixers() always sets it in production) - skip the
+            // check rather than reporting a spurious mismatch against every such fixture.
+            if (mixer->remote_inputs_signature != nullptr && snap.remote_inputs_signature != string(mixer->remote_inputs_signature)) {
+                result.skipped_requires_restart.push_back("mixer[" + to_string(i) + "]: remote_inputs changed");
                 continue;
             }
             if (snap.enabled != mixer->enabled) {

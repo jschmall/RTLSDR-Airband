@@ -624,6 +624,16 @@ struct mixer_t {
     // Without this, every live-edited mixer-connected channel (item 30) permanently burned a new
     // reserve_inputs slot instead of reusing the one its previous definition vacated.
     bool* input_removed;
+    // Canonical serialization of this mixer's remote_inputs config block (build_mixer_remote_
+    // inputs_signature(), config.cpp), set once by parse_mixers() - NULL only in hand-built test
+    // fixtures that predate this field (parse_mixers() always sets it in production), never in a
+    // live-running process. remote_inputs has no live-apply primitive of its own (unlike
+    // name/enabled, which reload_diff already diffs field-by-field): a route's listen_path/
+    // stream_id/ampfactor/balance/label are all fixed at parse time, since mixer_connect_input()
+    // is only ever called for them during startup config parsing. Without this signature,
+    // compute_and_apply_diff() (live_reconfig.cpp) had no way to even notice a remote_inputs edit
+    // - it wasn't rejected as skipped_requires_restart, it was silently never inspected at all.
+    char* remote_inputs_signature;
     channel_t channel;
 };
 
@@ -758,6 +768,13 @@ bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx,
 // arbitrarily nested output-type-specific blocks) with no risk of a future config option being
 // silently left out of the comparison.
 std::string build_channel_identity_signature(const libconfig::Setting& chan_setting);
+// Same idea as build_channel_identity_signature(), scoped to just a mixer's remote_inputs
+// block (or a distinct "absent" marker if the mixer has none) - see mixer_t::
+// remote_inputs_signature's comment (rtl_airband.h) for why reload_diff needs this: unlike
+// every other mixer field it already diffs (name, enabled), remote_inputs has no live-apply
+// primitive at all, so a changed remote_inputs block must be positively detected and reported
+// under skipped_requires_restart rather than silently doing nothing.
+std::string build_mixer_remote_inputs_signature(const libconfig::Setting& mixer_setting);
 
 // udp_stream.cpp
 bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len);
