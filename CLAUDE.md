@@ -1376,16 +1376,42 @@ Keep the local delta small and well understood.
       `"mixer"` output type's `strncmp()` match) is checked first in `parse_outputs()` and is
       never silently swallowed by the `"mixer"` branch (`test_live_reconfig.cpp`). All 279 tests
       (57 net new) pass across Debug, Debug+NFM, and `-DRDIO_SCANNER=OFF`.
-    - **Not yet done, explicitly deferred**: a two-instance system test (every existing system
-      test drives exactly one running instance; this needs a `Popen()`-based two-process helper,
-      closer to `helpers/interactive_runner.py`'s live-process pattern than
+    - **Manually validated end-to-end against two real RTL-SDR dongles** on this dev box
+      (serials `SI02`/`SI03`, one sender instance + one receiver instance, real `Release`
+      binary, `mixers.conf`-style config): zero `mixer_remote_route_failure_count`/
+      `mixer_remote_listener_failure_count` across ~65s of continuous real transmission
+      (no rate/sample-count mismatches, no seq gaps/reorders, no malformed packets, no
+      rejected UIDs); killing the sending instance mid-stream left the receiver running
+      with no crash, and `mixer_remote_last_packet_time_seconds` correctly froze at the
+      last real packet instead of resetting or continuing to advance — confirming the
+      "quiet sender" vs. "gone sender" distinction this metric exists for actually holds
+      up against a real process death, not just the simulated one in `test_mixer_remote.cpp`.
+    - **Real bug this testing caught, not a flaw in the feature**: the first attempt used a
+      `dest_path`/`listen_path` under a deeply nested test-scratch directory (127 bytes) —
+      `AF_UNIX` socket paths are capped at 107 bytes on Linux (`sizeof(sockaddr_un::sun_path)
+      - 1`), and both `mixer_remote_send_init()` and `mixer_remote_recv_start()` correctly
+      rejected it as "too long" (logged, non-fatal on the send side; logged and that
+      listener skipped on the receive side) rather than truncating the path or crashing —
+      exactly the designed behavior, just not something the unit tests (which use short
+      `temp_dir`-relative paths) had exercised against a realistically long path. No code
+      change needed; worth remembering that a deployment's `dest_path`/`listen_path` must
+      stay well under 107 bytes (`/run/rtl_airband/*.sock`-style paths are safely short).
+    - **Unrelated gotcha hit during this same validation session, not specific to this
+      feature**: `-F` (foreground) alone does not disable syslog — `do_syslog` defaults to
+      `1` regardless of `-F`, so every `log()` call (including all of this feature's own
+      startup/diagnostic messages) went to `journalctl`/syslog, not the redirected
+      stdout/stderr file, until `-e` was added too. Caused a long, confusing detour
+      chasing a phantom "listener never starts" hypothesis before the real explanation
+      (log destination, not a hang) was found. Worth remembering for any future manual
+      rtl_airband testing session, not just this feature's.
+    - **Still not done**: a two-instance system test (every existing system test drives
+      exactly one running instance; this needs a `Popen()`-based two-process helper, closer
+      to `helpers/interactive_runner.py`'s live-process pattern than
       `conftest.run_rtl_airband()`'s blocking model — flagged as the largest net-new test
-      infrastructure item when this was scoped, not yet built). Manual validation against two
-      real instances on `10.0.50.31` (or this dev box's own attached hardware first) — per this
-      fork's explicit rollout norm ("test on a low-priority SDR instance before rolling out") —
-      has also not yet been done; this feature should not be considered production-ready until
-      both of those happen. Per-remote-input live enable/disable and 16/8-bit wire formats remain
-      deliberately out of scope unless a concrete need emerges.
+      infrastructure item when this was scoped, still not built, so this manual validation
+      is not a substitute for that automated coverage going forward). Per-remote-input live
+      enable/disable and 16/8-bit wire formats remain deliberately out of scope unless a
+      concrete need emerges.
 
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
