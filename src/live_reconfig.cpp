@@ -198,6 +198,15 @@ void free_output_data(output_t* output) {
             break;
         }
 #endif /* WITH_PULSEAUDIO */
+        case O_MIXER_REMOTE: {
+            // XCALLOC'd (config.cpp); dest_path strdup'd there. send_buf is already freed and
+            // NULL'd by mixer_remote_send_shutdown() (disable_channel_outputs(), which always
+            // runs before this) - nothing left to do for it here, only the strdup'd path.
+            mixer_remote_send_data* d = (mixer_remote_send_data*)output->data;
+            free(const_cast<char*>(d->dest_path));
+            free(d);
+            break;
+        }
         case O_MIXER:
         default:
             // mixer_data::mixer points at the process-wide mixers[] array - not owned here.

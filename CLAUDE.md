@@ -1404,6 +1404,42 @@ Keep the local delta small and well understood.
       chasing a phantom "listener never starts" hypothesis before the real explanation
       (log destination, not a hang) was found. Worth remembering for any future manual
       rtl_airband testing session, not just this feature's.
+    - **Second manual validation round, specifically targeting how a remote sending output
+      stopping/dropping/being removed behaves** (prompted by a direct question about exactly
+      this — the first round only exercised a graceful `SIGTERM` on the sender): `kill -9`
+      on the sender (a hard crash, no cleanup possible) produced identical clean degradation
+      on the receiver to the graceful case — `mixer_remote_last_packet_time_seconds` froze,
+      zero crashes, zero failure-counter increments, confirming the receiver never assumed
+      anything about *how* a sender goes away. Separately, `kill -9` on the *receiver*
+      (leaving its socket file stranded on disk, listening socket gone) was tested from the
+      sender's side: the still-running sender kept operating normally for 35+ seconds against
+      the now-`ECONNREFUSED`-returning `sendto()`, with no crash or hang — the fire-and-forget
+      design (item 42's own send-side rationale) holds up against a dead-but-still-present
+      peer, not just a never-existed one.
+    - **A real bug found by this second round, now fixed**: live-editing a channel to remove
+      its `mixer_remote` output (config edit + `reload_diff`, exercising item 31's generic
+      tail-replace channel-edit mechanism — no `mixer_remote`-specific reload_diff code exists
+      or was needed) correctly stopped the packet stream and left both instances healthy, but
+      `free_output_data()` (`src/live_reconfig.cpp`, item 41) had no `case O_MIXER_REMOTE:` —
+      it fell into the `default:` branch written for `O_MIXER` ("XCALLOC'd, no other owned
+      pointers"), which is false for `mixer_remote_send_data`: its `dest_path` is a `strdup()`'d
+      string that was never freed. A real, confirmed leak (not a crash) on every live
+      removal/edit of a `mixer_remote`-connected channel. `send_buf` is unaffected — it's
+      already freed by `mixer_remote_send_shutdown()`, which `disable_channel_outputs()`
+      already calls before `free_output_data()` ever runs. Fixed by adding the missing case
+      (frees `dest_path`, matches every other output type's explicit-per-field-free pattern
+      in this function). `ReclaimPendingChannelFreesTest.frees_every_non_mixer_output_type_
+      without_corrupting_the_heap` (`test_live_reconfig.cpp`) extended with a fully-populated
+      `O_MIXER_REMOTE` case; confirmed the fix by first reverting it and re-running under
+      `ASAN_OPTIONS=detect_leaks=1` — LeakSanitizer caught the exact 34-byte `strdup` leak at
+      the test's own allocation site, then confirmed clean with the fix restored. All 279
+      tests pass across Debug, Debug+NFM, `-DRDIO_SCANNER=OFF`, and ASan/UBSan (leak-detection
+      on for this specific test, off for the full suite per the pre-existing unrelated-fixture-
+      leak convention items 40/41 already established). Also re-validated end-to-end on real
+      hardware after the fix: live-removing the sender's `mixer_remote` output via `reload_diff`
+      still works exactly as before, with no observable behavior change (the leak was
+      unreachable from any test or manual session prior to this — every previous validation
+      either restarted both instances or never live-edited a `mixer_remote` output).
     - **Still not done**: a two-instance system test (every existing system test drives
       exactly one running instance; this needs a `Popen()`-based two-process helper, closer
       to `helpers/interactive_runner.py`'s live-process pattern than

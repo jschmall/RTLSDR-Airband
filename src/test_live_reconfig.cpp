@@ -2889,7 +2889,7 @@ TEST_F(ReclaimPendingChannelFreesTest, frees_every_non_mixer_output_type_without
     channel.freq_count = 2;
     channel.config_signature = strdup("test-signature");
 
-    const int kOutputCount = 3
+    const int kOutputCount = 4
 #ifdef WITH_PULSEAUDIO
                              + 1
 #endif /* WITH_PULSEAUDIO */
@@ -2945,6 +2945,18 @@ TEST_F(ReclaimPendingChannelFreesTest, frees_every_non_mixer_output_type_without
     sdata->stereo_buffer = (float*)XCALLOC(200, sizeof(float));
     sdata->send_socket = -1;
     channel.outputs[idx].data = sdata;
+    idx++;
+
+    // O_MIXER_REMOTE - dest_path strdup'd (config.cpp); send_buf left NULL, matching a channel
+    // whose mixer_remote_send_shutdown() already ran during disable_channel_outputs() (which
+    // channel_teardown_for_removal() always calls first) and already freed/NULL'd it.
+    channel.outputs[idx].type = O_MIXER_REMOTE;
+    mixer_remote_send_data* rdata = (mixer_remote_send_data*)XCALLOC(1, sizeof(mixer_remote_send_data));
+    rdata->dest_path = strdup("/run/rtl_airband/mix1_remote.sock");
+    rdata->stream_id = 3;
+    rdata->send_socket = -1;
+    rdata->send_buf = nullptr;
+    channel.outputs[idx].data = rdata;
     idx++;
 
 #ifdef WITH_PULSEAUDIO
