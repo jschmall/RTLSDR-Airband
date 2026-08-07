@@ -1954,6 +1954,66 @@ devices:
     EXPECT_EQ(mdata->input, 0);
 }
 
+// Regression test for a real parse_outputs() (config.cpp) hazard: "mixer_remote" starts with
+// the same 5-character prefix ("mixer") that the pre-existing "mixer" branch's strncmp() matches
+// on. If the "mixer_remote" branch weren't checked first, this config would be silently
+// misparsed as a local `type = "mixer"` output instead - which would then throw trying to read
+// a "name" setting this config never provides (a mixer_remote output has no local mixer to name;
+// it has dest_path/stream_id instead), rather than being rejected as invalid or a bug that's
+// merely silently wrong. No mixer needs to be declared at all here - that's the point.
+TEST_F(ChannelAppendTest, appends_channel_with_mixer_remote_output_not_swallowed_by_mixer_branch) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    channel_t chans[2] = {};
+    chans[0].enabled = true;
+    size_t bins[2] = {0, 0};
+    size_t base_bins[2] = {0, 0};
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 1;
+    dev.channel_capacity = 2;
+    dev.channels = chans;
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    std::string path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); },
+    { freq = 120050000; label = "new-chan"; outputs: ( { type = "mixer_remote"; dest_path = "/run/rtl_airband/mix1.sock"; stream_id = 7; } ); }
+  );
+});
+)");
+    ConfigSnapshot snapshot;
+    std::string parse_error;
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+    chans[0].config_signature = strdup(snapshot.devices[0].channel_signature[0].c_str());
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(dev.channel_count.load(), 2);
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+    ASSERT_EQ(result.applied.size(), 1u);
+    ASSERT_EQ(chans[1].output_count, 1);
+    ASSERT_EQ(chans[1].outputs[0].type, O_MIXER_REMOTE);
+    mixer_remote_send_data* rdata = (mixer_remote_send_data*)chans[1].outputs[0].data;
+    EXPECT_STREQ(rdata->dest_path, "/run/rtl_airband/mix1.sock");
+    EXPECT_EQ(rdata->stream_id, 7u);
+}
+
 TEST_F(ChannelAppendTest, appends_channel_with_mixer_output_exceeding_reserve_inputs_is_requires_restart) {
     input_t input = {};
     input.driver_type = "rtlsdr";

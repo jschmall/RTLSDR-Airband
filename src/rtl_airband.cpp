@@ -63,6 +63,7 @@
 #include "input-common.h"
 #include "live_reconfig.h"
 #include "logging.h"
+#include "mixer_remote.h"
 #include "rtl_airband.h"
 #include "squelch.h"
 
@@ -306,6 +307,11 @@ bool init_output(channel_t* channel, output_t* output) {
     } else if (output->type == O_UDP_STREAM) {
         udp_stream_data* sdata = (udp_stream_data*)(output->data);
         if (!udp_stream_init(sdata, channel->mode, (size_t)WAVE_BATCH)) {
+            return false;
+        }
+    } else if (output->type == O_MIXER_REMOTE) {
+        mixer_remote_send_data* rdata = (mixer_remote_send_data*)(output->data);
+        if (!mixer_remote_send_init(rdata, (size_t)WAVE_BATCH)) {
             return false;
         }
 #ifdef WITH_PULSEAUDIO
@@ -1230,6 +1236,8 @@ int main(int argc, char* argv[]) {
         control_socket_start(control_socket_path);
     }
 
+    mixer_remote_recv_start();
+
     sincosf_lut_init();
 
     // Startup the demod threads
@@ -1292,6 +1300,7 @@ int main(int argc, char* argv[]) {
 
     stats_http_shutdown();
     control_socket_shutdown();
+    mixer_remote_recv_shutdown();
 
     close_debug();
 #ifdef WITH_PROFILING

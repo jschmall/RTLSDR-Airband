@@ -29,6 +29,7 @@
 #include <sstream>
 #include "input-common.h"   // input_t
 #include "live_reconfig.h"  // compute_channel_bin, compute_channel_dm_dphi
+#include "mixer_remote.h"
 #include "rtl_airband.h"
 
 using namespace std;
@@ -245,6 +246,45 @@ static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, in
                 cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: can't have both continuous and split_on_transmission\n";
                 error();
             }
+        } else if (!strncmp(outs[o]["type"], "mixer_remote", 12)) {
+            // Checked before the "mixer" branch below: "mixer_remote" also starts with the
+            // 5-char prefix that branch's strncmp() matches on, so it must be checked first or
+            // it would silently be swallowed by the "mixer" branch instead.
+            channel->outputs[oo].data = XCALLOC(1, sizeof(struct mixer_remote_send_data));
+            channel->outputs[oo].type = O_MIXER_REMOTE;
+            mixer_remote_send_data* rdata = (mixer_remote_send_data*)(channel->outputs[oo].data);
+
+            if (!outs[o].exists("dest_path")) {
+                if (parsing_mixers) {
+                    cerr << "Configuration error: mixers.[" << i << "] outputs.[" << o << "]: ";
+                } else {
+                    cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: ";
+                }
+                cerr << "missing dest_path\n";
+                error();
+            }
+            rdata->dest_path = strdup(outs[o]["dest_path"]);
+
+            if (!outs[o].exists("stream_id")) {
+                if (parsing_mixers) {
+                    cerr << "Configuration error: mixers.[" << i << "] outputs.[" << o << "]: ";
+                } else {
+                    cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: ";
+                }
+                cerr << "missing stream_id\n";
+                error();
+            }
+            int stream_id = (int)outs[o]["stream_id"];
+            if (stream_id < 0) {
+                if (parsing_mixers) {
+                    cerr << "Configuration error: mixers.[" << i << "] outputs.[" << o << "]: ";
+                } else {
+                    cerr << "Configuration error: devices.[" << i << "] channels.[" << j << "] outputs.[" << o << "]: ";
+                }
+                cerr << "stream_id must not be negative\n";
+                error();
+            }
+            rdata->stream_id = (uint32_t)stream_id;
         } else if (!strncmp(outs[o]["type"], "mixer", 5)) {
             if (parsing_mixers) {  // mixer outputs not allowed for mixers
                 cerr << "Configuration error: mixers.[" << i << "] outputs.[" << o << "]: mixer output is not allowed for mixers\n";
@@ -1085,6 +1125,60 @@ int parse_mixers(libconfig::Setting& mx) {
             cerr << "Configuration error: mixers.[" << i << "]: reserve_inputs must not be negative\n";
             error();
         }
+
+        // Cross-instance mixer inputs: each entry reserves a slot fed by a `mixer_remote` output
+        // in a DIFFERENT rtl_airband process's config (see mixer_remote.h/mixer_remote_wire.h),
+        // connected via the same mixer_connect_input() every local `type = "mixer"` output uses -
+        // same single-threaded startup window mixer_finalize_capacity() (mixer.cpp) relies on.
+        if (mx[i].exists("remote_inputs")) {
+            libconfig::Setting& remote_inputs = mx[i]["remote_inputs"];
+            for (int r = 0; r < remote_inputs.getLength(); r++) {
+                if (!remote_inputs[r].exists("listen_path")) {
+                    cerr << "Configuration error: mixers.[" << i << "] remote_inputs.[" << r << "]: missing listen_path\n";
+                    error();
+                }
+                string listen_path = (const char*)remote_inputs[r]["listen_path"];
+                if (listen_path.empty()) {
+                    cerr << "Configuration error: mixers.[" << i << "] remote_inputs.[" << r << "]: listen_path must not be empty\n";
+                    error();
+                }
+                if (!remote_inputs[r].exists("stream_id")) {
+                    cerr << "Configuration error: mixers.[" << i << "] remote_inputs.[" << r << "]: missing stream_id\n";
+                    error();
+                }
+                int stream_id = (int)remote_inputs[r]["stream_id"];
+                if (stream_id < 0) {
+                    cerr << "Configuration error: mixers.[" << i << "] remote_inputs.[" << r << "]: stream_id must not be negative\n";
+                    error();
+                }
+                float ampfactor = remote_inputs[r].exists("ampfactor") ? (float)remote_inputs[r]["ampfactor"] : 1.0f;
+                float balance = remote_inputs[r].exists("balance") ? (float)remote_inputs[r]["balance"] : 0.0f;
+                if (balance < -1.0f || balance > 1.0f) {
+                    cerr << "Configuration error: mixers.[" << i << "] remote_inputs.[" << r << "]: balance out of allowed range <-1.0;1.0>\n";
+                    error();
+                }
+
+                mixer_remote_listener_t* listener = mixer_remote_get_or_create_listener(listen_path);
+                for (const mixer_remote_route_t& existing : listener->routes) {
+                    if (existing.stream_id == (uint32_t)stream_id) {
+                        cerr << "Configuration error: mixers.[" << i << "] remote_inputs.[" << r << "]: duplicate stream_id " << stream_id << " for listen_path " << listen_path << "\n";
+                        error();
+                    }
+                }
+
+                int slot = mixer_connect_input(mixer, ampfactor, balance);
+                if (slot < 0) {
+                    cerr << "Configuration error: mixers.[" << i << "] remote_inputs.[" << r << "]: could not connect remote input: " << mixer_get_error() << "\n";
+                    error();
+                }
+                if (remote_inputs[r].exists("label")) {
+                    mixer->inputs[slot].remote_label = strdup((const char*)remote_inputs[r]["label"]);
+                }
+                mixer_remote_register_route(listener, (uint32_t)stream_id, mixer, slot);
+                debug_print("mixer %s remote_inputs.[%d]: listen_path=%s stream_id=%d slot=%d (ampfactor=%.1f balance=%.1f)\n", name, r, listen_path.c_str(), stream_id, slot, ampfactor, balance);
+            }
+        }
+
         channel_t* channel = &mixer->channel;
         // mixer->channel.enabled gates process_outputs() same as any other channel_t (see
         // output.cpp), but unlike device channels it has no separate config keyword - a mixer's

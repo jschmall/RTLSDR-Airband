@@ -1260,6 +1260,133 @@ Keep the local delta small and well understood.
       frees()` now running on every `output_thread()` pass in the real binary, not just the test
       harness.
 
+42. **Cross-instance remote mixer input** (`src/mixer_remote_wire.{h,cpp}`, `src/mixer_remote.{h,cpp}`,
+    new; `src/rtl_airband.h`, `src/config.cpp`, `src/output.cpp`, `src/rtl_airband.cpp`, `src/mixer.cpp`) —
+    a mixer in one `rtl_airband` instance can now absorb a live audio input streamed from a
+    channel in a *different* instance's process, same host only. Investigated and scoped in a
+    session that confirmed mixers were previously 100% in-process (no IPC/shared-memory/socket
+    mechanism connected `mixers[]` across processes anywhere in this codebase). Deliberately
+    extends each instance's own mixer (any mixer can absorb a remote input alongside its local
+    channels) rather than introducing a standalone no-device relay-hub process — this fork's
+    ~12 instances already run on one host (`10.0.50.31`), so a same-host, same-UID transport was
+    chosen over real cross-host networking, which remains an explicit non-goal for now.
+    - **Wire protocol** (`mixer_remote_wire.h`) — a fixed 32-byte header (`magic`, `version`,
+      `format`, `sample_rate`, `stream_id`, `seq`, `sample_count`, `flags`) immediately followed
+      by raw mono float32 PCM, one datagram per `WAVE_BATCH` tick. Rate mismatch is
+      self-described per-packet rather than a separate handshake (simpler given the
+      connectionless, fire-and-forget transport below); only `STREAM_FORMAT_FLOAT32`-equivalent
+      is implemented (`MIXER_REMOTE_FORMAT_FLOAT32`) — same-host loopback has no real bandwidth
+      constraint, so 16/8-bit variants (mirroring `udp_stream_format`) are deferred. Pure,
+      no-I/O encode/decode/seq-classification functions, unit tested directly.
+    - **Transport**: a new `AF_UNIX SOCK_DGRAM` socket, separate from the `dynamic_reload`
+      control socket (`SOCK_STREAM`/JSON, control-plane only — audio and control traffic have
+      different framing/latency needs). The *sending* side (`mixer_remote_send_init()`,
+      `mixer_remote.cpp`) deliberately never `connect()`s: unlike a UDP socket, an `AF_UNIX
+      SOCK_DGRAM` `connect()` requires the target socket file to already exist, but the
+      receiving instance may start after this one does — connecting eagerly would make
+      `init_output()` fail (fatal at startup, item 15) purely because a sibling instance hasn't
+      started its listener yet. Every packet instead uses `sendto()` with the destination
+      supplied explicitly; a missing/refused receiver is counted (`dropped_packet_count`,
+      mirroring `udp_stream_data`'s counter exactly) and silently non-fatal, matching this
+      output's own existing resilience pattern.
+    - **Trust model**: `SCM_CREDENTIALS`/`SO_PASSCRED`, the connectionless analog of
+      `control_socket.cpp`'s `SO_PEERCRED` check (which only applies to a connected/`SOCK_STREAM`
+      socket) — a datagram is rejected unless its sender's UID matches the receiving process's
+      own `getuid()`. Same-UID was chosen deliberately after checking against this deployment's
+      *in-flight* per-instance service-account migration (see the `plugdev`/USB-permissions
+      incident below in Deployment Context): any two instances meant to share a mixer must run
+      under the same service account for this to work.
+    - **Config surface**: a new `mixer_remote` output type (`type = "mixer_remote"; dest_path =
+      "..."; stream_id = N;`), legal on any `channel_t` (device channel or a mixer's own embedded
+      channel, matching `O_UDP_STREAM`'s precedent — not restricted like local `type = "mixer"`
+      outputs) via the standard 3-file "adding an output" pattern this fork documents. Dispatched
+      **unconditionally every tick** in `process_outputs()` (not gated on squelch like
+      `O_UDP_STREAM`'s `continuous` check) — load-bearing: the receiver's `mixer_thread()`
+      already silence-fills a slot that misses its ~1/16s window, but that only correctly
+      distinguishes "sender alive, channel quiet" from "sender/process gone" if packets keep
+      arriving every tick. No `ampfactor`/`balance` on the sending side — those describe how the
+      *receiving* mixer treats the input, so (mirroring how a local `type = "mixer"` output
+      already stores them mixer-side) they live in the receiver's config instead.
+    - **Receiving side**: a new mixer-level `remote_inputs` config block (`listen_path`,
+      `stream_id`, `ampfactor`, `balance`, optional `label`), parsed by `parse_mixers()`
+      (`config.cpp`) at startup — the same single-threaded window `mixer_finalize_capacity()`
+      already relies on — via the **existing** `mixer_connect_input()`, so no new
+      capacity-safety mechanism was needed. Multiple `remote_inputs` entries may share one
+      `listen_path`, multiplexed by `stream_id`. No live creation in this initial landing
+      (matches item 27's "mixer/device add/remove out of scope, toggle only" precedent) —
+      changing which sender feeds which slot needs a restart; the existing whole-mixer
+      `mixer_enable`/`mixer_disable` control-socket commands already cover disabling every
+      remote input on a mixer at once, so a granular per-remote-input live toggle was
+      deliberately left out of scope (it would need `mixer_thread()` itself to grow a new
+      poll-and-consume responsibility it doesn't have today, since a remote input has no local
+      owning output thread the way a device channel does).
+    - **Threading**: one receive thread per unique `listen_path` (not per `stream_id` — one
+      socket, multiplexed by the packet header), calling `mixer_put_samples()` **directly**, with
+      no sentinel request/apply split unlike `device_t`/`channel_t`'s pattern (items 27-36).
+      Rationale: `mixinput_t` was already designed with its own per-slot `pthread_mutex_t`
+      guarding exactly the producer-facing fields, specifically so *any* producer thread can call
+      `mixer_put_samples()` safely — already proven today by `multiple_output_threads = true`,
+      where several output threads already call it concurrently against the same mixer's
+      different slots. The sentinel-request pattern exists for fields with no independent lock of
+      their own (`device_t::bins`, `channel_t::outputs`); that's not the case here. The one
+      invariant that still applies — slot creation being startup-only/single-threaded — is why
+      registry/slot setup happens in `parse_mixers()`, not from this thread.
+    - **Tag support** (`send_tx_tags`, item 26): `mixinput_t` gained a `remote_label` field
+      (`strdup`'d from a `remote_inputs` entry's optional `label`), since a remote input has no
+      local `source_device_idx`/`source_channel_idx` to look up. `mixer_tx_tag()` (`output.cpp`)
+      falls back to it when those indices are unresolved. Required the same slot-reuse/
+      fresh-growth zeroing discipline `source_device_idx`/`source_channel_idx` already follow
+      (`mixer_connect_input()`'s tombstone-reuse branch, its fresh-growth branch, and
+      `mixer_finalize_capacity()`'s realloc-tail-zeroing loop) — same class of bug item 40's
+      merge-time fix caught for the mixer-tag-source-index fields, applied here proactively
+      rather than found the hard way.
+    - **Observability**: per-route counters (`rate_mismatch_count`, `sample_count_mismatch_count`,
+      `malformed_payload_count`, `seq_gap_count`, `seq_reorder_or_duplicate_count`,
+      `last_packet_time` gauge — lets an operator tell a quiet-but-alive sender apart from one
+      whose process is gone entirely, something the existing local-input model never needed) and
+      per-listener counters (`rejected_uid_count`, `malformed_header_count`, `unknown_stream_count`
+      — a malformed *header* can't be attributed to a route at all, since decoding it is what
+      would identify the route in the first place, so this is split from the route-level
+      `malformed_payload_count`). All exposed via `write_stats_file()`/the HTTP metrics endpoint
+      (item 8), following item 23's established per-output-counter pattern. A sender flooding
+      faster than `WAVE_BATCH` cadence is covered for free by the existing
+      `mixinput_t::input_overrun_count` — no new counter needed for that case.
+    - **Deviation from the original plan**: the plan called for a listener `bind()` failure to be
+      fatal at startup, mirroring `init_output()`. Implemented as non-fatal instead
+      (`mixer_remote_recv_start()` logs and skips that listener, leaving its routes permanently
+      silence-filled) after checking the actual precedent: `control_socket_start()`/
+      `stats_http_start()` — the closest analogs, both optional background listeners — are
+      already non-fatal in this codebase (their return values aren't even checked in `main()`).
+      Taking down a mixer's other, working inputs/outputs over one failed optional listener was
+      judged disproportionate, consistent with this fork's broader shift (items 32-36) toward
+      "a transient failure in one subsystem shouldn't take down the whole process."
+    - Unit tested extensively: wire encode/decode round-trip and bounds checks
+      (`test_mixer_remote_wire.cpp`, matching item 11's "real check, not `assert()`" discipline);
+      send-side against a real bound `AF_UNIX SOCK_DGRAM` socket including the "nothing listening
+      yet is safe/inert" contract and a `dest_path`-too-long rejection (`test_mixer_remote.cpp`);
+      receive-side registry logic, `mixer_remote_dispatch_packet()`'s full failure-mode matrix
+      (wrong UID, malformed header, unknown stream, rate/sample-count mismatch, seq
+      gap/duplicate/reorder classification), and a full round trip through the *real* listener
+      thread and a real bound socket including its `SCM_CREDENTIALS` extraction
+      (`test_mixer_remote.cpp`); `parse_mixers()`'s `remote_inputs` block including the
+      duplicate-`stream_id`-on-one-`listen_path` and missing-field config-error paths, exercised
+      via the `config_error_is_recoverable`/`ConfigApplyError` mechanism (item 28) rather than
+      letting a malformed config `_Exit(1)` the test binary; and a dedicated regression test
+      proving `"mixer_remote"` (which shares its first 5 characters with the pre-existing
+      `"mixer"` output type's `strncmp()` match) is checked first in `parse_outputs()` and is
+      never silently swallowed by the `"mixer"` branch (`test_live_reconfig.cpp`). All 279 tests
+      (57 net new) pass across Debug, Debug+NFM, and `-DRDIO_SCANNER=OFF`.
+    - **Not yet done, explicitly deferred**: a two-instance system test (every existing system
+      test drives exactly one running instance; this needs a `Popen()`-based two-process helper,
+      closer to `helpers/interactive_runner.py`'s live-process pattern than
+      `conftest.run_rtl_airband()`'s blocking model — flagged as the largest net-new test
+      infrastructure item when this was scoped, not yet built). Manual validation against two
+      real instances on `10.0.50.31` (or this dev box's own attached hardware first) — per this
+      fork's explicit rollout norm ("test on a low-priority SDR instance before rolling out") —
+      has also not yet been done; this feature should not be considered production-ready until
+      both of those happen. Per-remote-input live enable/disable and 16/8-bit wire formats remain
+      deliberately out of scope unless a concrete need emerges.
+
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
 
