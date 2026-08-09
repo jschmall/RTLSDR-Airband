@@ -1698,6 +1698,89 @@ TEST_F(DiffApplyTest, mixer_enabled_diff_calls_mixer_enable_disable) {
     EXPECT_NE(result.applied[0].find("mix1"), std::string::npos);
 }
 
+// remote_inputs has no live-apply primitive - unlike name/enabled, a changed remote_inputs block
+// must be positively detected and reported under skipped_requires_restart. Before this, it was
+// silently never inspected at all - see mixer_t::remote_inputs_signature's comment (rtl_airband.h).
+TEST_F(DiffApplyTest, remote_inputs_changed_is_requires_restart_and_applies_nothing) {
+    mixer_t mixer = {};
+    mixer.name = "mix1";
+    mixer.enabled = true;
+    mixer.pending_enable_request = -1;
+    mixer.input_count = 0;
+    mixer.channel.enabled = true;
+    mixer.channel.output_count = 0;
+    mixer.remote_inputs_signature = strdup("{stream_id=1;listen_path=\"/tmp/a.sock\";}");
+    mixers = &mixer;
+    mixer_count = 1;
+
+    ConfigSnapshot snapshot;
+    MixerConfigSnapshot snap;
+    snap.name = "mix1";
+    snap.enabled = true;                                                          // unchanged - isolates the remote_inputs check from the enabled check
+    snap.remote_inputs_signature = "{stream_id=2;listen_path=\"/tmp/a.sock\";}";  // stream_id changed
+    snapshot.mixers.push_back(snap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_TRUE(result.applied.empty());
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("remote_inputs changed"), std::string::npos);
+}
+
+TEST_F(DiffApplyTest, remote_inputs_unchanged_reports_nothing) {
+    mixer_t mixer = {};
+    mixer.name = "mix1";
+    mixer.enabled = true;
+    mixer.pending_enable_request = -1;
+    mixer.input_count = 0;
+    mixer.channel.enabled = true;
+    mixer.channel.output_count = 0;
+    mixer.remote_inputs_signature = strdup("{stream_id=1;listen_path=\"/tmp/a.sock\";}");
+    mixers = &mixer;
+    mixer_count = 1;
+
+    ConfigSnapshot snapshot;
+    MixerConfigSnapshot snap;
+    snap.name = "mix1";
+    snap.enabled = true;
+    snap.remote_inputs_signature = "{stream_id=1;listen_path=\"/tmp/a.sock\";}";  // identical
+    snapshot.mixers.push_back(snap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_TRUE(result.applied.empty());
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+}
+
+// A hand-built mixer_t fixture that predates this field (remote_inputs_signature left at its
+// zero-initialized NULL, same as every other pre-existing DiffApplyTest mixer case above) must
+// not spuriously report a change - only parse_mixers() (config.cpp) ever sets this in a real
+// process, so a NULL live signature means "not observed," not "definitely absent."
+TEST_F(DiffApplyTest, remote_inputs_signature_null_on_live_mixer_skips_the_check) {
+    mixer_t mixer = {};
+    mixer.name = "mix1";
+    mixer.enabled = true;
+    mixer.pending_enable_request = -1;
+    mixer.input_count = 0;
+    mixer.channel.enabled = true;
+    mixer.channel.output_count = 0;
+    // mixer.remote_inputs_signature deliberately left NULL
+    mixers = &mixer;
+    mixer_count = 1;
+
+    ConfigSnapshot snapshot;
+    MixerConfigSnapshot snap;
+    snap.name = "mix1";
+    snap.enabled = true;
+    snap.remote_inputs_signature = "{stream_id=1;listen_path=\"/tmp/a.sock\";}";  // differs from "<absent>"
+    snapshot.mixers.push_back(snap);
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_TRUE(result.applied.empty());
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+}
+
 // Dynamic channel add: compute_and_apply_diff() detecting/applying a config file's channel count
 // growing for a device (a pure tail append, within dev->channel_capacity's pre-reserved
 // headroom - see rtl_airband.h's comment on channel_capacity). Unlike the other DiffApplyTest
@@ -1952,6 +2035,66 @@ devices:
     mixer_data* mdata = (mixer_data*)chans[1].outputs[0].data;
     EXPECT_EQ(mdata->mixer, &mixer);
     EXPECT_EQ(mdata->input, 0);
+}
+
+// Regression test for a real parse_outputs() (config.cpp) hazard: "mixer_remote" starts with
+// the same 5-character prefix ("mixer") that the pre-existing "mixer" branch's strncmp() matches
+// on. If the "mixer_remote" branch weren't checked first, this config would be silently
+// misparsed as a local `type = "mixer"` output instead - which would then throw trying to read
+// a "name" setting this config never provides (a mixer_remote output has no local mixer to name;
+// it has dest_path/stream_id instead), rather than being rejected as invalid or a bug that's
+// merely silently wrong. No mixer needs to be declared at all here - that's the point.
+TEST_F(ChannelAppendTest, appends_channel_with_mixer_remote_output_not_swallowed_by_mixer_branch) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.sample_rate = 2000000;
+    input.centerfreq = 120000000;
+
+    channel_t chans[2] = {};
+    chans[0].enabled = true;
+    size_t bins[2] = {0, 0};
+    size_t base_bins[2] = {0, 0};
+
+    device_t dev = {};
+    dev.input = &input;
+    dev.mode = R_MULTICHANNEL;
+    dev.channel_count = 1;
+    dev.channel_capacity = 2;
+    dev.channels = chans;
+    dev.bins = bins;
+    dev.base_bins = base_bins;
+    dev.pending_centerfreq_request = -1;
+    devices = &dev;
+    device_count = 1;
+
+    std::string path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); },
+    { freq = 120050000; label = "new-chan"; outputs: ( { type = "mixer_remote"; dest_path = "/run/rtl_airband/mix1.sock"; stream_id = 7; } ); }
+  );
+});
+)");
+    ConfigSnapshot snapshot;
+    std::string parse_error;
+    ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+    chans[0].config_signature = strdup(snapshot.devices[0].channel_signature[0].c_str());
+
+    DiffResult result = compute_and_apply_diff(snapshot);
+
+    EXPECT_EQ(dev.channel_count.load(), 2);
+    EXPECT_TRUE(result.skipped_requires_restart.empty());
+    ASSERT_EQ(result.applied.size(), 1u);
+    ASSERT_EQ(chans[1].output_count, 1);
+    ASSERT_EQ(chans[1].outputs[0].type, O_MIXER_REMOTE);
+    mixer_remote_send_data* rdata = (mixer_remote_send_data*)chans[1].outputs[0].data;
+    EXPECT_STREQ(rdata->dest_path, "/run/rtl_airband/mix1.sock");
+    EXPECT_EQ(rdata->stream_id, 7u);
 }
 
 TEST_F(ChannelAppendTest, appends_channel_with_mixer_output_exceeding_reserve_inputs_is_requires_restart) {
@@ -2540,6 +2683,60 @@ TEST(ChannelIdentitySignatureTest, enabled_field_is_excluded_from_signature) {
     EXPECT_EQ(build_channel_identity_signature(cfg1.lookup("chan")), build_channel_identity_signature(cfg2.lookup("chan")));
 }
 
+// build_mixer_remote_inputs_signature() (config.cpp) is what backs the reload_diff check added
+// above (DiffApplyTest.remote_inputs_changed_is_requires_restart_and_applies_nothing) - tested
+// directly against real parsed config text, same style as ChannelIdentitySignatureTest above.
+TEST(MixerRemoteInputsSignatureTest, identical_remote_inputs_produce_identical_signatures) {
+    libconfig::Config cfg1, cfg2;
+    cfg1.readString(R"(mix: { remote_inputs: ( { listen_path = "/tmp/a.sock"; stream_id = 1; } ); };)");
+    cfg2.readString(R"(mix: { remote_inputs: ( { listen_path = "/tmp/a.sock"; stream_id = 1; } ); };)");
+    EXPECT_EQ(build_mixer_remote_inputs_signature(cfg1.lookup("mix")), build_mixer_remote_inputs_signature(cfg2.lookup("mix")));
+}
+
+TEST(MixerRemoteInputsSignatureTest, differing_stream_id_produces_different_signature) {
+    libconfig::Config cfg1, cfg2;
+    cfg1.readString(R"(mix: { remote_inputs: ( { listen_path = "/tmp/a.sock"; stream_id = 1; } ); };)");
+    cfg2.readString(R"(mix: { remote_inputs: ( { listen_path = "/tmp/a.sock"; stream_id = 2; } ); };)");
+    EXPECT_NE(build_mixer_remote_inputs_signature(cfg1.lookup("mix")), build_mixer_remote_inputs_signature(cfg2.lookup("mix")));
+}
+
+TEST(MixerRemoteInputsSignatureTest, differing_listen_path_produces_different_signature) {
+    libconfig::Config cfg1, cfg2;
+    cfg1.readString(R"(mix: { remote_inputs: ( { listen_path = "/tmp/a.sock"; stream_id = 1; } ); };)");
+    cfg2.readString(R"(mix: { remote_inputs: ( { listen_path = "/tmp/b.sock"; stream_id = 1; } ); };)");
+    EXPECT_NE(build_mixer_remote_inputs_signature(cfg1.lookup("mix")), build_mixer_remote_inputs_signature(cfg2.lookup("mix")));
+}
+
+TEST(MixerRemoteInputsSignatureTest, adding_a_second_route_produces_different_signature) {
+    libconfig::Config cfg1, cfg2;
+    cfg1.readString(R"(mix: { remote_inputs: ( { listen_path = "/tmp/a.sock"; stream_id = 1; } ); };)");
+    cfg2.readString(R"(mix: { remote_inputs: (
+        { listen_path = "/tmp/a.sock"; stream_id = 1; },
+        { listen_path = "/tmp/a.sock"; stream_id = 2; }
+    ); };)");
+    EXPECT_NE(build_mixer_remote_inputs_signature(cfg1.lookup("mix")), build_mixer_remote_inputs_signature(cfg2.lookup("mix")));
+}
+
+TEST(MixerRemoteInputsSignatureTest, absent_remote_inputs_is_distinct_from_an_empty_list) {
+    // Not just "different from any real content" - specifically distinct from "{}" (a present but
+    // empty remote_inputs list), so a mixer gaining its first remote_inputs entry (or losing its
+    // last one) is also detected as a change, not just edits to an already-present list.
+    libconfig::Config cfg1, cfg2;
+    cfg1.readString("mix: { outputs: (); };");  // no remote_inputs key at all
+    cfg2.readString("mix: { remote_inputs: (); outputs: (); };");
+    string absent_sig = build_mixer_remote_inputs_signature(cfg1.lookup("mix"));
+    string empty_sig = build_mixer_remote_inputs_signature(cfg2.lookup("mix"));
+    EXPECT_NE(absent_sig, empty_sig);
+    EXPECT_EQ(empty_sig, "{}");
+}
+
+TEST(MixerRemoteInputsSignatureTest, identical_absent_remote_inputs_produce_identical_signatures) {
+    libconfig::Config cfg1, cfg2;
+    cfg1.readString("mix: { outputs: (); };");
+    cfg2.readString("mix: { outputs: (); };");
+    EXPECT_EQ(build_mixer_remote_inputs_signature(cfg1.lookup("mix")), build_mixer_remote_inputs_signature(cfg2.lookup("mix")));
+}
+
 // End-to-end coverage for the tail-replace mechanism these signatures back: editing an already-
 // live channel's field (not just adding/removing channels) is picked up by reload_diff.
 TEST_F(ChannelAppendTest, replaces_tail_channel_when_its_definition_changes) {
@@ -2829,7 +3026,7 @@ TEST_F(ReclaimPendingChannelFreesTest, frees_every_non_mixer_output_type_without
     channel.freq_count = 2;
     channel.config_signature = strdup("test-signature");
 
-    const int kOutputCount = 3
+    const int kOutputCount = 4
 #ifdef WITH_PULSEAUDIO
                              + 1
 #endif /* WITH_PULSEAUDIO */
@@ -2885,6 +3082,18 @@ TEST_F(ReclaimPendingChannelFreesTest, frees_every_non_mixer_output_type_without
     sdata->stereo_buffer = (float*)XCALLOC(200, sizeof(float));
     sdata->send_socket = -1;
     channel.outputs[idx].data = sdata;
+    idx++;
+
+    // O_MIXER_REMOTE - dest_path strdup'd (config.cpp); send_buf left NULL, matching a channel
+    // whose mixer_remote_send_shutdown() already ran during disable_channel_outputs() (which
+    // channel_teardown_for_removal() always calls first) and already freed/NULL'd it.
+    channel.outputs[idx].type = O_MIXER_REMOTE;
+    mixer_remote_send_data* rdata = (mixer_remote_send_data*)XCALLOC(1, sizeof(mixer_remote_send_data));
+    rdata->dest_path = strdup("/run/rtl_airband/mix1_remote.sock");
+    rdata->stream_id = 3;
+    rdata->send_socket = -1;
+    rdata->send_buf = nullptr;
+    channel.outputs[idx].data = rdata;
     idx++;
 
 #ifdef WITH_PULSEAUDIO

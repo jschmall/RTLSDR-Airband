@@ -198,6 +198,15 @@ void free_output_data(output_t* output) {
             break;
         }
 #endif /* WITH_PULSEAUDIO */
+        case O_MIXER_REMOTE: {
+            // XCALLOC'd (config.cpp); dest_path strdup'd there. send_buf is already freed and
+            // NULL'd by mixer_remote_send_shutdown() (disable_channel_outputs(), which always
+            // runs before this) - nothing left to do for it here, only the strdup'd path.
+            mixer_remote_send_data* d = (mixer_remote_send_data*)output->data;
+            free(const_cast<char*>(d->dest_path));
+            free(d);
+            break;
+        }
         case O_MIXER:
         default:
             // mixer_data::mixer points at the process-wide mixers[] array - not owned here.
@@ -696,6 +705,7 @@ bool parse_config_snapshot(const string& config_path, ConfigSnapshot* out, strin
             const char* name = mx[i].getName();
             m.name = name ? name : "";
             m.enabled = mx[i].exists("enabled") ? (bool)mx[i]["enabled"] : true;
+            m.remote_inputs_signature = build_mixer_remote_inputs_signature(mx[i]);
             out->mixers.push_back(m);
         }
     }
@@ -935,6 +945,17 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
             const MixerConfigSnapshot& snap = snapshot.mixers[i];
             if (mixer->name != nullptr && snap.name != string(mixer->name)) {
                 result.skipped_requires_restart.push_back("mixer[" + to_string(i) + "]: name changed");
+                continue;
+            }
+            // remote_inputs has no live-apply primitive at all (every route's listen_path/
+            // stream_id/ampfactor/balance/label is fixed by mixer_connect_input() calls made only
+            // during startup parsing) - previously this was silently never inspected here at all,
+            // so an operator editing remote_inputs and calling reload_diff got no signal either
+            // way. mixer->remote_inputs_signature is only ever null in a hand-built test fixture
+            // that predates this field (parse_mixers() always sets it in production) - skip the
+            // check rather than reporting a spurious mismatch against every such fixture.
+            if (mixer->remote_inputs_signature != nullptr && snap.remote_inputs_signature != string(mixer->remote_inputs_signature)) {
+                result.skipped_requires_restart.push_back("mixer[" + to_string(i) + "]: remote_inputs changed");
                 continue;
             }
             if (snap.enabled != mixer->enabled) {

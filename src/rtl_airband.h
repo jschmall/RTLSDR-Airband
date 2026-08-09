@@ -26,6 +26,7 @@
 #include <shout/shout.h>
 #include <stdint.h>  // uint32_t
 #include <sys/time.h>
+#include <sys/un.h>  // sockaddr_un
 #include <atomic>
 #include <complex>
 #include <cstdio>
@@ -118,7 +119,8 @@ enum output_type {
     O_FILE,
     O_RAWFILE,
     O_MIXER,
-    O_UDP_STREAM
+    O_UDP_STREAM,
+    O_MIXER_REMOTE
 #ifdef WITH_PULSEAUDIO
     ,
     O_PULSE
@@ -251,6 +253,36 @@ struct udp_stream_data {
 
     // number of packets dropped by the bounds checks in udp_stream_write() (item 11 in
     // CLAUDE.md - real checks, not assert(), so this can actually increment in a Release build)
+    size_t dropped_packet_count;
+};
+
+// Cross-instance mixer input: streams one channel's audio to a mixer input slot reserved by a
+// remote_inputs entry in a DIFFERENT rtl_airband process instance's config, on the same host
+// (see mixer_remote_wire.h for the wire protocol, mixer_remote.cpp for the socket I/O). Unlike
+// a local `type = "mixer"` output, there is no ampfactor/balance here - those describe how the
+// RECEIVING mixer should treat this input, so they live in the receiver's remote_inputs config
+// entry instead (mirrors how a local mixer input already stores ampfactor/balance mixer-side,
+// not on the source channel).
+struct mixer_remote_send_data {
+    const char* dest_path;  // strdup'd; the receiver's AF_UNIX SOCK_DGRAM listen path
+    uint32_t stream_id;     // must match one of the receiver's remote_inputs[].stream_id entries
+
+    // Never connect()-ed, unlike udp_stream_data's socket - an AF_UNIX SOCK_DGRAM connect()
+    // requires the target socket file to already exist, but the receiving instance may start
+    // (or reload_diff a matching remote_inputs entry into existence) after this one does. Every
+    // send uses sendto() with dest_sockaddr explicitly instead - see mixer_remote_send_init()'s
+    // comment (mixer_remote.h) for the full rationale.
+    int send_socket;
+    struct sockaddr_un dest_sockaddr;
+
+    uint64_t seq;  // monotonically increasing, one per packet sent
+
+    uint8_t* send_buf;  // scratch buffer sized for one full packet (header + configured sample count)
+    size_t send_buf_len;
+
+    // number of times a send failed - either the local bounds check (more samples than send_buf
+    // was sized for) or the sendto() syscall itself (e.g. ENOENT because the receiver isn't
+    // listening yet) - mirrors udp_stream_data::dropped_packet_count exactly (item 11/23 pattern)
     size_t dropped_packet_count;
 };
 
@@ -528,6 +560,17 @@ struct mixinput_t {
     // on XCALLOC's zero-init.
     int source_device_idx;
     int source_channel_idx;
+    // strdup'd label for a remote_inputs-connected slot (source_device_idx/source_channel_idx
+    // are -1 for these - there is no local channel to look up), or NULL if this slot has no
+    // label configured (or is a local input). Set by config.cpp's parse_mixers() right after
+    // mixer_connect_input() returns, mirroring how source_device_idx/source_channel_idx are set
+    // post-connect for a local `type = "mixer"` output. Read by mixer_tx_tag() (output.cpp) as
+    // the send_tx_tags fallback when source_device_idx/source_channel_idx are unresolved. Must be
+    // freed and reset to NULL whenever a slot is reused (mixer_connect_input()'s tombstone-reuse
+    // branch) or zeroed on fresh growth (mixer_finalize_capacity()) - same discipline
+    // source_device_idx/source_channel_idx already follow, for the same reason (item 40's
+    // merge-time fix): a reused slot must never transiently expose the previous occupant's label.
+    char* remote_label;
 };
 
 struct mixer_t {
@@ -581,6 +624,16 @@ struct mixer_t {
     // Without this, every live-edited mixer-connected channel (item 30) permanently burned a new
     // reserve_inputs slot instead of reusing the one its previous definition vacated.
     bool* input_removed;
+    // Canonical serialization of this mixer's remote_inputs config block (build_mixer_remote_
+    // inputs_signature(), config.cpp), set once by parse_mixers() - NULL only in hand-built test
+    // fixtures that predate this field (parse_mixers() always sets it in production), never in a
+    // live-running process. remote_inputs has no live-apply primitive of its own (unlike
+    // name/enabled, which reload_diff already diffs field-by-field): a route's listen_path/
+    // stream_id/ampfactor/balance/label are all fixed at parse time, since mixer_connect_input()
+    // is only ever called for them during startup config parsing. Without this signature,
+    // compute_and_apply_diff() (live_reconfig.cpp) had no way to even notice a remote_inputs edit
+    // - it wasn't rejected as skipped_requires_restart, it was silently never inspected at all.
+    char* remote_inputs_signature;
     channel_t channel;
 };
 
@@ -715,6 +768,13 @@ bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx,
 // arbitrarily nested output-type-specific blocks) with no risk of a future config option being
 // silently left out of the comparison.
 std::string build_channel_identity_signature(const libconfig::Setting& chan_setting);
+// Same idea as build_channel_identity_signature(), scoped to just a mixer's remote_inputs
+// block (or a distinct "absent" marker if the mixer has none) - see mixer_t::
+// remote_inputs_signature's comment (rtl_airband.h) for why reload_diff needs this: unlike
+// every other mixer field it already diffs (name, enabled), remote_inputs has no live-apply
+// primitive at all, so a changed remote_inputs block must be positively detected and reported
+// under skipped_requires_restart rather than silently doing nothing.
+std::string build_mixer_remote_inputs_signature(const libconfig::Setting& mixer_setting);
 
 // udp_stream.cpp
 bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len);

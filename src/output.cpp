@@ -53,6 +53,7 @@
 #include "helper_functions.h"
 #include "input-common.h"
 #include "live_reconfig.h"
+#include "mixer_remote.h"
 #include "rtl_airband.h"
 
 void shout_setup(icecast_data* icecast, mix_modes mixmode) {
@@ -645,6 +646,14 @@ void process_outputs(channel_t* channel, int cur_scan_freq, const std::string& t
         } else if (channel->outputs[k].type == O_MIXER) {
             mixer_data* mdata = (mixer_data*)(channel->outputs[k].data);
             mixer_put_samples(mdata->mixer, mdata->input, channel->waveout, channel->axcindicate != NO_SIGNAL, WAVE_BATCH);
+        } else if (channel->outputs[k].type == O_MIXER_REMOTE) {
+            // Called unconditionally every tick, not gated on squelch like O_UDP_STREAM's
+            // `continuous` check - mirrors O_MIXER's own unconditional mixer_put_samples() call
+            // above. This is load-bearing: the receiver's mixer_thread() silence-fills a slot
+            // that misses its ~1/16s window, but only correctly distinguishes "sender alive,
+            // channel quiet" from "sender/process gone" if packets keep arriving every tick.
+            mixer_remote_send_data* rdata = (mixer_remote_send_data*)(channel->outputs[k].data);
+            mixer_remote_send(rdata, channel->waveout, (size_t)WAVE_BATCH, channel->axcindicate != NO_SIGNAL);
         } else if (channel->outputs[k].type == O_UDP_STREAM) {
             udp_stream_data* sdata = (udp_stream_data*)channel->outputs[k].data;
 
@@ -687,6 +696,9 @@ void disable_channel_outputs(channel_t* channel, bool permanent) {
         } else if (output->type == O_MIXER) {
             mixer_data* mdata = (mixer_data*)(output->data);
             mixer_disable_input(mdata->mixer, mdata->input, permanent);
+        } else if (output->type == O_MIXER_REMOTE) {
+            mixer_remote_send_data* rdata = (mixer_remote_send_data*)(output->data);
+            mixer_remote_send_shutdown(rdata);
         } else if (output->type == O_UDP_STREAM) {
             udp_stream_data* sdata = (udp_stream_data*)output->data;
             udp_stream_shutdown(sdata);
@@ -1155,6 +1167,82 @@ static void output_udp_stream_drops(FILE* f) {
     fprintf(f, "\n");
 }
 
+static void output_mixer_remote_send_drops(FILE* f) {
+    fprintf(f,
+            "# HELP mixer_remote_dropped_packet_count Number of packets dropped by a mixer_remote "
+            "output's bounds check or the underlying sendto() call (e.g. because the receiving "
+            "instance isn't listening yet).\n"
+            "# TYPE mixer_remote_dropped_packet_count counter\n");
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        for (int j = 0; j < dev->channel_count; j++) {
+            channel_t* channel = dev->channels + j;
+            for (int k = 0; k < channel->output_count; k++) {
+                if (channel->outputs[k].type != O_MIXER_REMOTE)
+                    continue;
+                mixer_remote_send_data* rdata = (mixer_remote_send_data*)channel->outputs[k].data;
+                fprintf(f, "mixer_remote_dropped_packet_count{device=\"%d\",channel=\"%d\",output=\"%d\"}\t%zu\n", i, j, k, rdata->dropped_packet_count);
+            }
+        }
+    }
+    for (int i = 0; i < mixer_count; i++) {
+        mixer_t* mixer = mixers + i;
+        for (int k = 0; k < mixer->channel.output_count; k++) {
+            if (mixer->channel.outputs[k].type != O_MIXER_REMOTE)
+                continue;
+            mixer_remote_send_data* rdata = (mixer_remote_send_data*)mixer->channel.outputs[k].data;
+            fprintf(f, "mixer_remote_dropped_packet_count{mixer=\"%d\",output=\"%d\"}\t%zu\n", i, k, rdata->dropped_packet_count);
+        }
+    }
+    fprintf(f, "\n");
+}
+
+static void output_mixer_remote_recv_health(FILE* f) {
+    fprintf(f,
+            "# HELP mixer_remote_last_packet_time_seconds Unix timestamp of the last packet "
+            "received for a remote_inputs route (0 = never). Lets an operator tell a quiet-but-"
+            "alive sender apart from one whose process is gone entirely.\n"
+            "# TYPE mixer_remote_last_packet_time_seconds gauge\n");
+    for (mixer_remote_listener_t* listener : mixer_remote_listeners) {
+        for (const mixer_remote_route_t& route : listener->routes) {
+            fprintf(f, "mixer_remote_last_packet_time_seconds{listen_path=\"%s\",stream_id=\"%u\"}\t%ld\n", listener->listen_path.c_str(), route.stream_id, (long)route.last_packet_time);
+        }
+    }
+    fprintf(f, "\n");
+
+    fprintf(f,
+            "# HELP mixer_remote_route_failure_count Per-remote_inputs-route packet failures: "
+            "rate/sample_count mismatches, malformed payloads, and out-of-order/duplicate "
+            "sequence numbers.\n"
+            "# TYPE mixer_remote_route_failure_count counter\n");
+    for (mixer_remote_listener_t* listener : mixer_remote_listeners) {
+        for (const mixer_remote_route_t& route : listener->routes) {
+            fprintf(f, "mixer_remote_route_failure_count{listen_path=\"%s\",stream_id=\"%u\",reason=\"rate_mismatch\"}\t%zu\n", listener->listen_path.c_str(), route.stream_id,
+                    route.rate_mismatch_count);
+            fprintf(f, "mixer_remote_route_failure_count{listen_path=\"%s\",stream_id=\"%u\",reason=\"sample_count_mismatch\"}\t%zu\n", listener->listen_path.c_str(), route.stream_id,
+                    route.sample_count_mismatch_count);
+            fprintf(f, "mixer_remote_route_failure_count{listen_path=\"%s\",stream_id=\"%u\",reason=\"malformed_payload\"}\t%zu\n", listener->listen_path.c_str(), route.stream_id,
+                    route.malformed_payload_count);
+            fprintf(f, "mixer_remote_route_failure_count{listen_path=\"%s\",stream_id=\"%u\",reason=\"seq_gap\"}\t%zu\n", listener->listen_path.c_str(), route.stream_id, route.seq_gap_count);
+            fprintf(f, "mixer_remote_route_failure_count{listen_path=\"%s\",stream_id=\"%u\",reason=\"seq_reorder_or_duplicate\"}\t%zu\n", listener->listen_path.c_str(), route.stream_id,
+                    route.seq_reorder_or_duplicate_count);
+        }
+    }
+    fprintf(f, "\n");
+
+    fprintf(f,
+            "# HELP mixer_remote_listener_failure_count Per-listener packet failures that "
+            "couldn't be attributed to a specific route: rejected sender UID, or a header that "
+            "couldn't be trusted enough to even identify a stream_id.\n"
+            "# TYPE mixer_remote_listener_failure_count counter\n");
+    for (mixer_remote_listener_t* listener : mixer_remote_listeners) {
+        fprintf(f, "mixer_remote_listener_failure_count{listen_path=\"%s\",reason=\"rejected_uid\"}\t%zu\n", listener->listen_path.c_str(), listener->rejected_uid_count);
+        fprintf(f, "mixer_remote_listener_failure_count{listen_path=\"%s\",reason=\"malformed_header\"}\t%zu\n", listener->listen_path.c_str(), listener->malformed_header_count);
+        fprintf(f, "mixer_remote_listener_failure_count{listen_path=\"%s\",reason=\"unknown_stream\"}\t%zu\n", listener->listen_path.c_str(), listener->unknown_stream_count);
+    }
+    fprintf(f, "\n");
+}
+
 #ifdef WITH_PULSEAUDIO
 static void output_pulse_health(FILE* f) {
     fprintf(f,
@@ -1300,6 +1388,8 @@ void write_stats_file(timeval* last_stats_write) {
     output_lame_encode_failures(file);
     output_file_write_failures(file);
     output_udp_stream_drops(file);
+    output_mixer_remote_send_drops(file);
+    output_mixer_remote_recv_health(file);
 #ifdef WITH_PULSEAUDIO
     output_pulse_health(file);
 #endif /* WITH_PULSEAUDIO */
@@ -1327,8 +1417,13 @@ static std::string mixer_tx_tag(mixer_t* mixer) {
     }
     mixinput_t& input = mixer->inputs[idx];
     if (input.source_device_idx < 0 || input.source_channel_idx < 0) {
-        // shouldn't happen for a config-time-connected input, but guard rather than index
-        // into devices[] with an unresolved index
+        // Always true for a remote_inputs-connected slot (there is no local channel to look
+        // up) - fall back to its configured remote_label, if any. compute_tx_tag_content()
+        // ignores frequency_hz whenever label is non-NULL, so passing 0 here is harmless; a
+        // remote source's frequency isn't known on this side anyway.
+        if (input.remote_label != NULL) {
+            return compute_tx_tag_content(true, input.remote_label, 0);
+        }
         return compute_tx_tag_content(false, NULL, 0);
     }
     channel_t& src = devices[input.source_device_idx].channels[input.source_channel_idx];

@@ -20,6 +20,9 @@ releases independently of upstream's — `v5.3.0` adds live reconfiguration (bel
 - **Live reconfiguration via a local control socket** — push most config changes to an
   already-running instance without dropping the audio feed for a full restart. See
   [Live Reconfiguration](#live-reconfiguration), below.
+- **Cross-instance mixer input** — let a mixer in one instance absorb a live audio input
+  streamed from a channel in a *different* instance's process, same host only. See
+  [Cross-Instance Mixer Input](#cross-instance-mixer-input), below.
 - **`send_tx_tags` Icecast output option** — push the channel's (or, for a mixer, whichever
   source channel is currently talking) configured `label` as the Icecast "song" tag when a
   transmission starts, and clear it when squelch closes — an on-air indicator for plain
@@ -104,6 +107,67 @@ change is never left in a broken or half-applied state — the instance keeps ru
 normally throughout, and you can either fix the config and try again, or fall back to
 SIGHUP (a clean, brief restart) to pick up anything that genuinely requires one.
 
+### Cross-Instance Mixer Input
+
+Normally a mixer can only combine channels from devices declared in its own instance's
+config. This lets a mixer in one instance absorb a channel's audio from a *different*
+running instance, so you can combine feeds from separate SDRs/instances without merging
+their configs into one process. Same-host only — it's built on a local Unix domain socket,
+not real networking, and trusts the same-UID model the [control socket](#live-reconfiguration)
+already uses (no TLS/auth beyond that).
+
+**On the sending instance**, add a `mixer_remote` output to the channel whose audio you want
+to share (works on a device channel or a mixer's own output, same as `udp_stream`):
+
+```
+outputs: (
+  {
+    type = "mixer_remote";
+    dest_path = "/run/rtl_airband/mix1_remote.sock";  # keep this short - see note below
+    stream_id = 1;
+  }
+);
+```
+
+**On the receiving instance**, add a `remote_inputs` block to the mixer that should absorb
+it:
+
+```
+mixers: {
+  mix1: {
+    remote_inputs: (
+      {
+        listen_path = "/run/rtl_airband/mix1_remote.sock";  # must match dest_path above
+        stream_id = 1;                                       # must match too
+        ampfactor = 1.0;
+        balance = 0.0;
+        label = "Unit 12";  # optional - used by send_tx_tags; there's no local channel here to pull a label from
+      }
+    );
+    outputs: ( ... );
+  };
+};
+```
+
+Multiple `remote_inputs` entries can share one `listen_path`, distinguished by `stream_id`
+— useful when several channels from the same sending instance feed the same mixer.
+
+**Keep `dest_path`/`listen_path` short.** These are real filesystem Unix domain socket
+paths, capped at 107 bytes by the OS — a deeply nested path (e.g. under a build or test
+scratch directory) can silently exceed that and fail to start. A short path like
+`/run/rtl_airband/mix1.sock` is safe.
+
+Startup order between the two instances doesn't matter — the sending side never blocks
+waiting for the receiver, and a receiver that isn't listening yet just means dropped
+packets (counted, not fatal) until it comes up. If the sending instance dies or its audio
+path drops, the mixer just goes quiet on that input instead of crashing — see the
+`mixer_remote_last_packet_time_seconds` metric below to tell "quiet" apart from "gone."
+
+This is a same-host-only, initial-landing feature: no live add/remove of a remote input
+(config-only, needs a restart to change), no cross-host support, and only whole-mixer
+enable/disable (no per-remote-input toggle) via the control socket. See
+[`CLAUDE.md`](CLAUDE.md) (fork-delta item 42) for full engineering detail.
+
 ### Metrics Exposed via the Stats Endpoint
 
 `stats_filepath` (and the HTTP metrics endpoint serving it) is written in Prometheus
@@ -132,7 +196,15 @@ rather than just knowing that it is.
 | `lame_encode_failure_count` | `lame_encode_buffer_ieee_float()` returned an error, for any output that encodes mp3 (icecast, file). |
 | `file_write_failure_count` | Short/failed `fwrite()` on a file or rawfile output; the output is disabled immediately after, so this should stay at 0 on a healthy instance. |
 | `udp_stream_dropped_packet_count` | A `udp_stream` packet was dropped by a bounds check (length/buffer-size mismatch) instead of overrunning a buffer. |
+| `mixer_remote_dropped_packet_count` | A `mixer_remote` output's send failed — a bounds check, or the `sendto()` itself (e.g. the receiving instance isn't listening yet). |
 | `pulse_underflow_count` / `pulse_overflow_count` / `pulse_disconnect_count` | PulseAudio stream underflow/overflow, and disconnects forced by the write path (latency check or a failed write). Requires the `PULSEAUDIO` build option. |
+
+**Cross-instance mixer input, receiving side** (label: `listen_path`, plus `stream_id` for per-route metrics — see [Cross-Instance Mixer Input](#cross-instance-mixer-input)):
+| Metric | Meaning |
+|---|---|
+| `mixer_remote_last_packet_time_seconds` | Unix timestamp of the last packet received for a `remote_inputs` route (0 = never). Distinguishes a quiet-but-alive sender from one whose process is gone entirely. |
+| `mixer_remote_route_failure_count{reason=...}` | Per-route failures: `rate_mismatch`, `sample_count_mismatch`, `malformed_payload`, `seq_gap`, `seq_reorder_or_duplicate`. |
+| `mixer_remote_listener_failure_count{reason=...}` | Per-listener failures that can't be attributed to a specific route: `rejected_uid`, `malformed_header`, `unknown_stream`. |
 
 **Process-wide**:
 | Metric | Meaning |

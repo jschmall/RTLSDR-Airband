@@ -295,6 +295,8 @@ add_library (rtl_airband_base OBJECT
 	input-helpers.cpp
 	live_reconfig.cpp
 	mixer.cpp
+	mixer_remote.cpp
+	mixer_remote_wire.cpp
 	output.cpp
 	rtl_airband.cpp
 	squelch.cpp
@@ -377,6 +379,8 @@ if(BUILD_UNITTESTS)
 		udp_stream.cpp
 		util.cpp
 		mixer.cpp
+		mixer_remote.cpp
+		mixer_remote_wire.cpp
 		stats_http.cpp
 		live_reconfig.cpp
 		control_socket.cpp

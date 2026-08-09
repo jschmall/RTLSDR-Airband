@@ -103,6 +103,10 @@ int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance) {
         // mixer_tx_tag(), not dereferenced.
         mixer->inputs[j].source_device_idx = -1;
         mixer->inputs[j].source_channel_idx = -1;
+        // Same rationale as source_device_idx/source_channel_idx just above: a reused slot must
+        // never transiently expose the previous occupant's remote_label to mixer_tx_tag().
+        free(mixer->inputs[j].remote_label);
+        mixer->inputs[j].remote_label = NULL;
         mixer->inputs_todo[j] = true;
         // Publish last, same discipline as the fresh-slot path below: mixer_thread() only reads
         // input_mask[j] first (short-circuiting before touching input->ready/wavein), so nothing
@@ -157,6 +161,7 @@ int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance) {
     mixer->inputs[i].input_overrun_count = 0;
     mixer->inputs[i].source_device_idx = -1;
     mixer->inputs[i].source_channel_idx = -1;
+    mixer->inputs[i].remote_label = NULL;
     mixer->input_mask[i] = true;
     mixer->input_removed[i] = false;
     mixer->inputs_todo[i] = true;
@@ -208,6 +213,7 @@ void mixer_finalize_capacity() {
                 mixer->inputs[k].input_overrun_count = 0;
                 mixer->inputs[k].source_device_idx = -1;
                 mixer->inputs[k].source_channel_idx = -1;
+                mixer->inputs[k].remote_label = NULL;
             }
             memset(mixer->inputs_todo + old_count, 0, mixer->reserve_inputs * sizeof(bool));
             memset(mixer->input_mask + old_count, 0, mixer->reserve_inputs * sizeof(bool));

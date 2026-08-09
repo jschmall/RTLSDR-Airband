@@ -206,6 +206,13 @@ struct DeviceConfigSnapshot {
 struct MixerConfigSnapshot {
     std::string name;
     bool enabled;
+    // build_mixer_remote_inputs_signature() (config.cpp) of the freshly re-read config -
+    // compared against the live mixer's own mixer_t::remote_inputs_signature in
+    // compute_and_apply_diff(). Defaulted to the same "absent" marker build_mixer_remote_
+    // inputs_signature() itself uses for a mixer with no remote_inputs block, so a hand-built
+    // MixerConfigSnapshot test fixture that predates this field compares as unchanged against a
+    // live mixer_t that also has no remote_inputs, rather than as indeterminate garbage.
+    std::string remote_inputs_signature = "<absent>";
 };
 
 struct ConfigSnapshot {
