@@ -60,6 +60,7 @@
 #include <iostream>
 #include <libconfig.h++>
 #include "control_socket.h"
+#include "helper_functions.h"
 #include "input-common.h"
 #include "live_reconfig.h"
 #include "logging.h"
@@ -87,6 +88,9 @@ bool multiple_demod_threads = false;
 bool multiple_output_threads = false;
 bool log_scan_activity = false;
 char* stats_filepath = NULL;
+double global_split_min_file_time = 1.0;
+double global_split_max_file_time = 60.0 * 60.0;
+double global_split_max_idle_time = 0.5;
 char* stats_http_address = NULL;
 int stats_http_port = 0;
 char* control_socket_path = NULL;
@@ -790,6 +794,14 @@ static int count_devices_running() {
     return ret;
 }
 
+// read an optional top-level numeric setting, leaving *value at its default if absent
+static void parse_global_double(const Setting& root, const char* key, double* value) {
+    if (!setting_as_double_or(root, key, *value, value)) {
+        cerr << "Configuration error: " << key << " must be a number\n";
+        error();
+    }
+}
+
 int main(int argc, char* argv[]) {
 #ifdef WITH_PROFILING
     ProfilerStart("rtl_airband.prof");
@@ -918,6 +930,13 @@ int main(int argc, char* argv[]) {
             log_scan_activity = true;
         if (root.exists("stats_filepath"))
             stats_filepath = strdup(root["stats_filepath"]);
+        parse_global_double(root, "split_min_file_time", &global_split_min_file_time);
+        parse_global_double(root, "split_max_file_time", &global_split_max_file_time);
+        parse_global_double(root, "split_max_idle_time", &global_split_max_idle_time);
+        if (!valid_split_file_times(global_split_min_file_time, global_split_max_file_time, global_split_max_idle_time)) {
+            cerr << "Configuration error: " << split_file_times_constraint << "\n";
+            error();
+        }
         if (root.exists("stats_http_address") || root.exists("stats_http_port")) {
             if (!root.exists("stats_http_address") || !root.exists("stats_http_port")) {
                 cerr << "Configuration error: stats_http_address and stats_http_port must be set together\n";

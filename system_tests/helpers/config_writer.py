@@ -11,7 +11,9 @@ def _build_output_lines(ch: dict, mp3_tmp_dir: Path | None) -> list[str]:
     """Build the "outputs: ( ... );" block lines for one channel dict.
 
     File outputs use directory+template+append, mixer outputs use
-    name+balance. extra_output_blocks lets a test supply a fully-formed
+    name+balance. Entries from split_outputs additionally enable
+    split_on_transmission and carry any per-output split file time
+    overrides. extra_output_blocks lets a test supply a fully-formed
     "{ ... }" output entry verbatim for output types (e.g. icecast,
     rdio_scanner's nested config) this helper doesn't otherwise know the
     schema of.
@@ -33,6 +35,15 @@ def _build_output_lines(ch: dict, mp3_tmp_dir: Path | None) -> list[str]:
                 "balance": ch["mixer_output"]["balance"],
             }
         )
+    for split_out in ch.get("split_outputs") or []:
+        output_entries.append(
+            {
+                "type": "file",
+                "directory": split_out["directory"],
+                "template": split_out["template"],
+                "overrides": split_out.get("overrides", {}),
+            }
+        )
     output_entries.extend(ch.get("extra_output_blocks", []))
 
     lines = ["      outputs: ("]
@@ -50,6 +61,10 @@ def _build_output_lines(ch: dict, mp3_tmp_dir: Path | None) -> list[str]:
             lines.append(f'          directory = "{entry["directory"]}";')
             lines.append(f'          filename_template = "{entry["template"]}";')
             lines.append("          append = false;")
+            if "overrides" in entry:
+                lines.append("          split_on_transmission = true;")
+                for key, value in entry["overrides"].items():
+                    lines.append(f"          {key} = {value};")
         lines.append("        }" + ("" if is_last_out else ","))
     lines.append("      );")
     return lines
@@ -71,6 +86,7 @@ def write_config(
     control_socket_path: Path | None = None,
     reserve_channels: int | None = None,
     shout_metadata_delay: int | None = None,
+    split_times: dict | None = None,
 ) -> None:
     """
     Write a minimal libconfig++-format .conf file for rtl_airband.
@@ -93,8 +109,12 @@ def write_config(
             - scan_freqs_hz (list[int]): Scan mode only — list of frequencies in Hz.
             - label (str|None): Channel label (send_scan_freq_tags/send_tx_tags/
               rdio_scanner metadata content), omitted if None.
+            - split_outputs (list[dict]|None): Extra "file" outputs with
+              split_on_transmission enabled, each {"directory": str, "template": str,
+              "overrides": dict}, where overrides maps split file time config keys
+              to per-output values.
             - extra_output_blocks (list[str]): Fully-formed "{ ... }" output
-              config entries appended verbatim after the file/mixer outputs,
+              config entries appended verbatim after the file/mixer/split outputs,
               for output types (icecast, rdio_scanner) this helper doesn't
               otherwise know the schema of.
         output_dir: Directory where mixer MP3 outputs are written. Unused when
@@ -137,10 +157,16 @@ def write_config(
         Mixer dicts also accept:
             - enabled (bool): same, at mixer level - omitted (defaults true)
               if not given.
+        split_times: If provided, top-level split file time settings written as
+            global config keys (split_min_file_time / split_max_file_time /
+            split_max_idle_time).
     """
     lines = []
     if fft_size is not None:
         lines.append(f"fft_size = {fft_size};")
+
+    for key, value in (split_times or {}).items():
+        lines.append(f"{key} = {value};")
 
     if mixers:
         lines.append("mixers:")
