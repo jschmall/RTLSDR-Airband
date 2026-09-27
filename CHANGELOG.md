@@ -4,9 +4,23 @@ Tracks changes specific to this fork ([`jschmall/RTLSDR-Airband`](https://github
 on top of what's inherited from [`rtl-airband/RTLSDR-Airband`](https://github.com/rtl-airband/RTLSDR-Airband).
 Upstream changes are not duplicated here — see `git log upstream/main` or upstream's PR history for those.
 
-This fork has no release tags; the binary's `-v` output is a git commit hash, generated at build
-time from the working tree (see `CMakeLists.txt` / `src/CMakeModules/version.cmake`). Entries below
-are dated by when the change was made, not by a version number.
+This fork tags its own releases (`vN.N.N`, kept above upstream's latest so the numbers are
+unambiguous); `rtl_airband -v` reports `git describe` against the nearest tag in local history.
+
+**This file is incomplete.** It stops at 2026-07-23 and does not cover the live-reconfiguration
+work (`dynamic_reload`), cross-instance mixer input, or the observability and correctness fixes
+added since. `CLAUDE.md`'s numbered fork-delta list is the authoritative record of what this fork
+carries; use `git log` for chronology.
+
+## v5.5.0 — 2026-09-27
+
+- Merged upstream through `v5.4.2` (`bd85874`), bringing in configurable
+  `split_min_file_time`/`split_max_file_time`/`split_max_idle_time` for `file` and `rawfile`
+  outputs, globally and per output. Adopted upstream's new `output_error()` helper throughout
+  `parse_outputs()`, including this fork's own error sites.
+- First fork tag since `v5.3.0`, so it also covers cross-instance remote mixer input
+  (`mixer_remote` output type + mixer-level `remote_inputs`) and the mixer input-slot and
+  channel-teardown memory-safety fixes that landed with it. See `CLAUDE.md` items 39-42.
 
 ## 2026-07-23 (rdio_api branch)
 

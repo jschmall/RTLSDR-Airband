@@ -31,7 +31,10 @@ auto-numbered list syntax specifically so they can't be silently renumbered by a
 **1. `post_write_script` + `min_rx_seconds`** — cherry-picked from `yegors` commit `bb36bb0`
 ("Rework file output options"). Touches `src/config.cpp`, `src/output.cpp`, `src/rtl_airband.h`.
 Both options require `split_on_transmission = true`. `post_write_script` is used here to upload
-completed transmission files to RDIO via API.
+completed transmission files to RDIO via API. Independent of upstream's `split_min_file_time`/
+`split_max_file_time`/`split_max_idle_time` (added upstream in `v5.4.0`), which control *when* a
+split file closes; `min_rx_seconds` then decides whether the already-closed file is kept. Lowering
+`split_max_idle_time` below `min_rx_seconds` will discard transmissions that used to be saved.
 
 **4. Native rdio-scanner call-upload support** (`src/rdio_scanner.cpp`, new) — replaces the
 `post_write_script` + external CSV lookup this fork previously used to push completed
@@ -322,6 +325,15 @@ one JSON object per line and returning one JSON response line: `retune`, `set_ga
 - **Documented, still-open follow-up**: a live-retune system test specifically confirming
   retuning one channel doesn't corrupt a sibling channel's bins on the same device (see
   `test_control_socket.py`'s module docstring).
+
+**Known limitation across all of items 27-41**: `reload_diff` re-reads only the `devices` and
+`mixers` sections of the config file (`src/live_reconfig.cpp`, `compute_and_apply_diff()`), never
+the top-level globals. A change to a *global* setting — `shout_metadata_delay`, `stats_filepath`,
+`fft_size`, or upstream's `split_min_file_time`/`split_max_file_time`/`split_max_idle_time` —
+is silently ignored with no `skipped_requires_restart` entry, and needs a restart (or SIGHUP,
+item 7). *Per-output* `split_*` values are covered for free: item 31's `config_signature` is a
+full `serialize_setting()` of the raw channel block, so editing one rebuilds that channel like any
+other output change.
 
 **28. Dynamic channel add via `reload_diff`** (`src/config.cpp`, `src/live_reconfig.{cpp,h}`,
 `src/rtl_airband.h`) — the config file stays the single source of truth: append a channel to a
@@ -884,6 +896,29 @@ Rules when writing commit messages:
 After tagging, the workflow re-runs `ci_build.yml`, `platform_build.yml`, and `build_docker_containers.yml` against the new tag (a tag pushed with `GITHUB_TOKEN` does not fire their own `tags: ['v*']` triggers, so they have to be dispatched explicitly).
 
 Note that those three dispatch steps are unguarded: on a `#none` merge the action leaves `new_tag` at the **existing** tag, so they re-run against the previous release and republish its container images.
+
+### Version tagging on *this fork*
+
+The section above describes how the tag is produced **upstream**. On this fork `version_bump.yml`
+exists but has never actually run (see the CI note above — no workflow run has ever executed on
+this repo), so **fork tags are created by hand** on the merge commit and pushed by name:
+
+```bash
+git tag -a v5.5.0 -m "..." && git push origin v5.5.0
+```
+
+This fork tags its own releases in the same `vN.N.N` namespace upstream uses, so its numbers must
+stay **above** upstream's latest to be unambiguous — `v5.5.0` sits above upstream `v5.4.2`. The
+upstream tags that arrive with `git fetch upstream` (currently through `v5.4.2`) live in the local
+tag namespace but are deliberately **not pushed to `origin`**, which is why `git push --tags` must
+never be used here — the README's fork-version badge reads `origin`'s tags and would otherwise
+start reporting upstream's release as this fork's. `scripts/find_version` (and therefore
+`rtl_airband -v`) reports `git describe` against whichever tag is nearest in local history, so it
+can name an upstream tag on an untagged working tree; that's expected, not drift.
+
+`CHANGELOG.md` is fork-only (upstream has none) and is **not** currently kept in sync — it stops
+at 2026-07-23 and predates fork-delta items 27-42 entirely. Treat this file's numbered fork-delta
+list, not `CHANGELOG.md`, as the authoritative record of what the fork carries.
 
 ## System Tests
 
