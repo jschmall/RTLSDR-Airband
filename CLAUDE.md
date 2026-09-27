@@ -715,6 +715,8 @@ Note: the devcontainer has failed to build under GitHub Codespaces (`docker buil
 during container creation). Local builds on Ubuntu without the devcontainer work fine — install the
 dependencies directly and build with CMake as below.
 
+Large system test cases for manual runs can be kept outside the repo in `../RTLSDR-Airband_test_cases/` (a sibling of the checkout, so several checkouts can share one copy). The devcontainer mounts it read-only at `system_tests/test_cases/` (gitignored); the pytest suite does not read it. `initializeCommand` creates an empty folder on the host if it is missing, so the container starts without it. This needs a POSIX host shell (macOS, Linux, WSL) and a container rebuild to take effect.
+
 ## Wiki Documentation
 
 User-facing documentation lives in a separate repo: https://github.com/rtl-airband/RTLSDR-Airband/wiki
