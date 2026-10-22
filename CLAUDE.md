@@ -180,7 +180,7 @@ fixture now accepts multiple concurrent connections instead of one blocking `acc
 #### Observability / metrics
 
 **8. HTTP metrics endpoint** (`src/stats_http.cpp`, new) — `write_stats_file()` already writes
-Prometheus-format stats to `stats_filepath` every 15s, but only to a file, requiring a textfile
+Prometheus-format stats to `stats_filepath` every `stats_update_interval` seconds (default 15s; configurable since upstream #579), but only to a file, requiring a textfile
 collector per host across this fork's ~12 concurrent instances. New `stats_http_address`/
 `stats_http_port` config options (must be set together, and require `stats_filepath`) start a
 background thread that serves the *current* content of `stats_filepath` (read fresh off disk
@@ -339,7 +339,8 @@ one JSON object per line and returning one JSON response line: `retune`, `set_ga
 `mixers` sections of the config file (`src/live_reconfig.cpp`, `compute_and_apply_diff()`), never
 the top-level globals. A change to a *global* setting — `shout_metadata_delay`, `stats_filepath`,
 `fft_size`, or upstream's `split_min_file_time`/`split_max_file_time`/`split_max_idle_time` —
-is silently ignored with no `skipped_requires_restart` entry, and needs a restart (or SIGHUP,
+is silently ignored with no `skipped_requires_restart` entry. The same goes for the newer upstream
+globals `stats_update_interval` (#579) and `split_include_transmission_start` (#574). Any of them needs a restart (or SIGHUP,
 item 7). *Per-output* `split_*` values are covered for free: item 31's `config_signature` is a
 full `serialize_setting()` of the raw channel block, so editing one rebuilds that channel like any
 other output change.
@@ -609,7 +610,7 @@ Item 30 deliberately left `channel->outputs`/`freqlist`/`config_signature` and e
 `data` struct allocated forever after a removal, since immediately freeing them risked a
 use-after-free against readers gated only on `channel->enabled` (no real synchronization).
 Investigating surfaced a **third, unguarded reader**: `write_stats_file()`'s per-channel metrics
-loop iterates `channel->freqlist` with no `enabled` check at all, on a 15-second cycle.
+loop iterates `channel->freqlist` with no `enabled` check at all, every `stats_update_interval` seconds.
 - Rejected a generation/epoch-counter approach (correct in principle, but would touch multiple
   hot-path loops with different cadences for a fix whose whole point is closing a memory-safety
   gap, not adding a performance-critical primitive).
@@ -618,8 +619,9 @@ loop iterates `channel->freqlist` with no `enabled` check at all, on a 15-second
   Teardown captures the old pointers into a timestamped `PendingChannelFree` entry instead of
   freeing them immediately — a slot reused by a later `parse_channel()` call just overwrites the
   pointers with fresh ones, the old values already safely captured. Anything past
-  `reclaim_grace_period_sec` (30s in production, comfortably more than double the 15s stats-file
-  cycle) gets actually freed. `lame`/`lamebuf` are unaffected — those still free immediately,
+  `reclaim_grace_period_sec` (30s in production) gets actually freed. The safety margin is set
+  by how long one `write_stats_file()` call runs (well under a second), not by the stats cycle,
+  so a `stats_update_interval` (upstream #579) above 15s doesn't weaken it. `lame`/`lamebuf` are unaffected — those still free immediately,
   since neither reader ever touches them.
 - `free_output_data()` mirrors, in reverse, every heap allocation `parse_outputs()` makes per
   output type — `icecast_data`/`udp_stream_data`/`pulse_data` are `XCALLOC`'d with `strdup()`'d

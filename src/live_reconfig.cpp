@@ -238,11 +238,11 @@ std::atomic<size_t> pending_channel_free_count{0};
 // How long a torn-down channel's outputs/freqlist/config_signature sit in pending_channel_frees
 // before reclaim_pending_channel_frees() actually frees them. Must comfortably exceed the widest
 // window any reader could still be using a captured pointer from before teardown -
-// write_stats_file()'s (src/output.cpp) 15-second STATS_FILE_TIMING throttle is the longest-period
-// unsynchronized reader of this memory (it has no `enabled` gate at all, unlike the demod thread's
-// and output_check_thread's per-channel loops), so this is set to comfortably more than double
-// that: any write_stats_file() call already in flight when a channel is torn down is long finished
-// (that function runs to completion in well under a second) by the time this elapses. A plain
+// write_stats_file() (src/output.cpp) is the riskiest unsynchronized reader of this memory (it has
+// no `enabled` gate at all, unlike the demod thread's and output_check_thread's per-channel loops).
+// What matters is how long one in-flight call can hold a stale pointer, not how often it runs
+// (stats_update_interval): that function runs to completion in well under a second, so any call
+// already in flight when a channel is torn down is long finished by the time this elapses. A plain
 // externally-linked global rather than a file-local const, same rationale as
 // mixer_capacity_finalized (rtl_airband.h): unit tests need to shrink this to something that
 // doesn't make the test suite take 30+ seconds per case; production code never touches it.

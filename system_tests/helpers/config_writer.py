@@ -83,6 +83,7 @@ def write_config(
     mixers: list[dict] | None = None,
     mp3_tmp_dir: Path | None = None,
     stats_filepath: Path | None = None,
+    stats_update_interval: float | None = None,
     control_socket_path: Path | None = None,
     reserve_channels: int | None = None,
     shout_metadata_delay: int | None = None,
@@ -142,6 +143,8 @@ def write_config(
             to find and validate the resulting file.
         stats_filepath: If provided, rtl_airband writes a Prometheus-format stats
             file to this path on shutdown.
+        stats_update_interval: If provided, how often (seconds) the stats file
+            is rewritten while running.
         control_socket_path: If provided, rtl_airband starts the dynamic_reload
             control socket listener at this path.
         reserve_channels: If provided, reserves this many extra (unused at
@@ -257,6 +260,8 @@ def write_config(
 
     if stats_filepath is not None:
         lines.append(f'stats_filepath = "{stats_filepath}";')
+    if stats_update_interval is not None:
+        lines.append(f"stats_update_interval = {stats_update_interval};")
 
     if control_socket_path is not None:
         lines.append(f'control_socket_path = "{control_socket_path}";')
