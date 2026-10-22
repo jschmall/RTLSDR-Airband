@@ -7,9 +7,9 @@
 
 This is a personal fork of [`rtl-airband/RTLSDR-Airband`](https://github.com/rtl-airband/RTLSDR-Airband)
 that tracks upstream `main` and carries a small delta on top of it. This fork tags its own
-releases independently of upstream's — `v5.5.0` adds cross-instance mixer input (below) on top of
-upstream `v5.4.2`, and carries forward the live reconfiguration and `send_tx_tags` support
-introduced in `v5.3.0`.
+releases independently of upstream's — `v6.3.0` is this fork's delta on top of upstream `v6.1.0`
+plus upstream's `split_include_transmission_start` (#574). `v5.5.0` added cross-instance mixer
+input (below), and `v5.3.0` introduced live reconfiguration and `send_tx_tags` support.
 
 - **`post_write_script` and `min_rx_seconds` file-output options** — run a script after
   each completed recording and skip saving very short transmissions. Cherry-picked from

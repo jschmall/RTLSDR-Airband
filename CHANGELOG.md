@@ -12,6 +12,16 @@ work (`dynamic_reload`), cross-instance mixer input, or the observability and co
 added since. `CLAUDE.md`'s numbered fork-delta list is the authoritative record of what this fork
 carries; use `git log` for chronology.
 
+## v6.3.0 — 2026-10-22
+
+- Merged upstream through `66d3076` (upstream `v6.1.0` plus #574), bringing in
+  `split_include_transmission_start`, a configurable `stats_update_interval`, a config error for
+  `tls` without libshout TLS support, and upstream's own UDP stereo fix (#578). This fork keeps
+  its sample-count `udp_stream` length convention and takes #578's `send()`-on-connected-socket and
+  `SO_SNDBUF` fixes. Re-applied the mixer NULL-`freqlist` guard (`CLAUDE.md` item 25) that #574
+  reintroduced behind `include_freq`, with a new regression system test.
+- Skips `v6.2.0`, which upstream is expected to use for #574.
+
 ## v5.5.0 — 2026-09-27
 
 - Merged upstream through `v5.4.2` (`bd85874`), bringing in configurable

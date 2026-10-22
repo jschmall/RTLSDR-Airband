@@ -11,7 +11,7 @@ time the mixer opens its file.
 from pathlib import Path
 
 from conftest import BinaryUnderTest, run_rtl_airband
-from helpers import config_writer, iq_generator, output_validator
+from helpers import config_writer, iq_generator
 
 SAMPLE_RATE = 2_048_000
 CENTERFREQ_HZ = 120_000_000
@@ -38,7 +38,6 @@ def test_mixer_file_include_freq(
     binary_under_test: BinaryUnderTest,
     test_output_dir: Path,
     cache_dir: Path,
-    mp3_tolerance: float,
     speedup_factor: float,
 ) -> None:
     """Mixer file output with include_freq → no crash, file named without a freq."""
@@ -87,12 +86,12 @@ def test_mixer_file_include_freq(
 
     run_rtl_airband(binary_under_test.path, config_path, timeout_s=TIMEOUT_S)
 
-    mp3 = output_validator.validate_mp3(
-        mp3_dir=test_output_dir,
-        filename_template=FREQ_TEMPLATE,
-        expected_duration_s=DURATION_S,
-        tolerance=mp3_tolerance,
-    )
+    # Duration isn't checked: a mixer's output under --mode fast's speedup doesn't
+    # track the IQ duration, and this test only targets the crash and the name.
+    matches = sorted(test_output_dir.glob(f"{FREQ_TEMPLATE}_[0-9]*.mp3"))
+    assert matches, f"no {FREQ_TEMPLATE} MP3 written in {test_output_dir}"
+    mp3 = matches[0]
+    assert mp3.stat().st_size > 0, f"{mp3.name} is empty"
     # A mixer has no source frequency, so frequency 0 must be left out of the name
     # rather than appended as "_0" (or a garbage value read from a NULL freqlist).
     assert mp3.stem.count("_") == 3, f"unexpected frequency suffix in {mp3.name}"

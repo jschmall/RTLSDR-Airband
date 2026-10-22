@@ -934,12 +934,15 @@ exists but has never actually run (see the CI note above — no workflow run has
 this repo), so **fork tags are created by hand** on the merge commit and pushed by name:
 
 ```bash
-git tag -a v5.5.0 -m "..." && git push origin v5.5.0
+git tag -a v6.3.0 -m "..." && git push origin v6.3.0
 ```
 
 This fork tags its own releases in the same `vN.N.N` namespace upstream uses, so its numbers must
-stay **above** upstream's latest to be unambiguous — `v5.5.0` sits above upstream `v5.4.2`. The
-upstream tags that arrive with `git fetch upstream` (currently through `v5.4.2`) live in the local
+stay **above** upstream's latest to be unambiguous — `v6.3.0` sits above upstream `v6.1.0`. Also
+check whether any upstream commit being merged is still **untagged** and carries a bump keyword:
+upstream will tag it later, and the fork must leave room for that. `v6.3.0` skips `v6.2.0` because
+upstream #574 (`#minor`, merged here) had no tag yet at merge time. The
+upstream tags that arrive with `git fetch upstream` (currently through `v6.1.0`) live in the local
 tag namespace but are deliberately **not pushed to `origin`**, which is why `git push --tags` must
 never be used here — the README's fork-version badge reads `origin`'s tags and would otherwise
 start reporting upstream's release as this fork's. `scripts/find_version` (and therefore
