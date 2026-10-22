@@ -884,6 +884,11 @@ TEST_F(DiffApplyTest, channel_enabled_diff_calls_channel_enable_disable) {
     chans[0].config_signature = strdup("chan0-signature");
     chans[1].enabled = false;
     chans[1].config_signature = strdup("chan1-signature");
+    // "No request pending", as config.cpp sets it. Left zero-initialized, 0 reads as a pending
+    // disable: the consumer thread below would disable chans[0] before compute_and_apply_diff()
+    // looks at it, leaving only one change to report (a race; consistently lost under QEMU).
+    chans[0].pending_enable_request = -1;
+    chans[1].pending_enable_request = -1;
 
     device_t dev = {};
     dev.input = &input;
