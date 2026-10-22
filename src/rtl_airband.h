@@ -229,7 +229,7 @@ struct file_data {
 
 struct udp_stream_data {
     float* stereo_buffer;
-    size_t stereo_buffer_len;
+    size_t stereo_buffer_len;  // number of float elements, including both channels
 
     bool continuous;
     const char* dest_address;
@@ -251,9 +251,6 @@ struct udp_stream_data {
     size_t resample_stereo_buffer_len;  // capacity of each of the above two buffers
 
     int send_socket;
-    struct sockaddr dest_sockaddr;
-    socklen_t dest_sockaddr_len;
-
     // number of packets dropped by the bounds checks in udp_stream_write() (item 11 in
     // CLAUDE.md - real checks, not assert(), so this can actually increment in a Release build)
     size_t dropped_packet_count;

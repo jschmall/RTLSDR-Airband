@@ -152,7 +152,6 @@ bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len) {
     }
 
     sdata->send_socket = -1;
-    sdata->dest_sockaddr_len = 0;
 
     // lookup address / port
     struct addrinfo hints, *result, *rptr;
@@ -182,8 +181,6 @@ bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len) {
             continue;
         }
 
-        sdata->dest_sockaddr = *rptr->ai_addr;
-        sdata->dest_sockaddr_len = rptr->ai_addrlen;
         break;
     }
     freeaddrinfo(result);
@@ -192,6 +189,17 @@ bool udp_stream_init(udp_stream_data* sdata, mix_modes mode, size_t len) {
     if (sdata->send_socket == -1) {
         log(LOG_ERR, "udp_stream: could not set up UDP socket to %s:%s - all addresses failed\n", sdata->dest_address, sdata->dest_port);
         return false;
+    }
+
+    // Ensure the socket can queue one complete datagram, especially on macOS,
+    // where the default send buffer can be smaller than a stereo NFM packet.
+    const int datagram_bytes = static_cast<int>((mode == MM_STEREO ? 2 : 1) * resampled_len * bytes_per_sample(sdata->format));
+    int sndbuf = 0;
+    socklen_t optlen = sizeof(sndbuf);
+    if (getsockopt(sdata->send_socket, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen) == 0 && sndbuf < datagram_bytes) {
+        if (setsockopt(sdata->send_socket, SOL_SOCKET, SO_SNDBUF, &datagram_bytes, sizeof(datagram_bytes)) == -1) {
+            log(LOG_WARNING, "udp_stream: could not raise send buffer to %d bytes: %s\n", datagram_bytes, strerror(errno));
+        }
     }
 
     log(LOG_INFO, "udp_stream: sending %s %s at %d Hz to %s:%s\n", mode == MM_MONO ? "Mono" : "Stereo", format_name(sdata->format), sdata->sample_rate, sdata->dest_address, sdata->dest_port);
@@ -212,7 +220,9 @@ void udp_stream_write(udp_stream_data* sdata, const float* data, size_t len) {
         data = sdata->resample_buffer;
     }
 
-    // Send without blocking or checking for success
+    // Send without blocking or checking for success. The socket is connected during
+    // initialization, so use send(): sendto() with an explicit destination on a
+    // connected socket fails with EISCONN on macOS.
     switch (sdata->format) {
         case STREAM_FORMAT_S16LE: {
             if (len > sdata->convert_buffer_len) {
@@ -224,7 +234,7 @@ void udp_stream_write(udp_stream_data* sdata, const float* data, size_t len) {
             for (size_t i = 0; i < len; ++i) {
                 buf[i] = float_to_s16(data[i]);
             }
-            sendto(sdata->send_socket, buf, len * sizeof(int16_t), MSG_DONTWAIT | MSG_NOSIGNAL, &sdata->dest_sockaddr, sdata->dest_sockaddr_len);
+            send(sdata->send_socket, buf, len * sizeof(int16_t), MSG_DONTWAIT | MSG_NOSIGNAL);
             break;
         }
         case STREAM_FORMAT_S8: {
@@ -237,12 +247,12 @@ void udp_stream_write(udp_stream_data* sdata, const float* data, size_t len) {
             for (size_t i = 0; i < len; ++i) {
                 buf[i] = float_to_s8(data[i]);
             }
-            sendto(sdata->send_socket, buf, len * sizeof(int8_t), MSG_DONTWAIT | MSG_NOSIGNAL, &sdata->dest_sockaddr, sdata->dest_sockaddr_len);
+            send(sdata->send_socket, buf, len * sizeof(int8_t), MSG_DONTWAIT | MSG_NOSIGNAL);
             break;
         }
         case STREAM_FORMAT_FLOAT32:
         default:
-            sendto(sdata->send_socket, data, len * sizeof(float), MSG_DONTWAIT | MSG_NOSIGNAL, &sdata->dest_sockaddr, sdata->dest_sockaddr_len);
+            send(sdata->send_socket, data, len * sizeof(float), MSG_DONTWAIT | MSG_NOSIGNAL);
             break;
     }
 }

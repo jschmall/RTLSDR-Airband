@@ -25,7 +25,9 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cerrno>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -365,4 +367,78 @@ TEST_F(UdpStreamTest, unset_sample_rate_defaults_to_wave_rate_no_resampling) {
     ASSERT_TRUE(udp_stream_init(&sdata, MM_MONO, len));
     EXPECT_EQ(sdata.sample_rate, WAVE_RATE);
     EXPECT_EQ(sdata.resample_buffer, nullptr);
+}
+
+// The following tests were adapted from upstream's #578 test suite, converted to this
+// fork's sample-count len convention.
+
+static int get_sndbuf(int sock) {
+    int sndbuf = 0;
+    socklen_t optlen = sizeof(sndbuf);
+    EXPECT_EQ(getsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen), 0);
+    return sndbuf;
+}
+
+static void fill_samples(float* samples, size_t count, bool right) {
+    for (size_t i = 0; i < count; ++i) {
+        samples[i] = (float)(i + 1) / 4096.0f * (right ? -1.0f : 1.0f);
+    }
+}
+
+static vector<float> interleave(const float* left, const float* right, size_t count) {
+    vector<float> out(count * 2);
+    for (size_t i = 0; i < count; ++i) {
+        out[2 * i] = left[i];
+        out[2 * i + 1] = right[i];
+    }
+    return out;
+}
+
+TEST_F(UdpStreamTest, mono_send_buffer_fits_datagram) {
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_MONO, (size_t)WAVE_BATCH));
+    EXPECT_GE(get_sndbuf(sdata.send_socket), (int)((size_t)WAVE_BATCH * sizeof(float)));
+}
+
+TEST_F(UdpStreamTest, stereo_send_buffer_fits_datagram) {
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_STEREO, (size_t)WAVE_BATCH));
+    EXPECT_GE(get_sndbuf(sdata.send_socket), (int)(2 * (size_t)WAVE_BATCH * sizeof(float)));
+}
+
+// Exact-sized, separately heap-allocated WAVE_LEN sources (matching waveout/waveout_r) let
+// ASan detect a read past either channel's buffer - the stereo 4x over-read #578 fixed.
+TEST_F(UdpStreamTest, stereo_full_batch_from_wave_length_sources_is_byte_exact) {
+    unique_ptr<float[]> left(new float[WAVE_LEN]);
+    unique_ptr<float[]> right(new float[WAVE_LEN]);
+    fill_samples(left.get(), WAVE_LEN, false);
+    fill_samples(right.get(), WAVE_LEN, true);
+    const vector<float> expected = interleave(left.get(), right.get(), (size_t)WAVE_BATCH);
+
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_STEREO, (size_t)WAVE_BATCH));
+    udp_stream_write(&sdata, left.get(), right.get(), (size_t)WAVE_BATCH);
+
+    vector<float> received(expected.size() + 100);
+    ssize_t bytes = recv_packet(received.data(), received.size() * sizeof(float));
+    ASSERT_EQ(bytes, (ssize_t)(expected.size() * sizeof(float)));
+    EXPECT_EQ(memcmp(received.data(), expected.data(), bytes), 0);
+}
+
+TEST_F(UdpStreamTest, stereo_short_blocks_send_exactly_one_datagram_each) {
+    ASSERT_TRUE(udp_stream_init(&sdata, MM_STEREO, (size_t)WAVE_BATCH));
+    const size_t counts[] = {(size_t)WAVE_BATCH, 17, 1};
+    for (size_t count : counts) {
+        unique_ptr<float[]> left(new float[count]);
+        unique_ptr<float[]> right(new float[count]);
+        fill_samples(left.get(), count, false);
+        fill_samples(right.get(), count, true);
+        const vector<float> expected = interleave(left.get(), right.get(), count);
+
+        udp_stream_write(&sdata, left.get(), right.get(), count);
+
+        vector<float> received(expected.size() + 100);
+        ssize_t bytes = recv_packet(received.data(), received.size() * sizeof(float));
+        ASSERT_EQ(bytes, (ssize_t)(expected.size() * sizeof(float)));
+        EXPECT_EQ(memcmp(received.data(), expected.data(), bytes), 0);
+        EXPECT_EQ(recvfrom(listen_socket, received.data(), received.size() * sizeof(float), MSG_DONTWAIT, NULL, NULL), -1);
+        EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
+    }
 }

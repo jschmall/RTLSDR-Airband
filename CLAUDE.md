@@ -108,6 +108,15 @@ past the end of `channel->waveout`/`waveout_r` into adjacent `channel_t` memory.
 explains the "~4x realtime throughput" and choppy-audio symptoms documented below under
 "Resolved Issue" — it was never a pacing problem.** Fixed by making `len` a sample count at all
 three call sites; regression-tested in `test_udp_stream.cpp`.
+Upstream later fixed the same stereo over-read independently in #578, going the *opposite* way
+(`len` is a byte count everywhere). When merging #578 this fork **kept its sample-count
+convention**, because items 6/9/11's format-conversion, resampling, and bounds-check code is all
+written in samples. It took #578's two independent fixes: `send()` on the already-`connect()`ed
+socket in place of `sendto()` (which fails with `EISCONN` on macOS and truncated IPv6 addresses),
+which removed `udp_stream_data::dest_sockaddr`, and raising `SO_SNDBUF` to fit one datagram, sized
+for the actual wire bytes after `bit_depth`/`sample_rate`. The fork also took the subset of #578's
+tests that adds coverage, converted to sample counts. **Expect this to conflict again** on any
+future upstream change to `udp_stream.cpp`'s signatures.
 
 **6. Configurable `bit_depth` for `udp_stream` output** (`src/udp_stream.cpp`, `src/config.cpp`,
 `src/rtl_airband.h`) — optional `bit_depth` field on a `udp_stream` output: `32` (default,
