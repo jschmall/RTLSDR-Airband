@@ -199,29 +199,39 @@ struct rdio_scanner_job {
 #endif /* WITH_RDIO_SCANNER */
 
 struct file_data {
+    // set once by config
+    enum output_type type;
     std::string basedir;
     std::string basename;
-    std::string suffix;
-    std::string file_path;
-    std::string file_path_tmp;
     bool dated_subdirectories;
+    std::string suffix;
     bool continuous;
     bool append;
     bool split_on_transmission;
+    bool include_freq;
     double split_min_file_time;
     double split_max_file_time;
     double split_max_idle_time;
-    bool include_freq;
+    bool split_include_transmission_start;
     double min_rx_seconds;
     std::string post_write_script;
 #ifdef WITH_RDIO_SCANNER
     rdio_scanner_data* rdio_scanner;  // NULL if not configured for this output
-    int open_frequency;               // frequency (Hz) captured at transmission-open time, for rdio_scanner upload
 #endif                                /* WITH_RDIO_SCANNER */
-    timeval open_time;
+
+    // set per output file
+    timeval transmission_start_time;
+    timeval file_open_time;
+#ifdef WITH_RDIO_SCANNER
+    // frequency (Hz) captured at file-open time for rdio_scanner upload; unlike `frequency`
+    // below, set regardless of include_freq
+    int open_frequency;
+#endif /* WITH_RDIO_SCANNER */
     timeval last_write_time;
+    int frequency;
+    std::string file_path;
+    std::string file_path_tmp;
     FILE* f;
-    enum output_type type;
     // number of times fwrite() on this output came up short (disk full, I/O error) -
     // the output is disabled when this happens, so it should stay at 0 or 1 in practice
     size_t write_failure_count;
@@ -687,6 +697,7 @@ extern char* cfgfile;
 #ifdef WITH_RDIO_SCANNER
 extern int rdio_scanner_queue_depth;
 #endif /* WITH_RDIO_SCANNER */
+extern bool global_split_include_transmission_start;
 extern size_t fft_size, fft_size_log;
 extern int device_count, mixer_count;
 extern int shout_metadata_delay;

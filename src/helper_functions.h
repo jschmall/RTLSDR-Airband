@@ -37,12 +37,17 @@ bool file_exists(const std::string& file_path);
 bool make_dir(const std::string& dir_path);
 bool make_subdirs(const std::string& basedir, const std::string& subdirs);
 std::string make_dated_subdirs(const std::string& basedir, const struct tm* time);
+
 bool should_close_split_file(double duration_sec, double idle_sec, double split_min_file_time, double split_max_file_time, double split_max_idle_time);
+bool should_close_split_file_max_time(double duration_sec, double split_max_file_time);
+bool should_close_split_file_idle(double duration_sec, double idle_sec, double split_min_file_time, double split_max_idle_time);
+
 bool valid_split_file_times(double split_min_file_time, double split_max_file_time, double split_max_idle_time);
 extern const char* const split_file_times_constraint;
 bool valid_stats_update_interval(double interval);
 bool setting_as_double(const libconfig::Setting& setting, double* value);
 bool setting_as_double_or(const libconfig::Setting& parent, const char* key, double fallback, double* value);
+bool setting_as_bool_or(const libconfig::Setting& parent, const char* key, bool fallback, bool* value);
 std::string make_icecast_mountpoint(const std::string& mountpoint);
 double rusage_cpu_seconds(const struct rusage& ru);
 

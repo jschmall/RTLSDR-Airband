@@ -7,6 +7,13 @@ Generates minimal libconfig++-format .conf files for the rtl_airband binary.
 from pathlib import Path
 
 
+def _config_value(value) -> str:
+    """Render a Python value as a libconfig literal (bools are lowercase)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 def _build_output_lines(ch: dict, mp3_tmp_dir: Path | None) -> list[str]:
     """Build the "outputs: ( ... );" block lines for one channel dict.
 
@@ -64,7 +71,7 @@ def _build_output_lines(ch: dict, mp3_tmp_dir: Path | None) -> list[str]:
             if "overrides" in entry:
                 lines.append("          split_on_transmission = true;")
                 for key, value in entry["overrides"].items():
-                    lines.append(f"          {key} = {value};")
+                    lines.append(f"          {key} = {_config_value(value)};")
         lines.append("        }" + ("" if is_last_out else ","))
     lines.append("      );")
     return lines
@@ -112,8 +119,8 @@ def write_config(
               rdio_scanner metadata content), omitted if None.
             - split_outputs (list[dict]|None): Extra "file" outputs with
               split_on_transmission enabled, each {"directory": str, "template": str,
-              "overrides": dict}, where overrides maps split file time config keys
-              to per-output values.
+              "overrides": dict}, where overrides maps per-output config keys
+              (split file times, split_include_transmission_start) to values.
             - extra_output_blocks (list[str]): Fully-formed "{ ... }" output
               config entries appended verbatim after the file/mixer/split outputs,
               for output types (icecast, rdio_scanner) this helper doesn't
@@ -160,16 +167,16 @@ def write_config(
         Mixer dicts also accept:
             - enabled (bool): same, at mixer level - omitted (defaults true)
               if not given.
-        split_times: If provided, top-level split file time settings written as
-            global config keys (split_min_file_time / split_max_file_time /
-            split_max_idle_time).
+        split_times: If provided, top-level split settings written as global
+            config keys (split_min_file_time / split_max_file_time /
+            split_max_idle_time / split_include_transmission_start).
     """
     lines = []
     if fft_size is not None:
         lines.append(f"fft_size = {fft_size};")
 
     for key, value in (split_times or {}).items():
-        lines.append(f"{key} = {value};")
+        lines.append(f"{key} = {_config_value(value)};")
 
     if mixers:
         lines.append("mixers:")

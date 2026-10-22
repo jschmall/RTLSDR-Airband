@@ -38,10 +38,11 @@ int pulse_setup(pulse_data*, mix_modes) {
 // config.cpp's parse_split_file_times() reads these as extern for the per-output > global >
 // default fallback; normally defined in rtl_airband.cpp, which can't be linked here for the same
 // reasons documented above. Set to the same defaults rtl_airband.cpp uses, so a test fixture's
-// file output parses with realistic split times rather than zeros.
+// file output parses with realistic split settings rather than zeros.
 double global_split_min_file_time = 1.0;
 double global_split_max_file_time = 60.0 * 60.0;
 double global_split_max_idle_time = 0.5;
+bool global_split_include_transmission_start = false;
 #ifdef NFM
 // config.cpp's parse_devices() references this as extern under NFM; normally defined in
 // rtl_airband.cpp, which can't be linked here for the same reasons documented above. None of the

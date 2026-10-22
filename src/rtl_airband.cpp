@@ -101,6 +101,7 @@ char* cfgfile = CFGFILE;  // overridden by -c; promoted to global so reload_diff
 #ifdef WITH_RDIO_SCANNER
 int rdio_scanner_queue_depth = 64;  // matches the previous hardcoded MAX_QUEUE_DEPTH
 #endif                              /* WITH_RDIO_SCANNER */
+bool global_split_include_transmission_start = false;
 size_t fft_size_log = DEFAULT_FFT_SIZE_LOG;
 size_t fft_size = 1 << fft_size_log;
 
@@ -973,6 +974,10 @@ int main(int argc, char* argv[]) {
             }
         }
 #endif /* WITH_RDIO_SCANNER */
+        if (!setting_as_bool_or(root, "split_include_transmission_start", global_split_include_transmission_start, &global_split_include_transmission_start)) {
+            cerr << "Configuration error: split_include_transmission_start must be a boolean\n";
+            error();
+        }
 #ifdef NFM
         if (root.exists("tau"))
             alpha = ((int)root["tau"] == 0 ? 0.0f : exp(-1.0f / (WAVE_RATE * 1e-6 * (int)root["tau"])));

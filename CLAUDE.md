@@ -92,7 +92,10 @@ dereferenced `channel->freqlist[channel->freq_idx]` unconditionally, but a mixer
 frequency — leaving it `NULL` and crashing on the mixer's first file rotation. No automated test
 caught this until two branches' own new mixer system tests hit it independently (items 26 and
 27's test coverage). Fixed by computing the frequency once, guarded by `channel->freqlist !=
-NULL`, defaulting to `0` for a mixer's own channel.
+NULL`, defaulting to `0` for a mixer's own channel. Upstream #574 (`split_include_transmission_start`)
+restructured `output_file_ready()` around a new `build_output_filename()` and again dereferenced
+`freqlist` unconditionally, though now only when `include_freq` is set. The guard was re-applied
+when that change was merged. Watch for this on future upstream changes to the function.
 
 #### UDP stream output
 
@@ -1049,6 +1052,8 @@ Mixers have **no `inputs` section** — a channel connects to a mixer implicitly
 libconfig rejects an invalid boolean (`disable = ture;`) at parse time, but a misspelled or
 misplaced *option name* is silently ignored. When a config change appears to have no effect, verify
 the option name against `parse_outputs()` before assuming a code bug.
+
+`file`/`rawfile` outputs with `split_on_transmission = true` can set `split_include_transmission_start` (per output > global > default `false`; the global is parsed in `main()` in `src/rtl_airband.cpp`, the per-output value in `parse_split_file_times` in `src/config.cpp`). It changes only file names, never when files close. A transmission cut by `split_max_file_time` is named `<template>_<tx start>_<part start>[_<freq>]<suffix>`; part 1 repeats the tx start, and unsplit transmissions keep `<template>_<start>`. Names are built by `build_output_filename` (`src/output.cpp`). Part 1 is written under the standalone `.tmp` name and renamed to the part name in `close_if_necessary` when it is split; parts 2+ open under the part name, in the tx start's dated folder. A file that reaches max time while squelch is closed ends the transmission, as it always closed there. Examples: `config/split_include_transmission_start*.conf`.
 
 ### Unit Tests
 
