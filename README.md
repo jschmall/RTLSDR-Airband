@@ -36,6 +36,10 @@ input (below), and `v5.3.0` introduced live reconfiguration and `send_tx_tags` s
   parse and aggregate than the default plain-text format.
 - **HTTP metrics endpoint** — serve the existing Prometheus stats file over plain HTTP
   so it can be scraped directly, instead of relying on a textfile collector.
+- **Device health reporting** — each SDR's headroom before ADC clipping, a clipped-sample
+  count, and how far each channel's received carrier sits from its configured frequency
+  (to dial in `correction`), available live from the control socket's `status` command
+  and in the stats file. See [Device Health Status](#device-health-status), below.
 - **SIGHUP config reload** — SIGHUP now triggers a clean restart to pick up config
   changes, instead of just exiting.
 - **Assorted stability fixes** — buffer overflow, thread-safety, and error-handling
@@ -107,6 +111,24 @@ The reload response tells you exactly what it changed and what it couldn't. A re
 change is never left in a broken or half-applied state — the instance keeps running
 normally throughout, and you can either fix the config and try again, or fall back to
 SIGHUP (a clean, brief restart) to pick up anything that genuinely requires one.
+
+### Device Health Status
+
+Send `{"cmd":"status"}` to an instance's control socket (see above) to get a snapshot of
+every device it runs: its tuning (center frequency, sample rate, gain, correction, tuner
+bandwidth), its health counters, and per-channel noise and signal levels. Two numbers are
+new in this fork:
+
+- **`peak_dbfs`** — the strongest sample the radio's ADC produced in the last second,
+  relative to full scale. 0 dBFS means it's clipping, and `clipped_samples` will be
+  climbing: lower the gain. The distance below 0 is your headroom.
+- **`freq_offset_hz`** (per channel frequency) — how far the received carrier sits from
+  the configured frequency, measured while the channel's squelch is open. If every channel
+  on a radio is off by about the same number of parts per million, that radio's
+  `correction` is off by that much.
+
+The stats file also carries `device_peak_dbfs`, `device_clipped_sample_count` and
+`channel_freq_offset_hz` for graphing over time.
 
 ### Cross-Instance Mixer Input
 

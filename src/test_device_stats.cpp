@@ -1,0 +1,280 @@
+/*
+ * test_device_stats.cpp
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "test_base_class.h"
+
+#include <cmath>
+#include <complex>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <vector>
+
+#include "control_socket.h"
+#include "device_stats.h"
+#include "live_reconfig.h"
+#include "rtl_airband.h"
+
+using namespace std;
+
+// Normally generated into version.cpp, which the unittests target doesn't compile.
+char const* RTL_AIRBAND_VERSION = "test-version";
+
+class DeviceStatsTest : public TestBaseClass {};
+
+TEST_F(DeviceStatsTest, u8_quiet_signal_has_low_peak_and_no_clipping) {
+    vector<unsigned char> buf = {127, 128, 120, 135, 128, 127};
+    SampleLevels levels;
+    scan_sample_levels(buf.data(), 3, SFMT_U8, 126.5f, &levels);
+    EXPECT_EQ(levels.clipped, 0u);
+    EXPECT_NEAR(levels.peak, 7.5f / 127.5f, 1e-6);
+}
+
+TEST_F(DeviceStatsTest, u8_counts_each_iq_sample_once_when_either_component_clips) {
+    vector<unsigned char> buf = {255, 0, 128, 255, 128, 128};
+    SampleLevels levels;
+    scan_sample_levels(buf.data(), 3, SFMT_U8, 126.5f, &levels);
+    EXPECT_EQ(levels.clipped, 2u);
+    EXPECT_FLOAT_EQ(levels.peak, 1.0f);
+}
+
+TEST_F(DeviceStatsTest, s8_clipping_at_either_rail) {
+    vector<signed char> buf = {-128, 0, 10, -20, 127, 5};
+    SampleLevels levels;
+    scan_sample_levels((const unsigned char*)buf.data(), 3, SFMT_S8, 126.5f, &levels);
+    EXPECT_EQ(levels.clipped, 2u);
+    EXPECT_FLOAT_EQ(levels.peak, 1.0f);
+}
+
+TEST_F(DeviceStatsTest, s16_uses_the_devices_native_full_scale) {
+    // A 12-bit ADC in a CS16 container: 2047 is the rail, not 32767.
+    vector<int16_t> buf = {1024, -512, 2047, 0};
+    SampleLevels levels;
+    scan_sample_levels((const unsigned char*)buf.data(), 2, SFMT_S16, 2048.0f, &levels);
+    EXPECT_EQ(levels.clipped, 1u);
+    EXPECT_NEAR(levels.peak, 2047.0f / 2048.0f, 1e-6);
+}
+
+TEST_F(DeviceStatsTest, f32_peak_relative_to_full_scale) {
+    vector<float> buf = {0.25f, -0.5f, 0.1f, 0.0f};
+    SampleLevels levels;
+    scan_sample_levels((const unsigned char*)buf.data(), 2, SFMT_F32, 1.0f, &levels);
+    EXPECT_EQ(levels.clipped, 0u);
+    EXPECT_FLOAT_EQ(levels.peak, 0.5f);
+}
+
+TEST_F(DeviceStatsTest, peak_is_published_per_window_and_clipping_accumulates) {
+    input_t input = {};
+    input_account_sample_levels(&input, SampleLevels{0.5f, 3}, 600, 1000);
+    EXPECT_FALSE(input.peak_valid.load()) << "window isn't complete yet";
+    EXPECT_EQ(input.clipped_count.load(), 3u);
+
+    input_account_sample_levels(&input, SampleLevels{0.25f, 1}, 600, 1000);
+    ASSERT_TRUE(input.peak_valid.load());
+    EXPECT_FLOAT_EQ(input.peak_level.load(), 0.5f) << "the window's max, not the latest scan";
+    EXPECT_EQ(input.clipped_count.load(), 4u);
+
+    input_account_sample_levels(&input, SampleLevels{0.1f, 0}, 1000, 1000);
+    EXPECT_FLOAT_EQ(input.peak_level.load(), 0.1f) << "a new window starts from scratch";
+}
+
+TEST_F(DeviceStatsTest, consumed_samples_wrap_around_the_circular_buffer) {
+    vector<unsigned char> buf(8, 128);
+    buf[0] = 255;  // first sample after the wrap
+    buf[6] = 0;    // last sample before the wrap
+    input_t input = {};
+    input.buffer = buf.data();
+    input.buf_size = buf.size();
+    input.bufs = 6;
+    input.bytes_per_sample = 1;
+    input.sfmt = SFMT_U8;
+    input.sample_rate = 1000000;
+    input_measure_consumed_samples(&input, 4);
+    EXPECT_EQ(input.clipped_count.load(), 2u);
+    EXPECT_FLOAT_EQ(input.peak_window_max, 1.0f);
+    EXPECT_EQ(input.peak_window_samples, 2u);
+}
+
+// The demod loop's 7-term Blackman-Harris window (rtl_airband.cpp). It matters here:
+// compute_channel_bin() picks the bin *below* a channel that lands exactly on a bin center, and
+// only the window's main lobe makes the carrier visible in that neighbouring bin at all.
+static double fft_window(size_t i, size_t n) {
+    const double a[] = {0.27105140069342, 0.43329793923448, 0.21812299954311, 0.06592544638803, 0.01081174209837, 0.00077658482522, 0.00001388721735};
+    double x = 0.0;
+    for (int k = 0; k < 7; k++) {
+        x += (k % 2 ? -a[k] : a[k]) * cos(2.0 * M_PI * k * (double)i / (double)(n - 1));
+    }
+    return x;
+}
+
+// What the demod loop sees for one channel: the bin of a windowed fft_size-point DFT taken every
+// round(sample_rate / WAVE_RATE) input samples, of a carrier at carrier_hz.
+// Returns the sum of z[n] * conj(z[n-1]) over frames, which freq_offset_from_phase_increment()
+// turns back into an offset from channel_freq.
+static complex<double> simulate_phase_increment(int channel_freq, int centerfreq, int sample_rate, double carrier_hz, int frames) {
+    size_t const n_fft = 512;
+    size_t const hop = (size_t)round((double)sample_rate / (double)WAVE_RATE);
+    size_t const bin = compute_channel_bin(channel_freq, centerfreq, sample_rate, n_fft);
+    double const w = 2.0 * M_PI * (carrier_hz - centerfreq) / sample_rate;
+    complex<double> prev, acc;
+    for (int f = 0; f < frames; f++) {
+        complex<double> z;
+        for (size_t m = 0; m < n_fft; m++) {
+            double const t = (double)(f * hop + m);
+            z += fft_window(m, n_fft) * polar(1.0, w * t) * polar(1.0, -2.0 * M_PI * (double)(bin * m) / (double)n_fft);
+        }
+        if (f > 0) {
+            acc += z * conj(prev);
+        }
+        prev = z;
+    }
+    return acc;
+}
+
+struct OffsetCase {
+    int sample_rate;
+    int centerfreq;
+    int channel_freq;
+    double offset_hz;
+};
+
+TEST_F(DeviceStatsTest, freq_offset_recovers_known_carrier_offsets_through_the_real_dft) {
+    vector<OffsetCase> cases = {
+        {2560000, 120000000, 120250000, 0.0},  {2560000, 120000000, 120250000, 350.0}, {2560000, 120000000, 119725000, -1200.0},
+        {2400000, 133000000, 133912500, 75.0}, {2048000, 450000000, 449600000, -40.0}, {1000000, 118000000, 118300000, 2500.0},  // decimation 125 (AM) / 62.5 (NFM) - exercises the non-integer path
+    };
+    for (const OffsetCase& c : cases) {
+        complex<double> acc = simulate_phase_increment(c.channel_freq, c.centerfreq, c.sample_rate, c.channel_freq + c.offset_hz, 64);
+        float const got = freq_offset_from_phase_increment(acc.real(), acc.imag(), c.channel_freq, c.centerfreq, c.sample_rate);
+        EXPECT_NEAR(got, c.offset_hz, 0.5) << "sample_rate=" << c.sample_rate << " channel=" << c.channel_freq << " offset=" << c.offset_hz;
+    }
+}
+
+TEST_F(DeviceStatsTest, freq_offset_commit_drops_mostly_closed_batches_and_smooths) {
+    freq_t f = {};
+    f.frequency = 120250000;
+    int const fs = 2560000, cf = 120000000;
+    complex<double> acc = simulate_phase_increment(f.frequency, cf, fs, f.frequency + 1000.0, 16);
+
+    freq_offset_commit(&f, acc.real(), acc.imag(), WAVE_BATCH / 4, WAVE_BATCH, cf, fs);
+    EXPECT_EQ(f.freq_offset_updates.load(), 0u);
+
+    freq_offset_commit(&f, acc.real(), acc.imag(), WAVE_BATCH, WAVE_BATCH, cf, fs);
+    EXPECT_EQ(f.freq_offset_updates.load(), 1u);
+    EXPECT_NEAR(f.freq_offset_hz.load(), 1000.0f, 0.5f) << "first estimate is taken as-is";
+
+    complex<double> acc2 = simulate_phase_increment(f.frequency, cf, fs, f.frequency + 2000.0, 16);
+    freq_offset_commit(&f, acc2.real(), acc2.imag(), WAVE_BATCH, WAVE_BATCH, cf, fs);
+    EXPECT_NEAR(f.freq_offset_hz.load(), 1200.0f, 1.0f) << "later estimates are smoothed";
+}
+
+static int fake_get_settings(input_t* const, input_settings_t* out) {
+    out->gain = 33.8f;
+    out->gain_known = true;
+    out->correction = 2.0f;
+    out->bandwidth = 0;
+    return 0;
+}
+
+class DeviceStatusJsonTest : public TestBaseClass {
+   protected:
+    void SetUp() override {
+        TestBaseClass::SetUp();
+        saved_devices = devices;
+        saved_device_count = device_count;
+    }
+    void TearDown() override {
+        devices = saved_devices;
+        device_count = saved_device_count;
+        TestBaseClass::TearDown();
+    }
+    device_t* saved_devices;
+    int saved_device_count;
+};
+
+TEST_F(DeviceStatusJsonTest, no_devices_is_an_empty_list) {
+    devices = nullptr;
+    device_count = 0;
+    string response = control_socket_dispatch_command({{"cmd", "status"}});
+    EXPECT_EQ(response, "{\"ok\":true,\"version\":\"test-version\",\"devices\":[]}");
+}
+
+TEST_F(DeviceStatusJsonTest, reports_tuning_levels_counters_and_channels) {
+    input_t input = {};
+    input.driver_type = "rtlsdr";
+    input.state = INPUT_RUNNING;
+    input.centerfreq = 120000000;
+    input.sample_rate = 2560000;
+    input.get_settings = &fake_get_settings;
+    input.peak_level = 0.5f;
+    input.peak_valid = true;
+    input.clipped_count = 7;
+    input.overflow_count = 3;
+
+    freq_t* freqs = (freq_t*)calloc(2, sizeof(freq_t));
+    freqs[0].frequency = 120250000;
+    freqs[0].label = strdup("Tower \"A\"");
+    freqs[0].freq_offset_hz = 42.0f;
+    freqs[0].freq_offset_updates = 5;
+    freqs[1].frequency = 120500000;
+
+    unique_ptr<channel_t[]> channels(new channel_t[2]());
+    channels[0].freqlist = &freqs[0];
+    channels[0].freq_count = 1;
+    channels[0].enabled = true;
+    channels[0].axcindicate = SIGNAL;
+    channels[1].freqlist = &freqs[1];
+    channels[1].freq_count = 1;
+    channels[1].enabled = false;
+    channels[1].axcindicate = NO_SIGNAL;
+
+    unique_ptr<device_t> dev(new device_t());
+    dev->input = &input;
+    dev->mode = R_MULTICHANNEL;
+    dev->channels = channels.get();
+    dev->channel_count = 2;
+
+    devices = dev.get();
+    device_count = 1;
+    string json = build_status_json();
+
+    EXPECT_NE(json.find("\"driver\":\"rtlsdr\",\"state\":\"running\",\"mode\":\"multichannel\",\"centerfreq\":120000000,\"sample_rate\":2560000"), string::npos) << json;
+    EXPECT_NE(json.find("\"gain\":33.8,\"correction\":2,\"bandwidth\":0"), string::npos) << json;
+    EXPECT_NE(json.find("\"peak_dbfs\":-6.02,\"clipped_samples\":7,\"buffer_overflows\":3"), string::npos) << json;
+    EXPECT_NE(json.find("{\"index\":0,\"enabled\":true,\"freq_idx\":0,\"squelch_open\":true"), string::npos) << json;
+    EXPECT_NE(json.find("\"label\":\"Tower \\\"A\\\"\""), string::npos) << json;
+    EXPECT_NE(json.find("\"freq_offset_hz\":42.0,\"freq_offset_updates\":5"), string::npos) << json;
+    EXPECT_NE(json.find("{\"index\":1,\"enabled\":false,\"freq_idx\":0,\"squelch_open\":false"), string::npos) << json;
+    EXPECT_NE(json.find("\"freq\":120500000,\"label\":null"), string::npos) << json;
+    EXPECT_NE(json.find("\"freq_offset_hz\":null,\"freq_offset_updates\":0"), string::npos) << json;
+
+    free(freqs[0].label);
+    free(freqs);
+}
+
+TEST_F(DeviceStatusJsonTest, unmeasured_peak_and_missing_settings_hook_are_null) {
+    input_t input = {};
+    input.driver_type = "file";
+    input.state = INPUT_RUNNING;
+    unique_ptr<device_t> dev(new device_t());
+    dev->input = &input;
+    dev->channel_count = 0;
+    devices = dev.get();
+    device_count = 1;
+    string json = build_status_json();
+    EXPECT_NE(json.find("\"gain\":null,\"correction\":null,\"bandwidth\":null,\"peak_dbfs\":null"), string::npos) << json;
+}

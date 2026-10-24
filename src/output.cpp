@@ -989,6 +989,58 @@ static void output_channel_activity_counters(FILE* f) {
     fprintf(f, "\n");
 }
 
+static void output_channel_freq_offsets(FILE* f) {
+    fprintf(f,
+            "# HELP channel_freq_offset_hz Smoothed carrier offset from the configured frequency, measured while "
+            "squelch is open. Absent for a frequency that hasn't had a transmission yet.\n"
+            "# TYPE channel_freq_offset_hz gauge\n");
+
+    for (int i = 0; i < device_count; i++) {
+        device_t* dev = devices + i;
+        for (int j = 0; j < dev->channel_count; j++) {
+            channel_t* channel = devices[i].channels + j;
+            for (int k = 0; k < channel->freq_count; k++) {
+                freq_t& fparms = channel->freqlist[k];
+                if (fparms.freq_offset_updates.load(std::memory_order_acquire) == 0) {
+                    continue;
+                }
+                print_channel_metric(f, "channel_freq_offset_hz", fparms.frequency, fparms.label);
+                fprintf(f, "\t%.1f\n", fparms.freq_offset_hz.load(std::memory_order_relaxed));
+            }
+        }
+    }
+    fprintf(f, "\n");
+}
+
+static void output_device_peak_levels(FILE* f) {
+    fprintf(f,
+            "# HELP device_peak_dbfs Largest I/Q sample magnitude over the last ~1 s, relative to the ADC's full "
+            "scale. 0 means the ADC is clipping; its negation is the headroom left before it does.\n"
+            "# TYPE device_peak_dbfs gauge\n");
+
+    for (int i = 0; i < device_count; i++) {
+        input_t* input = devices[i].input;
+        if (!input->peak_valid.load(std::memory_order_acquire)) {
+            continue;
+        }
+        float const peak = input->peak_level.load(std::memory_order_relaxed);
+        fprintf(f, "device_peak_dbfs{device=\"%d\"}\t%.2f\n", i, peak > 0.0f ? 20.0f * log10f(peak) : -200.0f);
+    }
+    fprintf(f, "\n");
+}
+
+static void output_device_clipped_samples(FILE* f) {
+    fprintf(f,
+            "# HELP device_clipped_sample_count Number of I/Q samples where either component hit the ADC's full-scale "
+            "limit. A climbing count means the gain is too high for the strongest signal in the passband.\n"
+            "# TYPE device_clipped_sample_count counter\n");
+
+    for (int i = 0; i < device_count; i++) {
+        fprintf(f, "device_clipped_sample_count{device=\"%d\"}\t%zu\n", i, devices[i].input->clipped_count.load(std::memory_order_relaxed));
+    }
+    fprintf(f, "\n");
+}
+
 static void output_device_buffer_overflows(FILE* f) {
     fprintf(f,
             "# HELP buffer_overflow_count Number of times a device's buffer has overflowed.\n"
@@ -1451,6 +1503,7 @@ void write_stats_file(timeval* last_stats_write) {
     }
 
     output_channel_activity_counters(file);
+    output_channel_freq_offsets(file);
     output_channel_noise_levels(file);
     output_channel_dbfs_noise_levels(file);
     output_channel_signal_levels(file);
@@ -1463,6 +1516,8 @@ void write_stats_file(timeval* last_stats_write) {
     output_device_buffer_overflows(file);
     output_device_buffer_underruns(file);
     output_device_centerfreq_retune_failures(file);
+    output_device_peak_levels(file);
+    output_device_clipped_samples(file);
     output_output_overruns(file);
     output_input_overruns(file);
     output_process_cpu_seconds(file);

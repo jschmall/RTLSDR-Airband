@@ -60,6 +60,7 @@
 #include <iostream>
 #include <libconfig.h++>
 #include "control_socket.h"
+#include "device_stats.h"
 #include "helper_functions.h"
 #include "input-common.h"
 #include "live_reconfig.h"
@@ -493,6 +494,8 @@ void* demodulate(void* params) {
             continue;
         }
 
+        input_measure_consumed_samples(dev->input, bps * FFT_BATCH);
+
         if (dev->input->sfmt == SFMT_S16) {
             float const scale = 1.0f / dev->input->fullscale;
 #ifdef WITH_BCM_VC
@@ -563,23 +566,22 @@ void* demodulate(void* params) {
             for (int j = 0; j < FFT_BATCH; j++, ++wavein, fftout += fft->step)
                 *wavein = sqrtf(fftout->im * fftout->im + fftout->re * fftout->re);
         }
+        // Raw I/Q is kept for every channel, not just needs_raw_iq ones: the frequency offset
+        // estimator (device_stats.cpp) reads it for all of them.
         for (int j = 0; j < dev->channel_count; j++) {
-            if (dev->channels[j].needs_raw_iq) {
-                struct GPU_FFT_COMPLEX* ptr = fft->out;
-                for (int job = 0; job < FFT_BATCH; job++) {
-                    dev->channels[j].iq_in[2 * (dev->waveend + job)] = ptr[dev->bins[j]].re;
-                    dev->channels[j].iq_in[2 * (dev->waveend + job) + 1] = ptr[dev->bins[j]].im;
-                    ptr += fft->step;
-                }
+            struct GPU_FFT_COMPLEX* ptr = fft->out;
+            for (int job = 0; job < FFT_BATCH; job++) {
+                dev->channels[j].iq_in[2 * (dev->waveend + job)] = ptr[dev->bins[j]].re;
+                dev->channels[j].iq_in[2 * (dev->waveend + job) + 1] = ptr[dev->bins[j]].im;
+                ptr += fft->step;
             }
         }
 #else
         for (int j = 0; j < dev->channel_count; j++) {
             dev->channels[j].wavein[dev->waveend] = sqrtf(fftout[dev->bins[j]][0] * fftout[dev->bins[j]][0] + fftout[dev->bins[j]][1] * fftout[dev->bins[j]][1]);
-            if (dev->channels[j].needs_raw_iq) {
-                dev->channels[j].iq_in[2 * dev->waveend] = fftout[dev->bins[j]][0];
-                dev->channels[j].iq_in[2 * dev->waveend + 1] = fftout[dev->bins[j]][1];
-            }
+            // Kept for every channel, not just needs_raw_iq ones - see the BCM_VC branch above.
+            dev->channels[j].iq_in[2 * dev->waveend] = fftout[dev->bins[j]][0];
+            dev->channels[j].iq_in[2 * dev->waveend + 1] = fftout[dev->bins[j]][1];
         }
 #endif /* WITH_BCM_VC */
 
@@ -592,7 +594,10 @@ void* demodulate(void* params) {
                     continue;
                 }
                 AFC afc(dev, i);
-                freq_t* fparms = channel->freqlist + channel->freq_idx;
+                int const batch_freq_idx = channel->freq_idx;
+                freq_t* fparms = channel->freqlist + batch_freq_idx;
+                channel->fo_acc_re = channel->fo_acc_im = 0.0;
+                channel->fo_open_samples = 0;
 
                 // set to NO_SIGNAL, will be updated to SIGNAL based on squelch below
                 channel->axcindicate = NO_SIGNAL;
@@ -600,6 +605,9 @@ void* demodulate(void* params) {
                 for (int j = AGC_EXTRA; j < WAVE_BATCH + AGC_EXTRA; j++) {
                     float& real = channel->iq_in[2 * (j - AGC_EXTRA)];
                     float& imag = channel->iq_in[2 * (j - AGC_EXTRA) + 1];
+                    // the cleanup below derotates/filters real/imag in place; the offset
+                    // estimator needs them as they came out of the FFT
+                    float const raw_re = real, raw_im = imag;
 
                     fparms->squelch.process_raw_sample(channel->wavein[j]);
 
@@ -701,6 +709,9 @@ void* demodulate(void* params) {
                         }
 
                         channel->axcindicate = SIGNAL;
+                        channel->fo_acc_re += (double)(raw_re * channel->fo_prev_re + raw_im * channel->fo_prev_im);
+                        channel->fo_acc_im += (double)(raw_im * channel->fo_prev_re - raw_re * channel->fo_prev_im);
+                        channel->fo_open_samples++;
                         if (channel->has_iq_outputs) {
                             channel->iq_out[2 * (j - AGC_EXTRA)] = real;
                             channel->iq_out[2 * (j - AGC_EXTRA) + 1] = imag;
@@ -714,10 +725,14 @@ void* demodulate(void* params) {
                             channel->iq_out[2 * (j - AGC_EXTRA) + 1] = 0;
                         }
                     }
+                    channel->fo_prev_re = raw_re;
+                    channel->fo_prev_im = raw_im;
                 }
                 memmove(channel->wavein, channel->wavein + WAVE_BATCH, (dev->waveend - WAVE_BATCH) * sizeof(float));
-                if (channel->needs_raw_iq) {
-                    memmove(channel->iq_in, channel->iq_in + 2 * WAVE_BATCH, (dev->waveend - WAVE_BATCH) * sizeof(float) * 2);
+                memmove(channel->iq_in, channel->iq_in + 2 * WAVE_BATCH, (dev->waveend - WAVE_BATCH) * sizeof(float) * 2);
+                // An R_SCAN hop mid-batch mixes two frequencies' phase into one sum - drop it.
+                if (channel->freq_idx == batch_freq_idx) {
+                    freq_offset_commit(fparms, channel->fo_acc_re, channel->fo_acc_im, channel->fo_open_samples, WAVE_BATCH, dev->input->centerfreq, dev->input->sample_rate);
                 }
 
 #ifdef WITH_BCM_VC

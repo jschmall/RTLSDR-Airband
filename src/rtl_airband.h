@@ -395,6 +395,11 @@ struct freq_t {
     NotchFilter notch_filter;      // notch filter - good to remove CTCSS tones
     LowpassFilter lowpass_filter;  // lowpass filter, applied to I/Q after derotation, set at bandwidth/2 to remove out of band noise
     enum modulations modulation;
+    // Smoothed carrier offset from this frequency while squelch was open (device_stats.cpp
+    // freq_offset_commit()). Written by the demod thread, read by the control socket and output
+    // threads; meaningless until freq_offset_updates is non-zero.
+    std::atomic<float> freq_offset_hz;
+    std::atomic<uint32_t> freq_offset_updates;
 };
 struct channel_t {
     float wavein[WAVE_LEN];      // FFT output waveform
@@ -409,7 +414,12 @@ struct channel_t {
     float alpha;
 #endif                         /* NFM */
     uint32_t dm_dphi, dm_phi;  // derotation frequency and current phase value
-    enum mix_modes mode;       // mono or stereo
+    // Frequency offset estimator state (demod thread only): the previous raw bin output and this
+    // batch's power-weighted sum of z[n] * conj(z[n-1]) over squelch-open samples.
+    float fo_prev_re, fo_prev_im;
+    double fo_acc_re, fo_acc_im;
+    int fo_open_samples;
+    enum mix_modes mode;  // mono or stereo
     // axcindicate, freq_idx, and state are each written by one thread (demod/mixer) and
     // read by others (output, controller, stats) with no lock between them - atomic so
     // that's well-defined rather than a data race, at no runtime cost over a plain

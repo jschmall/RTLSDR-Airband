@@ -710,6 +710,50 @@ a standalone relay-hub process, since this fork's ~12 instances already share on
 Anything outside those areas should match upstream. If a diff against `upstream/main` shows
 changes elsewhere, treat it as unintended drift and flag it.
 
+**43. Device health: ADC peak/clipping, per-channel frequency offset, control socket `status`**
+(`src/device_stats.{h,cpp}`, new) — adds the hardware-side numbers a control panel needs to judge
+an SDR's setup (headroom before clipping, how far off-frequency the dongle's oscillator is, what
+gain it's actually running at), which nothing exposed before: the stats file had per-channel noise
+and signal levels and per-device buffer counters only, and the control socket had no read command.
+- **ADC peak and clipping.** Once per demod pass, `input_measure_consumed_samples()` scans exactly
+  the input bytes that pass advances `bufs` by (wrap-safe), so every sample is counted once even
+  though FFT windows overlap. `peak_level` is the largest |I|/|Q| over the last complete ~1 s
+  window as a fraction of full scale (U8/S8 by format rails, S16/F32 by the driver's `fullscale`,
+  since SoapySDR CS16 devices can report a 12-bit full scale); `clipped_count` counts I/Q samples
+  where either component sat on a rail. New `input_t` fields, atomics published by the demod
+  thread. Covers the BCM_VC path too, since it reads the raw buffer rather than the FFT input.
+- **Per-channel carrier offset.** `iq_in` is now filled for *every* channel, not just
+  `needs_raw_iq` ones (two stores per channel-sample, plus a memmove per batch). In the batch loop,
+  while squelch is open, the power-weighted sum of z[n]·conj(z[n-1]) over the raw bin output is
+  accumulated; at the end of the batch `freq_offset_from_phase_increment()` subtracts the rotation
+  a carrier exactly on the channel frequency would have (the same quantity
+  `compute_channel_dm_dphi()` derotates) and converts the remainder to Hz. Sub-Hz precision, where
+  FFT bin resolution (~4-5 kHz) would be useless for ppm. Batches less than half open are dropped,
+  R_SCAN batches that hopped mid-batch are dropped, and the result is EMA-smoothed (0.2) into
+  `freq_t::freq_offset_hz`. Works whether `afc` is on or off. AM sidebands bias the estimate
+  slightly (a 0.8-modulated 1 kHz test tone reads ~3% low: ~0.2 ppm at 120 MHz).
+  **Gotcha found while testing:** `compute_channel_bin()` picks the bin *below* a channel that
+  lands exactly on a bin center; only the 7-term Blackman-Harris window's main lobe makes the
+  carrier visible there, so the unit test's simulated DFT has to apply the same window.
+- **Driver settings readback.** New nullable `input_t::get_settings` hook (rtlsdr, mirisdr,
+  soapysdr) reports gain / correction / tuner bandwidth from the driver's `dev_data`. Only ever
+  called from the control socket thread, the same thread that issues live `set_*` calls, so there's
+  no concurrent writer. rtlsdr now stores the gain the tuner actually took (nearest supported step)
+  at init, as `rtlsdr_set_gain` already did. mirisdr's correction is in Hz (libmirisdr has no ppm).
+- **Control socket `status` command** (read-only): `{"ok":true,"version":...,"devices":[{index,
+  driver,state,mode,centerfreq,sample_rate,gain,correction,bandwidth,peak_dbfs,clipped_samples,
+  buffer_overflows,buffer_underruns,retune_failures,output_overruns,channels:[{index,enabled,
+  freq_idx,squelch_open,freqs:[{freq,label,modulation,noise_dbfs,signal_dbfs,freq_offset_hz,
+  freq_offset_updates}]}]}]}`. Unmeasured values are `null` (JSON has no NaN/inf). Unlike the stats
+  file's channel series, channels are addressed by device/channel index.
+- **Stats file**: `device_peak_dbfs{device}` (gauge, omitted until the first window completes),
+  `device_clipped_sample_count{device}` (counter), `channel_freq_offset_hz{freq,label}` (gauge,
+  omitted for a frequency with no transmission yet). Existing series are unchanged.
+- Tests: `src/test_device_stats.cpp` (level scans per sample format, window publishing, buffer wrap,
+  offset recovery through a windowed DFT at several sample rates incl. a non-integer decimation,
+  commit gating/smoothing, status JSON shape) and `system_tests/tests/test_device_status.py`
+  (a 700 Hz off-frequency AM carrier and a clipped fixture through the real binary).
+
 ### Do not import from `yegors`
 
 The `yegors` fork also contains SRT output support and its own UDP path. The UDP path there is
