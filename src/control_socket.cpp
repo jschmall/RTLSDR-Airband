@@ -35,6 +35,7 @@
 #include <cstdio>   // snprintf
 #include <cstdlib>
 #include <cstring>
+#include "device_stats.h"
 #include "input-common.h"
 #include "live_reconfig.h"
 #include "rtl_airband.h"
@@ -581,6 +582,8 @@ string control_socket_dispatch_command(const map<string, string>& fields) {
         return handle_mixer_disable(fields);
     } else if (cmd == "reload_diff") {
         return handle_reload_diff(fields);
+    } else if (cmd == "status") {
+        return build_status_json();
     }
     return error_response("unknown cmd '" + cmd + "'");
 }

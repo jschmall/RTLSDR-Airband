@@ -207,6 +207,15 @@ int mirisdr_parse_config(input_t* const input, libconfig::Setting& cfg) {
     return 0;
 }
 
+static int mirisdr_get_settings(input_t* const input, input_settings_t* out) {
+    mirisdr_dev_data_t* dev_data = (mirisdr_dev_data_t*)input->dev_data;
+    out->gain = (float)dev_data->gain;
+    out->gain_known = true;
+    out->correction = (float)dev_data->correction;  // Hz, not ppm - libmirisdr has no ppm correction
+    out->bandwidth = 0;
+    return 0;
+}
+
 MODULE_EXPORT input_t* mirisdr_input_new() {
     mirisdr_dev_data_t* dev_data = (mirisdr_dev_data_t*)XCALLOC(1, sizeof(mirisdr_dev_data_t));
     dev_data->index = -1;  // invalid default receiver index
@@ -235,6 +244,7 @@ MODULE_EXPORT input_t* mirisdr_input_new() {
     input->init = &mirisdr_init;
     input->run_rx_thread = &mirisdr_rx_thread;
     input->set_centerfreq = &mirisdr_set_centerfreq;
+    input->get_settings = &mirisdr_get_settings;
     input->stop = &mirisdr_stop;
     return input;
 }

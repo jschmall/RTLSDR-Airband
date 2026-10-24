@@ -364,6 +364,15 @@ int soapysdr_set_bandwidth(input_t* const input, int const bandwidth) {
     return 0;
 }
 
+static int soapysdr_get_settings(input_t* const input, input_settings_t* out) {
+    soapysdr_dev_data_t* dev_data = (soapysdr_dev_data_t*)input->dev_data;
+    out->gain = (float)dev_data->gain;
+    out->gain_known = !dev_data->agc && dev_data->gains.size == 0;
+    out->correction = (float)dev_data->correction;
+    out->bandwidth = dev_data->dev != NULL ? (int)SoapySDRDevice_getBandwidth(dev_data->dev, SOAPY_SDR_RX, dev_data->channel) : 0;
+    return 0;
+}
+
 MODULE_EXPORT input_t* soapysdr_input_new() {
     soapysdr_dev_data_t* dev_data = (soapysdr_dev_data_t*)XCALLOC(1, sizeof(soapysdr_dev_data_t));
     dev_data->gain = -1.0;  // invalid default gain value
@@ -398,6 +407,7 @@ MODULE_EXPORT input_t* soapysdr_input_new() {
     input->set_centerfreq = &soapysdr_set_centerfreq;
     input->set_gain = &soapysdr_set_gain;
     input->set_bandwidth = &soapysdr_set_bandwidth;
+    input->get_settings = &soapysdr_get_settings;
     input->stop = NULL;
     return input;
 }

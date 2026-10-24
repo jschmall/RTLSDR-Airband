@@ -151,6 +151,7 @@ int rtlsdr_configure_opened_device(input_t* const input, rtlsdr_dev_data_t* cons
     if (r < 0) {
         log(LOG_ERR, "Failed to set gain to %0.2f for device #%d: error %d\n", (float)ngain / 10.f, dev_data->index, r);
     } else {
+        dev_data->gain = ngain;  // what the tuner actually took, for get_settings
         log(LOG_INFO, "Device #%d: gain set to %0.2f dB\n", dev_data->index, (float)rtlsdr_get_tuner_gain(rtl) / 10.f);
     }
 
@@ -266,6 +267,15 @@ int rtlsdr_set_bandwidth(input_t* const input, int const bandwidth) {
     return 0;
 }
 
+static int rtlsdr_get_settings(input_t* const input, input_settings_t* out) {
+    rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
+    out->gain = (float)dev_data->gain / 10.0f;
+    out->gain_known = true;
+    out->correction = (float)dev_data->correction;
+    out->bandwidth = dev_data->bandwidth;
+    return 0;
+}
+
 int rtlsdr_set_correction(input_t* const input, int const correction) {
     rtlsdr_dev_data_t* dev_data = (rtlsdr_dev_data_t*)input->dev_data;
     assert(dev_data->dev != NULL);
@@ -353,6 +363,7 @@ MODULE_EXPORT input_t* rtlsdr_input_new() {
     input->set_gain = &rtlsdr_set_gain;
     input->set_bandwidth = &rtlsdr_set_bandwidth;
     input->set_correction = &rtlsdr_set_correction;
+    input->get_settings = &rtlsdr_get_settings;
     input->stop = &rtlsdr_stop;
     return input;
 }

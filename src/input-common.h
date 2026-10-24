@@ -20,6 +20,7 @@
 #ifndef _INPUT_COMMON_H
 #define _INPUT_COMMON_H 1
 #include <pthread.h>
+#include <atomic>
 #include <libconfig.h++>
 
 #if __GNUC__ >= 4
@@ -35,6 +36,16 @@ typedef enum { INPUT_UNKNOWN = 0, INPUT_INITIALIZED, INPUT_RUNNING, INPUT_FAILED
 #define INPUT_STATE_CNT 6
 
 typedef struct input_t input_t;
+
+// Current tuner settings as the driver last applied them, for the control socket "status"
+// command. gain_known is false when the driver can't express its gain as one number (SoapySDR's
+// per-element "name=value,..." gain form).
+typedef struct {
+    float gain;
+    bool gain_known;
+    float correction;
+    int bandwidth;  // tuner bandwidth in Hz, 0 = driver default / automatic
+} input_settings_t;
 
 struct input_t {
     // Set once by each driver's own <type>_input_new(), e.g. "rtlsdr"/"soapysdr"/"mirisdr"/
@@ -70,6 +81,19 @@ struct input_t {
     int (*set_bandwidth)(input_t* const input, int const bandwidth);
     int (*set_correction)(input_t* const input, int const correction);
     int (*stop)(input_t* const input);
+    // Nullable. Called only from the control socket thread - the same thread that issues every
+    // live set_gain/set_bandwidth/set_correction - so the driver's dev_data fields it reads are
+    // never written concurrently.
+    int (*get_settings)(input_t* const input, input_settings_t* out);
+    // ADC level measurements (device_stats.cpp). peak_level is the largest |I|/|Q| over the last
+    // complete ~1 s window as a fraction of full scale, valid once peak_valid is set; written by
+    // the demod thread, read by the control socket and output threads. The window fields are
+    // demod-thread only.
+    std::atomic<float> peak_level;
+    std::atomic<bool> peak_valid;
+    std::atomic<size_t> clipped_count;
+    float peak_window_max;
+    size_t peak_window_samples;
     pthread_t rx_thread;
     pthread_mutex_t buffer_lock;
 };
