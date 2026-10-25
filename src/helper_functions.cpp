@@ -92,6 +92,26 @@ string make_icecast_mountpoint(const string& mountpoint) {
     return "/" + mountpoint;
 }
 
+std::string fork_features() {
+    std::string features = "fork control_socket device_status reserve mixer_remote send_tx_tags stats_http json_log post_write_script";
+#ifdef WITH_RDIO_SCANNER
+    features += " rdio_scanner";
+#endif
+#ifdef WITH_SOAPYSDR
+    features += " soapysdr";
+#endif
+#ifdef WITH_MIRISDR
+    features += " mirisdr";
+#endif
+#ifdef WITH_PULSEAUDIO
+    features += " pulseaudio";
+#endif
+#ifdef NFM
+    features += " nfm";
+#endif
+    return features;
+}
+
 double rusage_cpu_seconds(const struct rusage& ru) {
     return (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6 + (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6;
 }

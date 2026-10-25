@@ -477,3 +477,16 @@ TEST_F(HelperFunctionsTest, setting_as_bool_or_rejects_non_bool) {
     EXPECT_FALSE(setting_as_bool_or(config.getRoot(), "int_value", false, &value));
     EXPECT_FALSE(setting_as_bool_or(config.getRoot(), "string_value", false, &value));
 }
+
+TEST_F(HelperFunctionsTest, fork_features_names_the_fork_and_its_capabilities) {
+    std::string const features = " " + fork_features() + " ";
+    EXPECT_EQ(fork_features().rfind("fork ", 0), 0u);
+    for (const char* name : {"control_socket", "device_status", "reserve", "mixer_remote", "send_tx_tags", "stats_http", "json_log", "post_write_script"}) {
+        EXPECT_NE(features.find(std::string(" ") + name + " "), std::string::npos) << name;
+    }
+#ifdef NFM
+    EXPECT_NE(features.find(" nfm "), std::string::npos);
+#else
+    EXPECT_EQ(features.find(" nfm "), std::string::npos);
+#endif
+}

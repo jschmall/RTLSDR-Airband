@@ -754,6 +754,18 @@ and signal levels and per-device buffer counters only, and the control socket ha
   commit gating/smoothing, status JSON shape) and `system_tests/tests/test_device_status.py`
   (a 700 Hz off-frequency AM carrier and a clipped fixture through the real binary).
 
+**44. `rtl_airband -v` prints a `Features:` line** (`fork_features()` in
+`src/helper_functions.cpp`, printed from `main()`). The version line is unchanged; a second line
+reads `Features: fork control_socket device_status reserve mixer_remote send_tx_tags stats_http
+json_log post_write_script`, followed by whichever optional build components are compiled in
+(`rdio_scanner`, `soapysdr`, `mirisdr`, `pulseaudio`, `nfm`).
+- **Why:** upstream now tags in the same `v6.x` range as this fork (upstream `v6.2.0`), so a
+  version number can no longer tell the two apart. rtl-airband-panel reads this line to decide
+  whether an instance runs the fork, and soft-locks fork-only settings and Apply live when it
+  doesn't.
+- **The names are an interface.** Add new names, but never rename or remove one. The line
+  always starts with `fork`. Unit tested in `test_helper_functions.cpp`.
+
 ### Do not import from `yegors`
 
 The `yegors` fork also contains SRT output support and its own UDP path. The UDP path there is
