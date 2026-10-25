@@ -51,6 +51,13 @@ bool setting_as_bool_or(const libconfig::Setting& parent, const char* key, bool 
 std::string make_icecast_mountpoint(const std::string& mountpoint);
 double rusage_cpu_seconds(const struct rusage& ru);
 
+// Space-separated list of what this build supports beyond upstream RTLSDR-Airband, printed by
+// `rtl_airband -v` as a "Features: ..." line so tools (rtl-airband-panel) can tell this fork
+// from a stock build and gate fork-only settings. Always starts with "fork"; the rest are
+// fork capabilities plus the optional build components compiled in. Names are an interface:
+// add new ones, never rename or drop one.
+std::string fork_features();
+
 // Builds the Icecast "song" tag content for a currently-active transmission: the configured
 // label if set, else a "%.3f MHz" formatted frequency (matching the existing
 // send_scan_freq_tags fallback in process_outputs()). Returns "" when has_signal is false,

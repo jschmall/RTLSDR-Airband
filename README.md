@@ -130,6 +130,15 @@ new in this fork:
 The stats file also carries `device_peak_dbfs`, `device_clipped_sample_count` and
 `channel_freq_offset_hz` for graphing over time.
 
+### Feature List
+
+`rtl_airband -v` prints a second line after the version: `Features: fork control_socket
+device_status ...`. It lists this fork's capabilities, followed by the optional components
+compiled in (`rdio_scanner`, `soapysdr`, `mirisdr`, `pulseaudio`, `nfm`). Tools such as
+[rtl-airband-panel](https://github.com/jschmall/rtl-airband-panel) use it to tell this fork
+from a stock build, since both now use `v6.x` version numbers. Names are only ever added,
+never renamed or removed.
+
 ### Cross-Instance Mixer Input
 
 Normally a mixer can only combine channels from devices declared in its own instance's

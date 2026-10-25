@@ -878,6 +878,7 @@ int main(int argc, char* argv[]) {
                 break;
             case 'v':
                 cout << "RTLSDR-Airband version " << RTL_AIRBAND_VERSION << "\n";
+                cout << "Features: " << fork_features() << "\n";
                 exit(EXIT_SUCCESS);
             case 'h':
             default:
