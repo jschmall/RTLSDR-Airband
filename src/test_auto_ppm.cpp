@@ -17,6 +17,7 @@
 
 #include "test_base_class.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -39,6 +40,19 @@ AutoPpmEstimate est(int freq_hz, double residual_ppm, uint32_t updates = 50) {
 
 class AutoPpmDecideTest : public TestBaseClass {
    protected:
+    // One evaluation, then (unless the first already acted) a second from newer measurements:
+    // persistence means an out-of-deadband residual only steps on its second reading.
+    AutoPpmDecision decide2(int correction, vector<AutoPpmEstimate> e) {
+        AutoPpmDecision d = auto_ppm_decide(correction, e, params, &state);
+        if (d.action != AUTO_PPM_HOLD) {
+            return d;
+        }
+        for (AutoPpmEstimate& x : e) {
+            x.updates += 10;
+        }
+        return auto_ppm_decide(correction, e, params, &state);
+    }
+
     AutoPpmParams params;
     AutoPpmState state;
 };
@@ -58,7 +72,7 @@ TEST_F(AutoPpmDecideTest, estimates_with_too_few_updates_are_ignored) {
 
 TEST_F(AutoPpmDecideTest, carrier_above_frequency_means_correction_must_drop) {
     // +360 Hz at 120 MHz: the LO runs 3 ppm slow, so the correction has to come down 3 ppm.
-    AutoPpmDecision d = auto_ppm_decide(0, {{120000000, 360.0f, 50}}, params, &state);
+    AutoPpmDecision d = decide2(0, {{120000000, 360.0f, 50}});
     ASSERT_TRUE(d.residual_valid);
     EXPECT_NEAR(d.residual_ppm, -3.0, 1e-3);
     EXPECT_EQ(d.action, AUTO_PPM_ADJUST);
@@ -66,7 +80,7 @@ TEST_F(AutoPpmDecideTest, carrier_above_frequency_means_correction_must_drop) {
 }
 
 TEST_F(AutoPpmDecideTest, residual_scales_with_channel_frequency_not_centerfreq) {
-    AutoPpmDecision d = auto_ppm_decide(10, {est(118000000, 2.0), est(136000000, 2.0)}, params, &state);
+    AutoPpmDecision d = decide2(10, {est(118000000, 2.0), est(136000000, 2.0)});
     ASSERT_TRUE(d.residual_valid);
     EXPECT_NEAR(d.residual_ppm, 2.0, 1e-3);
     EXPECT_EQ(d.new_correction, 12);
@@ -82,7 +96,7 @@ TEST_F(AutoPpmDecideTest, small_residual_inside_deadband_holds) {
 TEST_F(AutoPpmDecideTest, offset_carrier_channel_is_rejected_as_an_outlier) {
     // Three channels agree on +2 ppm; a climax site sits 5 kHz off (~40 ppm at 125 MHz).
     vector<AutoPpmEstimate> e = {est(120000000, 2.0), est(121500000, 2.2), est(123000000, 1.9), {125000000, -5000.0f, 50}};
-    AutoPpmDecision d = auto_ppm_decide(0, e, params, &state);
+    AutoPpmDecision d = decide2(0, e);
     EXPECT_EQ(d.eligible, 4);
     EXPECT_EQ(d.contributing, 3);
     EXPECT_EQ(d.rejected, 1);
@@ -111,31 +125,32 @@ TEST_F(AutoPpmDecideTest, wide_spread_inside_the_outlier_window_holds) {
 }
 
 TEST_F(AutoPpmDecideTest, step_is_limited_to_max_step) {
-    AutoPpmDecision d = auto_ppm_decide(0, {est(120000000, 23.0)}, params, &state);
+    AutoPpmDecision d = decide2(0, {est(120000000, 23.0)});
     EXPECT_EQ(d.action, AUTO_PPM_ADJUST);
     EXPECT_EQ(d.new_correction, 5);
     EXPECT_FALSE(d.clamped);
 
-    d = auto_ppm_decide(0, {est(120000000, -23.0)}, params, &state);
+    state = AutoPpmState();
+    d = decide2(0, {est(120000000, -23.0)});
     EXPECT_EQ(d.new_correction, -5);
 }
 
 TEST_F(AutoPpmDecideTest, never_goes_past_plus_minus_100_ppm) {
     // Plausible estimates (|implied| <= 100) that would still push past the limit.
-    AutoPpmDecision d = auto_ppm_decide(98, {est(120000000, 1.9)}, params, &state);
+    AutoPpmDecision d = decide2(98, {est(120000000, 1.9)});
     EXPECT_EQ(d.new_correction, 100);
     EXPECT_FALSE(d.clamped);
 
     state = AutoPpmState();
     params.max_step = 100;
     // At the hard limit, anything asking for more implies >100 ppm and is rejected outright.
-    d = auto_ppm_decide(100, {est(120000000, 0.99)}, params, &state);
+    d = decide2(100, {est(120000000, 0.99)});
     EXPECT_EQ(d.action, AUTO_PPM_HOLD);
     EXPECT_EQ(d.new_correction, 100);
     EXPECT_EQ(d.rejected, 1);
 
     state = AutoPpmState();
-    d = auto_ppm_decide(-99, {est(120000000, -0.99)}, params, &state);
+    d = decide2(-99, {est(120000000, -0.99)});
     EXPECT_EQ(d.new_correction, -100);
 }
 
@@ -143,7 +158,7 @@ TEST_F(AutoPpmDecideTest, estimates_implying_more_than_100_ppm_are_rejected) {
     params.max_step = 100;
     for (double residual : {150.0, -300.0}) {
         state = AutoPpmState();
-        AutoPpmDecision d = auto_ppm_decide(0, {est(120000000, residual), est(122000000, residual)}, params, &state);
+        AutoPpmDecision d = decide2(0, {est(120000000, residual), est(122000000, residual)});
         EXPECT_EQ(d.action, AUTO_PPM_HOLD) << residual;
         EXPECT_EQ(d.new_correction, 0) << residual;
         EXPECT_EQ(d.rejected, 2) << residual;
@@ -152,7 +167,7 @@ TEST_F(AutoPpmDecideTest, estimates_implying_more_than_100_ppm_are_rejected) {
 }
 
 TEST_F(AutoPpmDecideTest, one_implausible_channel_does_not_block_the_rest) {
-    AutoPpmDecision d = auto_ppm_decide(0, {est(120000000, 2.0), est(121000000, 2.1), est(122000000, 400.0)}, params, &state);
+    AutoPpmDecision d = decide2(0, {est(120000000, 2.0), est(121000000, 2.1), est(122000000, 400.0)});
     EXPECT_EQ(d.action, AUTO_PPM_ADJUST);
     EXPECT_EQ(d.new_correction, 2);
     EXPECT_EQ(d.rejected, 1);
@@ -161,7 +176,7 @@ TEST_F(AutoPpmDecideTest, one_implausible_channel_does_not_block_the_rest) {
 TEST_F(AutoPpmDecideTest, smaller_max_ppm_clamps_tighter) {
     params.max_ppm = 20;
     params.max_step = 100;
-    AutoPpmDecision d = auto_ppm_decide(0, {est(120000000, 40.0)}, params, &state);
+    AutoPpmDecision d = decide2(0, {est(120000000, 40.0)});
     EXPECT_EQ(d.new_correction, 20);
     EXPECT_TRUE(d.clamped);
 }
@@ -170,7 +185,7 @@ TEST_F(AutoPpmDecideTest, converging_steps_never_trip_the_divergence_guard) {
     int correction = 0;
     double const truth = 23.0;
     for (int i = 0; i < 10; i++) {
-        AutoPpmDecision d = auto_ppm_decide(correction, {est(120000000, truth - correction)}, params, &state);
+        AutoPpmDecision d = decide2(correction, {est(120000000, truth - correction)});
         ASSERT_NE(d.action, AUTO_PPM_REVERT) << i;
         correction = d.new_correction;
     }
@@ -182,25 +197,196 @@ TEST_F(AutoPpmDecideTest, diverging_steps_revert_to_the_base_correction) {
     state.base_correction = 7;
     int correction = 7;
     double residual = 10.0;
-    AutoPpmDecision d = auto_ppm_decide(correction, {est(120000000, residual)}, params, &state);
+    AutoPpmDecision d = decide2(correction, {est(120000000, residual)});
     ASSERT_EQ(d.action, AUTO_PPM_ADJUST);
     for (int i = 0; i < 2; i++) {
         correction = d.new_correction;
         residual += 5.0;
-        d = auto_ppm_decide(correction, {est(120000000, residual)}, params, &state);
+        d = decide2(correction, {est(120000000, residual)});
     }
+    // The second growth is caught on the first reading after the step, before persistence.
     EXPECT_EQ(d.action, AUTO_PPM_REVERT);
     EXPECT_EQ(d.new_correction, 7);
 }
 
 TEST_F(AutoPpmDecideTest, one_noisy_step_does_not_trip_the_guard) {
-    AutoPpmDecision d = auto_ppm_decide(0, {est(120000000, 10.0)}, params, &state);
-    d = auto_ppm_decide(d.new_correction, {est(120000000, 10.5)}, params, &state);  // grew once
+    AutoPpmDecision d = decide2(0, {est(120000000, 10.0)});
+    d = decide2(d.new_correction, {est(120000000, 10.5)});  // grew once
     EXPECT_EQ(d.action, AUTO_PPM_ADJUST);
-    d = auto_ppm_decide(d.new_correction, {est(120000000, 4.0)}, params, &state);  // then shrank
+    d = decide2(d.new_correction, {est(120000000, 4.0)});  // then shrank
     EXPECT_EQ(d.action, AUTO_PPM_ADJUST);
-    d = auto_ppm_decide(d.new_correction, {est(120000000, 5.0)}, params, &state);  // grew once more
+    d = decide2(d.new_correction, {est(120000000, 5.0)});  // grew once more
     EXPECT_NE(d.action, AUTO_PPM_REVERT);
+}
+
+TEST_F(AutoPpmDecideTest, first_out_of_deadband_reading_waits_for_a_second) {
+    AutoPpmDecision d = auto_ppm_decide(0, {est(120000000, 3.0, 50)}, params, &state);
+    EXPECT_EQ(d.action, AUTO_PPM_HOLD);
+    EXPECT_TRUE(d.residual_valid);
+    EXPECT_EQ(state.pending_count, 1);
+    d = auto_ppm_decide(0, {est(120000000, 3.0, 60)}, params, &state);
+    EXPECT_EQ(d.action, AUTO_PPM_ADJUST);
+    EXPECT_EQ(d.new_correction, 3);
+    EXPECT_EQ(state.pending_count, 0);
+}
+
+TEST_F(AutoPpmDecideTest, rereading_an_unchanged_estimate_is_not_a_second_measurement) {
+    for (int i = 0; i < 5; i++) {
+        AutoPpmDecision d = auto_ppm_decide(0, {est(120000000, 3.0, 50)}, params, &state);
+        EXPECT_EQ(d.action, AUTO_PPM_HOLD) << i;
+    }
+    EXPECT_EQ(auto_ppm_decide(0, {est(120000000, 3.0, 51)}, params, &state).action, AUTO_PPM_ADJUST);
+}
+
+TEST_F(AutoPpmDecideTest, sign_flip_restarts_persistence) {
+    auto_ppm_decide(0, {est(120000000, 3.0, 50)}, params, &state);
+    AutoPpmDecision d = auto_ppm_decide(0, {est(120000000, -3.0, 60)}, params, &state);
+    EXPECT_EQ(d.action, AUTO_PPM_HOLD);
+    EXPECT_EQ(state.pending_sign, -1);
+    EXPECT_EQ(state.pending_count, 1);
+    d = auto_ppm_decide(0, {est(120000000, -3.0, 70)}, params, &state);
+    EXPECT_EQ(d.action, AUTO_PPM_ADJUST);
+    EXPECT_EQ(d.new_correction, -3);
+}
+
+TEST_F(AutoPpmDecideTest, reading_inside_deadband_resets_persistence) {
+    auto_ppm_decide(0, {est(120000000, 3.0, 50)}, params, &state);
+    auto_ppm_decide(0, {est(120000000, 0.2, 60)}, params, &state);
+    EXPECT_EQ(state.pending_count, 0);
+    EXPECT_EQ(auto_ppm_decide(0, {est(120000000, 3.0, 70)}, params, &state).action, AUTO_PPM_HOLD);
+}
+
+TEST_F(AutoPpmDecideTest, evaluation_without_a_residual_leaves_persistence_alone) {
+    auto_ppm_decide(0, {est(120000000, 3.0, 50)}, params, &state);
+    EXPECT_FALSE(auto_ppm_decide(0, {}, params, &state).residual_valid);
+    EXPECT_FALSE(auto_ppm_decide(0, {est(120000000, 1.0, 55), est(125000000, 6.0, 55)}, params, &state).residual_valid);
+    EXPECT_EQ(auto_ppm_decide(0, {est(120000000, 3.0, 60)}, params, &state).action, AUTO_PPM_ADJUST);
+}
+
+TEST_F(AutoPpmDecideTest, too_few_voters_hold) {
+    params.min_voters = 2;
+    AutoPpmDecision d = decide2(0, {est(120000000, 3.0)});
+    EXPECT_EQ(d.action, AUTO_PPM_HOLD);
+    EXPECT_FALSE(d.residual_valid);
+    EXPECT_EQ(d.reason, "1 voter, need 2");
+    EXPECT_EQ(decide2(0, {est(120000000, 3.0), est(121000000, 3.2)}).action, AUTO_PPM_ADJUST);
+}
+
+TEST_F(AutoPpmDecideTest, rejected_outliers_do_not_count_as_voters) {
+    params.min_voters = 3;
+    vector<AutoPpmEstimate> e = {est(120000000, 2.0), est(121500000, 2.2), {125000000, -5000.0f, 50}};
+    AutoPpmDecision d = decide2(0, e);
+    EXPECT_EQ(d.eligible, 3);
+    EXPECT_EQ(d.contributing, 2);
+    EXPECT_EQ(d.action, AUTO_PPM_HOLD);
+    EXPECT_EQ(d.reason, "2 voters, need 3");
+}
+
+TEST_F(AutoPpmDecideTest, deadband_widens_at_low_band) {
+    // 100 Hz at 42.44 MHz is 2.36 ppm; at 160 MHz the 0.75 ppm floor applies.
+    AutoPpmDecision d = decide2(0, {est(42440000, 2.0)});
+    EXPECT_EQ(d.action, AUTO_PPM_HOLD);
+    EXPECT_EQ(d.reason, "within deadband");
+    EXPECT_NEAR(d.deadband_ppm, 100.0 / 42.44, 1e-3);
+
+    state = AutoPpmState();
+    d = decide2(0, {est(42440000, 3.0)});
+    EXPECT_EQ(d.action, AUTO_PPM_ADJUST);
+    EXPECT_EQ(d.new_correction, 3);
+
+    state = AutoPpmState();
+    d = decide2(0, {est(160000000, 2.0)});
+    EXPECT_EQ(d.action, AUTO_PPM_ADJUST);
+    EXPECT_NEAR(d.deadband_ppm, 0.75, 1e-9);
+}
+
+TEST_F(AutoPpmDecideTest, zero_deadband_hz_keeps_the_ppm_floor) {
+    params.deadband_hz = 0;
+    AutoPpmDecision d = decide2(0, {est(42440000, 1.0)});
+    EXPECT_EQ(d.action, AUTO_PPM_ADJUST);
+    EXPECT_NEAR(d.deadband_ppm, 0.75, 1e-9);
+    state = AutoPpmState();
+    EXPECT_EQ(decide2(0, {est(42440000, 0.7)}).action, AUTO_PPM_HOLD);
+}
+
+TEST_F(AutoPpmDecideTest, growth_tolerance_scales_with_the_deadband) {
+    // At 42.44 MHz the tolerance is 2.36 / 3 = 0.79 ppm: two steps each followed by 0.5 ppm of
+    // apparent growth are noise, not divergence.
+    int correction = 0;
+    double residual = 4.0;
+    for (int i = 0; i < 3; i++) {
+        AutoPpmDecision d = decide2(correction, {est(42440000, residual)});
+        ASSERT_NE(d.action, AUTO_PPM_REVERT) << i;
+        correction = d.new_correction;
+        residual += 0.5;
+    }
+}
+
+// Residual sequences auto_ppm acted on in production on 2026-11-03, before this rule set. Each
+// value was then measured again from fresh samples, so feed every one twice with growing updates.
+TEST_F(AutoPpmDecideTest, replay_of_low_band_hunting_on_042) {
+    const double seq[] = {2.80, 0.92, -4.03, 2.28, 1.12, -3.04, 0.81, 1.49, 0.91, -2.10, 1.43, 1.98, -3.32, 1.06, 0.96, -1.24, -1.76};
+    const int voters[] = {1, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2};
+    for (int min_voters : {1, 2}) {
+        params.min_voters = min_voters;
+        state = AutoPpmState();
+        int adjustments = 0;
+        uint32_t updates = 50;
+        for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
+            vector<AutoPpmEstimate> e = {est(42440000, seq[i], updates)};
+            if (voters[i] == 2) {
+                e.push_back(est(42280000, seq[i], updates));
+            }
+            for (int rep = 0; rep < 2; rep++) {
+                for (AutoPpmEstimate& x : e) {
+                    x.updates = updates;
+                }
+                updates += 10;
+                AutoPpmDecision d = auto_ppm_decide(0, e, params, &state);
+                ASSERT_NE(d.action, AUTO_PPM_REVERT) << min_voters << " " << i;
+                adjustments += d.action == AUTO_PPM_ADJUST;
+                if (d.action == AUTO_PPM_ADJUST) {
+                    updates = 50;  // a step restarts the estimates
+                }
+            }
+        }
+        EXPECT_LE(adjustments, min_voters == 2 ? 1 : 4) << min_voters;
+    }
+}
+
+TEST_F(AutoPpmDecideTest, replay_of_mobile_disagreement_on_172) {
+    const double seq[] = {-0.76, 1.65, -1.17, -0.78, 2.27};
+    const int voters[] = {1, 2, 2, 1, 1};
+    params.min_voters = 2;
+    int adjustments = 0;
+    uint32_t updates = 50;
+    for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
+        vector<AutoPpmEstimate> e = {est(172225000, seq[i], updates)};
+        if (voters[i] == 2) {
+            e.push_back(est(172500000, seq[i], updates));
+        }
+        AutoPpmDecision d = auto_ppm_decide(0, e, params, &state);
+        ASSERT_NE(d.action, AUTO_PPM_REVERT) << i;
+        adjustments += d.action == AUTO_PPM_ADJUST;
+        updates += 10;
+    }
+    EXPECT_EQ(adjustments, 0);
+}
+
+TEST_F(AutoPpmDecideTest, single_reference_still_converges) {
+    // The dev box's NOAA 162.550 validation: one voter, starting 20 ppm off.
+    int correction = -20;
+    double const truth = 0.5;
+    int evaluations = 0;
+    uint32_t updates = 50;
+    for (; evaluations < 20 && fabs(truth - correction) >= 0.75; evaluations++) {
+        AutoPpmDecision d = auto_ppm_decide(correction, {est(162550000, truth - correction, updates)}, params, &state);
+        ASSERT_NE(d.action, AUTO_PPM_REVERT);
+        updates = d.action == AUTO_PPM_ADJUST ? 50 : updates + 10;
+        correction = d.new_correction;
+    }
+    EXPECT_LE(fabs(truth - correction), 0.75);
+    EXPECT_LE(evaluations, 10);  // 5 steps of up to 5 ppm, two readings each
 }
 
 class AutoPpmParamsTest : public TestBaseClass {
@@ -219,6 +405,8 @@ TEST_F(AutoPpmParamsTest, defaults) {
     EXPECT_EQ(p.interval_sec, 30);
     EXPECT_EQ(p.max_ppm, 100);
     EXPECT_EQ(p.max_step, 5);
+    EXPECT_EQ(p.min_voters, 1);
+    EXPECT_EQ(p.deadband_hz, 100);
 }
 
 TEST_F(AutoPpmParamsTest, explicit_values) {
@@ -228,11 +416,16 @@ TEST_F(AutoPpmParamsTest, explicit_values) {
     EXPECT_EQ(p.interval_sec, 10);
     EXPECT_EQ(p.max_ppm, 40);
     EXPECT_EQ(p.max_step, 2);
+
+    ASSERT_TRUE(parse("dev: { auto_ppm_min_voters = 2; auto_ppm_deadband_hz = 0; };", &p, &error)) << error;
+    EXPECT_EQ(p.min_voters, 2);
+    EXPECT_EQ(p.deadband_hz, 0);
 }
 
 TEST_F(AutoPpmParamsTest, out_of_range_values_are_rejected) {
     for (const char* text : {"dev: { auto_ppm_max_ppm = 101; };", "dev: { auto_ppm_max_ppm = 0; };", "dev: { auto_ppm_max_step = 0; };", "dev: { auto_ppm_interval = 4; };",
-                             "dev: { auto_ppm_interval = -30; };", "dev: { auto_ppm_max_ppm = 50.5; };"}) {
+                             "dev: { auto_ppm_interval = -30; };", "dev: { auto_ppm_max_ppm = 50.5; };", "dev: { auto_ppm_min_voters = 0; };", "dev: { auto_ppm_min_voters = 33; };",
+                             "dev: { auto_ppm_deadband_hz = -1; };", "dev: { auto_ppm_deadband_hz = 1001; };"}) {
         AutoPpmParams p;
         string error;
         EXPECT_FALSE(parse(text, &p, &error)) << text;
@@ -301,8 +494,15 @@ class AutoPpmTickTest : public TestBaseClass {
     }
     // What the demod thread would publish for every channel, under the current generation, if
     // the tuner's true error were truth_ppm.
-    void measure(double truth_ppm, uint32_t updates = 50) {
+    // Each call is a newer measurement (more updates) unless the generation changed.
+    void measure(double truth_ppm) {
         uint32_t const gen = input.tuning_generation.load();
+        if (gen != measured_gen) {
+            measured_gen = gen;
+            next_updates = 50;
+        }
+        uint32_t const updates = next_updates;
+        next_updates += 10;
         for (int j = 0; j < kChannels; j++) {
             freqs[j].ppm_offset_hz = (float)(-(truth_ppm - fake_correction) * freqs[j].frequency / 1e6);
             freqs[j].ppm_offset_updates = updates;
@@ -328,6 +528,8 @@ class AutoPpmTickTest : public TestBaseClass {
     device_t dev{};
     auto_ppm_device* ap = nullptr;
     double now = 0.0;
+    uint32_t measured_gen = 0;
+    uint32_t next_updates = 50;
 };
 
 TEST_F(AutoPpmTickTest, converges_in_bounded_steps) {
@@ -343,6 +545,8 @@ TEST_F(AutoPpmTickTest, converges_in_bounded_steps) {
 TEST_F(AutoPpmTickTest, stale_generation_estimates_are_not_used) {
     measure(10.0);
     tick();
+    measure(10.0);
+    tick();
     ASSERT_EQ(fake_correction, 5);
     // No fresh measurements since the change: the old ones are from the previous generation.
     tick();
@@ -354,12 +558,12 @@ TEST_F(AutoPpmTickTest, waits_for_the_interval) {
     ap->params.interval_sec = 30;
     measure(10.0);
     auto_ppm_tick(&dev, 0, 100.0);
-    EXPECT_EQ(fake_correction, 5);
+    EXPECT_EQ(ap->state.pending_count, 1);
     measure(10.0);
     auto_ppm_tick(&dev, 0, 110.0);
-    EXPECT_EQ(fake_correction, 5);
+    EXPECT_EQ(fake_correction, 0) << "inside the interval";
     auto_ppm_tick(&dev, 0, 130.0);
-    EXPECT_EQ(fake_correction, 10);
+    EXPECT_EQ(fake_correction, 5);
 }
 
 TEST_F(AutoPpmTickTest, never_exceeds_the_limit_even_when_the_dongle_is_out_of_spec) {
@@ -385,10 +589,13 @@ TEST_F(AutoPpmTickTest, divergence_reverts_and_disables) {
     ap->state.base_correction = 3;
     fake_correction = 3;
     double truth = 20.0;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 10 && !ap->tripped; i++) {
+        int const before = fake_set_count;
         measure(truth);
         tick();
-        truth += 10.0;  // the error runs away faster than each step closes it
+        if (fake_set_count != before) {
+            truth += 10.0;  // the error runs away faster than each step closes it
+        }
     }
     EXPECT_TRUE(ap->tripped);
     EXPECT_EQ(fake_correction, 3);
@@ -420,6 +627,9 @@ TEST_F(AutoPpmTickTest, failed_set_correction_is_not_counted) {
     fake_set_fails = true;
     measure(10.0);
     tick();
+    measure(10.0);
+    tick();
+    EXPECT_EQ(ap->last.action, AUTO_PPM_ADJUST);
     EXPECT_EQ(ap->adjustments, 0u);
     EXPECT_FALSE(ap->state.awaiting_check);
 }
@@ -459,6 +669,9 @@ TEST_F(AutoPpmTickTest, status_json) {
     EXPECT_NE(auto_ppm_status_json(&dev, now).find("\"residual_ppm\":null"), string::npos);
     measure(2.0);
     tick();
+    EXPECT_NE(auto_ppm_status_json(&dev, now).find("\"pending_count\":1"), string::npos);
+    measure(2.0);
+    tick();
     string const json = auto_ppm_status_json(&dev, now + 12.0);
     EXPECT_NE(json.find("\"enabled\":true"), string::npos) << json;
     EXPECT_NE(json.find("\"residual_ppm\":2.00"), string::npos) << json;
@@ -467,6 +680,10 @@ TEST_F(AutoPpmTickTest, status_json) {
     EXPECT_NE(json.find("\"last_adjust_age_s\":12"), string::npos) << json;
     EXPECT_NE(json.find("\"max_ppm\":100"), string::npos) << json;
     EXPECT_NE(json.find("\"disabled_reason\":null"), string::npos) << json;
+    EXPECT_NE(json.find("\"min_voters\":1"), string::npos) << json;
+    EXPECT_NE(json.find("\"deadband_hz\":100"), string::npos) << json;
+    EXPECT_NE(json.find("\"deadband_ppm\":0.83"), string::npos) << json;
+    EXPECT_NE(json.find("\"pending_count\":0"), string::npos) << json;
 
     dev.auto_ppm = nullptr;
     EXPECT_EQ(auto_ppm_status_json(&dev, now), "null");

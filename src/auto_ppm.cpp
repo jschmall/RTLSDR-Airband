@@ -38,12 +38,24 @@ namespace {
 // offset-carrier ATC sites at +/-2.5..7.5 kHz) rather than tuner error.
 const double OUTLIER_WINDOW_PPM = 1.5;
 const double MAX_SPREAD_PPM = 2.0;
-// rtlsdr takes whole ppm; acting on less than this would flap around +/-0.5.
+// rtlsdr takes whole ppm; acting on less than this would flap around +/-0.5. The
+// auto_ppm_deadband_hz term can only widen it.
 const double DEADBAND_PPM = 0.75;
-// Slack before a post-step residual counts as having grown, so measurement noise around a
-// near-zero residual doesn't trip the divergence guard.
-const double GROWTH_TOLERANCE_PPM = 0.25;
+// Slack before a post-step residual counts as having grown, as a fraction of the deadband (0.25
+// ppm at the 0.75 ppm floor), so measurement noise around a near-zero residual doesn't trip the
+// divergence guard.
+const double GROWTH_TOLERANCE_FRACTION = 1.0 / 3.0;
 const int DIVERGENCE_STEPS = 2;
+// Consecutive same-sign readings needed before a step. Different transmitters on one frequency
+// disagree by a ppm or two, and acting on each in turn hunted back and forth until the
+// divergence guard tripped (prod 2026-11-03).
+const int PERSIST_EVALS = 2;
+
+struct Vote {
+    double residual_ppm;
+    int frequency;
+    uint32_t updates;
+};
 
 double median_of(vector<double> v) {
     sort(v.begin(), v.end());
@@ -107,6 +119,9 @@ void reset_tracking(auto_ppm_device* ap) {
     ap->disabled_reason.clear();
     ap->state.awaiting_check = false;
     ap->state.growing_steps = 0;
+    ap->state.pending_sign = 0;
+    ap->state.pending_count = 0;
+    ap->state.pending_updates = 0;
     ap->clamp_warned = false;
     ap->next_eval = 0.0;
 }
@@ -116,7 +131,9 @@ void reset_tracking(auto_ppm_device* ap) {
 bool auto_ppm_parse_params(libconfig::Setting& dev, AutoPpmParams* out, string* error) {
     AutoPpmParams p;
     if (!read_int_param(dev, "auto_ppm_interval", p.interval_sec, 5, 86400, &p.interval_sec, error) || !read_int_param(dev, "auto_ppm_max_ppm", p.max_ppm, 1, AUTO_PPM_HARD_LIMIT, &p.max_ppm, error) ||
-        !read_int_param(dev, "auto_ppm_max_step", p.max_step, 1, AUTO_PPM_HARD_LIMIT, &p.max_step, error)) {
+        !read_int_param(dev, "auto_ppm_max_step", p.max_step, 1, AUTO_PPM_HARD_LIMIT, &p.max_step, error) ||
+        !read_int_param(dev, "auto_ppm_min_voters", p.min_voters, 1, AUTO_PPM_MAX_MIN_VOTERS, &p.min_voters, error) ||
+        !read_int_param(dev, "auto_ppm_deadband_hz", p.deadband_hz, 0, 1000, &p.deadband_hz, error)) {
         return false;
     }
     *out = p;
@@ -127,7 +144,7 @@ AutoPpmDecision auto_ppm_decide(int current_correction, const vector<AutoPpmEsti
     AutoPpmDecision d;
     d.new_correction = current_correction;
 
-    vector<double> plausible;
+    vector<Vote> plausible;
     for (const AutoPpmEstimate& e : estimates) {
         if (e.updates < params.min_updates || e.frequency <= 0) {
             continue;
@@ -137,7 +154,7 @@ AutoPpmDecision auto_ppm_decide(int current_correction, const vector<AutoPpmEsti
         if (!isfinite(r) || fabs((double)current_correction + r) > AUTO_PPM_HARD_LIMIT) {
             continue;
         }
-        plausible.push_back(r);
+        plausible.push_back({r, e.frequency, e.updates});
     }
     if (d.eligible == 0) {
         d.reason = "not enough measurements yet";
@@ -149,11 +166,15 @@ AutoPpmDecision auto_ppm_decide(int current_correction, const vector<AutoPpmEsti
         return d;
     }
 
-    double const med = median_of(plausible);
-    vector<double> kept;
-    for (double r : plausible) {
-        if (fabs(r - med) <= OUTLIER_WINDOW_PPM) {
-            kept.push_back(r);
+    vector<double> residuals;
+    for (const Vote& v : plausible) {
+        residuals.push_back(v.residual_ppm);
+    }
+    double const med = median_of(residuals);
+    vector<Vote> kept;
+    for (const Vote& v : plausible) {
+        if (fabs(v.residual_ppm - med) <= OUTLIER_WINDOW_PPM) {
+            kept.push_back(v);
         }
     }
     d.contributing = (int)kept.size();
@@ -162,25 +183,40 @@ AutoPpmDecision auto_ppm_decide(int current_correction, const vector<AutoPpmEsti
         d.reason = "channel estimates disagree";
         return d;
     }
-    auto const mm = minmax_element(kept.begin(), kept.end());
+    vector<double> kept_residuals, kept_freqs;
+    uint64_t updates = 0;
+    for (const Vote& v : kept) {
+        kept_residuals.push_back(v.residual_ppm);
+        kept_freqs.push_back((double)v.frequency);
+        updates += v.updates;
+    }
+    auto const mm = minmax_element(kept_residuals.begin(), kept_residuals.end());
     if (*mm.second - *mm.first > MAX_SPREAD_PPM) {
         d.reason = "channel estimates disagree";
         return d;
     }
+    if (d.contributing < params.min_voters) {
+        d.reason = to_string(d.contributing) + " voter" + (d.contributing == 1 ? "" : "s") + ", need " + to_string(params.min_voters);
+        return d;
+    }
 
-    double const residual = median_of(kept);
+    double const residual = median_of(kept_residuals);
+    double const deadband = max(DEADBAND_PPM, (double)params.deadband_hz / median_of(kept_freqs) * 1e6);
     d.residual_valid = true;
     d.residual_ppm = residual;
+    d.deadband_ppm = deadband;
 
     if (state->awaiting_check) {
         state->awaiting_check = false;
-        if (fabs(residual) > state->residual_before_step + GROWTH_TOLERANCE_PPM) {
+        if (fabs(residual) > state->residual_before_step + deadband * GROWTH_TOLERANCE_FRACTION) {
             state->growing_steps++;
         } else {
             state->growing_steps = 0;
         }
         if (state->growing_steps >= DIVERGENCE_STEPS) {
             state->growing_steps = 0;
+            state->pending_sign = 0;
+            state->pending_count = 0;
             d.action = AUTO_PPM_REVERT;
             d.new_correction = clamp_int(state->base_correction, params.max_ppm);
             d.reason = "error grew after " + to_string(DIVERGENCE_STEPS) + " consecutive adjustments";
@@ -188,12 +224,27 @@ AutoPpmDecision auto_ppm_decide(int current_correction, const vector<AutoPpmEsti
         }
     }
 
-    if (fabs(residual) < DEADBAND_PPM) {
+    if (fabs(residual) < deadband) {
+        state->pending_sign = 0;
+        state->pending_count = 0;
         d.reason = "within deadband";
         return d;
     }
     long const target = lround((double)current_correction + residual);
     d.clamped = target > params.max_ppm || target < -params.max_ppm;
+
+    int const sign = residual > 0 ? 1 : -1;
+    if (sign != state->pending_sign) {
+        state->pending_sign = sign;
+        state->pending_count = 1;
+    } else if (updates > state->pending_updates) {
+        state->pending_count++;
+    }
+    state->pending_updates = updates;
+    if (state->pending_count < PERSIST_EVALS) {
+        d.reason = "waiting for a consistent second measurement";
+        return d;
+    }
 
     long const delta = max<long>(-params.max_step, min<long>(params.max_step, target - current_correction));
     int const next = clamp_int(current_correction + delta, params.max_ppm);
@@ -206,6 +257,9 @@ AutoPpmDecision auto_ppm_decide(int current_correction, const vector<AutoPpmEsti
     d.reason = "adjusting";
     state->awaiting_check = true;
     state->residual_before_step = fabs(residual);
+    state->pending_sign = 0;
+    state->pending_count = 0;
+    state->pending_updates = 0;
     return d;
 }
 
@@ -272,7 +326,8 @@ void auto_ppm_tick(device_t* dev, int index, double now) {
         if (input_set_correction(input, d.new_correction) == 0) {
             ap->adjustments++;
             ap->last_adjust = now;
-            log(LOG_INFO, "Device #%d: auto_ppm correction %d -> %d ppm (residual %+.2f, %d/%d channels)\n", index, current, d.new_correction, d.residual_ppm, d.contributing, d.eligible);
+            log(LOG_INFO, "Device #%d: auto_ppm correction %d -> %d ppm (residual %+.2f, deadband %.2f, %d/%d channels)\n", index, current, d.new_correction, d.residual_ppm, d.deadband_ppm,
+                d.contributing, d.eligible);
         } else {
             ap->state.awaiting_check = false;
             log(LOG_ERR, "Device #%d: auto_ppm failed to set correction %d ppm\n", index, d.new_correction);
@@ -357,6 +412,10 @@ string auto_ppm_status_json(device_t* dev, double now) {
     out += ",\"max_ppm\":" + to_string(ap->params.max_ppm);
     out += ",\"max_step\":" + to_string(ap->params.max_step);
     out += ",\"interval\":" + to_string(ap->params.interval_sec);
+    out += ",\"min_voters\":" + to_string(ap->params.min_voters);
+    out += ",\"deadband_hz\":" + to_string(ap->params.deadband_hz);
+    out += ",\"deadband_ppm\":" + (have && ap->last.residual_valid ? json_fixed(ap->last.deadband_ppm, "%.2f") : string("null"));
+    out += ",\"pending_count\":" + to_string(ap->state.pending_count);
     return out + "}";
 }
 

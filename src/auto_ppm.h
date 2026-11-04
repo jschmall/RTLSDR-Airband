@@ -33,20 +33,30 @@ struct device_t;
 // No configuration can push a correction past this, in either direction. A real crystal this far
 // off is broken hardware, not something to chase.
 #define AUTO_PPM_HARD_LIMIT 100
+#define AUTO_PPM_MAX_MIN_VOTERS 32
 
 struct AutoPpmParams {
     int interval_sec = 30;
     int max_ppm = AUTO_PPM_HARD_LIMIT;
     int max_step = 5;
+    // Frequencies that must agree before any step. Counted after outlier rejection.
+    int min_voters = 1;
+    // Smallest frequency error worth correcting, in Hz at the voters' frequency. The effective
+    // deadband is the larger of this and 0.75 ppm, so it only widens below ~133 MHz, where whole
+    // ppm are a few tens of Hz and transmitter tolerance alone is several ppm.
+    int deadband_hz = 100;
     // Not configurable: offset updates (squelch-open batches) a frequency needs since the last
     // tuning change before it may vote.
     uint32_t min_updates = 20;
 
-    bool operator==(const AutoPpmParams& o) const { return interval_sec == o.interval_sec && max_ppm == o.max_ppm && max_step == o.max_step && min_updates == o.min_updates; }
+    bool operator==(const AutoPpmParams& o) const {
+        return interval_sec == o.interval_sec && max_ppm == o.max_ppm && max_step == o.max_step && min_voters == o.min_voters && deadband_hz == o.deadband_hz && min_updates == o.min_updates;
+    }
     bool operator!=(const AutoPpmParams& o) const { return !(*this == o); }
 };
 
-// Reads auto_ppm_interval / auto_ppm_max_ppm / auto_ppm_max_step from a device block, applying
+// Reads auto_ppm_interval / auto_ppm_max_ppm / auto_ppm_max_step / auto_ppm_min_voters /
+// auto_ppm_deadband_hz from a device block, applying
 // defaults for absent keys. Returns false with *error set when a value is out of range.
 bool auto_ppm_parse_params(libconfig::Setting& dev, AutoPpmParams* out, std::string* error);
 
@@ -64,6 +74,11 @@ struct AutoPpmState {
     bool awaiting_check = false;
     double residual_before_step = 0.0;  // |residual| that prompted the last step
     int growing_steps = 0;
+    // Persistence: a step needs this many consecutive out-of-deadband residuals of one sign,
+    // each from newer measurements (a larger total update count) than the one before.
+    int pending_sign = 0;
+    int pending_count = 0;
+    uint64_t pending_updates = 0;
 };
 
 struct AutoPpmDecision {
@@ -72,10 +87,11 @@ struct AutoPpmDecision {
     bool residual_valid = false;
     // Correction still needed, in ppm: the ideal correction is current + residual_ppm.
     double residual_ppm = 0.0;
-    int eligible = 0;      // estimates with enough updates
-    int contributing = 0;  // eligible estimates that survived plausibility and outlier rejection
-    int rejected = 0;      // eligible - contributing
-    bool clamped = false;  // the limit stopped the correction from going where the estimate wanted
+    int eligible = 0;           // estimates with enough updates
+    int contributing = 0;       // eligible estimates that survived plausibility and outlier rejection
+    int rejected = 0;           // eligible - contributing
+    bool clamped = false;       // the limit stopped the correction from going where the estimate wanted
+    double deadband_ppm = 0.0;  // effective deadband for these voters, valid with residual_valid
     std::string reason;
 };
 

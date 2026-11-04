@@ -155,6 +155,8 @@ devices: ({
   # auto_ppm_interval = 30;  # seconds between evaluations (5 or more)
   # auto_ppm_max_ppm = 100;  # never set a correction beyond +/- this (1-100)
   # auto_ppm_max_step = 5;   # largest change in one adjustment
+  # auto_ppm_min_voters = 1; # channels that must agree before any change
+  # auto_ppm_deadband_hz = 100;  # ignore errors smaller than this many Hz (0-1000)
   ...
 });
 ```
@@ -165,8 +167,17 @@ devices: ({
   changes.
 - **Hard limits.** No correction outside `auto_ppm_max_ppm` is ever set, and that limit can't
   be configured above 100 ppm. Estimates that would put the dongle more than 100 ppm off are
-  treated as bad measurements. A single adjustment moves at most `auto_ppm_max_step` ppm,
-  and auto_ppm does nothing for an error under 0.75 ppm.
+  treated as bad measurements. A single adjustment moves at most `auto_ppm_max_step` ppm.
+- **Small errors are left alone.** auto_ppm ignores an error under 0.75 ppm or under
+  `auto_ppm_deadband_hz` at the channels' frequency, whichever is larger. The Hz term only
+  matters below about 133 MHz: at 42 MHz the default 100 Hz is 2.4 ppm. There, ordinary
+  transmitter tolerance is several ppm, and chasing it only makes the correction hunt.
+- **It waits for confirmation.** An error has to show up with the same sign in two
+  evaluations in a row, the second from newer transmissions, before anything changes. So each
+  step takes at least two `auto_ppm_interval`s. With `auto_ppm_min_voters` above 1, that many
+  channels must also agree (after outliers are dropped). Set it to 2 on a device whose
+  channels carry many different mobiles, so no single transmitter can move the correction.
+  It must be 1 in scan mode, where only the current frequency votes.
 - **It turns itself off if things get worse.** If the error grows after two adjustments in a row,
   auto_ppm puts the configured `correction` back, stops, and logs an error. `status` then
   shows the reason. A `reload_diff` (or restart) re-arms it.

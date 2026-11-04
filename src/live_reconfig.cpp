@@ -946,7 +946,7 @@ DiffResult compute_and_apply_diff(const ConfigSnapshot& snapshot) {
                 apply_correction = false;
             } else {
                 if (snap.auto_ppm_params != dev->auto_ppm->params) {
-                    result.skipped_requires_restart.push_back(label + ": auto_ppm_interval/auto_ppm_max_ppm/auto_ppm_max_step changed");
+                    result.skipped_requires_restart.push_back(label + ": auto_ppm_interval/auto_ppm_max_ppm/auto_ppm_max_step/auto_ppm_min_voters/auto_ppm_deadband_hz changed");
                 }
                 vector<string> changes;
                 apply_correction = auto_ppm_reload(dev, snap.auto_ppm, snap.correction, &changes);

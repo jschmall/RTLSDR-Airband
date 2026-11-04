@@ -60,3 +60,61 @@ def test_auto_ppm_is_rejected_on_a_driver_without_live_correction(
     )
     assert result.returncode != 0, result.stderr
     assert expected in result.stderr, result.stderr
+
+
+def write_rtlsdr_config(config_path: Path, output_dir: Path, device_body: str) -> None:
+    config_path.write_text(f"""
+devices: (
+  {{
+    type = "rtlsdr";
+    index = 0;
+    gain = 25;
+    auto_ppm = true;
+    {device_body}
+  }}
+);
+""".replace("OUTDIR", str(output_dir)))
+
+
+FILE_OUTPUT = """outputs: ( { type = "file"; directory = "OUTDIR"; filename_template = "out"; } );"""
+
+
+@pytest.mark.parametrize(
+    "device_body, expected",
+    [
+        (
+            f"""auto_ppm_min_voters = 3; reserve_channels = 1; centerfreq = 120.0;
+            channels: ( {{ freq = 120.025; {FILE_OUTPUT} }} );""",
+            "auto_ppm_min_voters (3) is more than the device's 2 channel(s)",
+        ),
+        (
+            f"""auto_ppm_min_voters = 2; mode = "scan";
+            channels: ( {{ freqs = ( 120.025, 121.5 ); {FILE_OUTPUT} }} );""",
+            "auto_ppm_min_voters must be 1 in scan mode",
+        ),
+        (
+            f"""auto_ppm_deadband_hz = 2000; centerfreq = 120.0;
+            channels: ( {{ freq = 120.025; {FILE_OUTPUT} }} );""",
+            "auto_ppm_deadband_hz must be between 0 and 1000",
+        ),
+    ],
+    ids=[
+        "min_voters_over_capacity",
+        "min_voters_in_scan_mode",
+        "deadband_out_of_range",
+    ],
+)
+def test_auto_ppm_voting_settings_are_validated(
+    binary_under_test: BinaryUnderTest,
+    test_output_dir: Path,
+    device_body: str,
+    expected: str,
+) -> None:
+    # Parsing runs before any device is opened, so this needs no dongle.
+    config_path = test_output_dir / "rtl_airband.conf"
+    write_rtlsdr_config(config_path, test_output_dir, device_body)
+    result = run_rtl_airband(
+        binary_under_test.path, config_path, timeout_s=30, check=False
+    )
+    assert result.returncode != 0, result.stderr
+    assert expected in result.stderr, result.stderr

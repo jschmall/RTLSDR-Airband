@@ -1053,6 +1053,16 @@ int parse_devices(libconfig::Setting& devs) {
                 cerr << "Configuration error: devices.[" << i << "]: " << param_error << "\n";
                 error();
             }
+            // Only the current scan frequency's generation ever votes.
+            if (dev->mode == R_SCAN && params.min_voters > 1) {
+                cerr << "Configuration error: devices.[" << i << "]: auto_ppm_min_voters must be 1 in scan mode\n";
+                error();
+            }
+            int const voter_capacity = (devs[i].exists("channels") ? devs[i]["channels"].getLength() : 0) + reserve_channels;
+            if (params.min_voters > voter_capacity) {
+                cerr << "Configuration error: devices.[" << i << "]: auto_ppm_min_voters (" << params.min_voters << ") is more than the device's " << voter_capacity << " channel(s)\n";
+                error();
+            }
             input_settings_t settings;
             int start_correction = 0;
             if (input->get_settings(input, &settings) == 0) {

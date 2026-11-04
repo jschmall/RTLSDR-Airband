@@ -1720,6 +1720,18 @@ TEST_F(AutoPpmDiffTest, changed_parameters_need_a_restart) {
     EXPECT_EQ(dev.auto_ppm->params.max_step, 5);
 }
 
+TEST_F(AutoPpmDiffTest, changed_voting_parameters_need_a_restart) {
+    configure_auto_ppm(true);
+    dsnap.auto_ppm_params.min_voters = 2;
+    dsnap.auto_ppm_params.deadband_hz = 50;
+    DiffResult result = run();
+    ASSERT_EQ(result.skipped_requires_restart.size(), 1u);
+    EXPECT_NE(result.skipped_requires_restart[0].find("auto_ppm_min_voters"), std::string::npos);
+    EXPECT_NE(result.skipped_requires_restart[0].find("auto_ppm_deadband_hz"), std::string::npos);
+    EXPECT_EQ(dev.auto_ppm->params.min_voters, 1);
+    EXPECT_EQ(dev.auto_ppm->params.deadband_hz, 100);
+}
+
 TEST_F(AutoPpmDiffTest, correction_outside_the_limit_is_not_applied) {
     configure_auto_ppm(true);
     dsnap.correction = 150;

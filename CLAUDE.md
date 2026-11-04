@@ -774,7 +774,7 @@ and signal levels and per-device buffer counters only, and the control socket ha
 **44. `rtl_airband -v` prints a `Features:` line** (`fork_features()` in
 `src/helper_functions.cpp`, printed from `main()`). The version line is unchanged; a second line
 reads `Features: fork control_socket device_status reserve mixer_remote send_tx_tags stats_http
-json_log post_write_script auto_ppm usb_chunk_sizing` (`auto_ppm` added by item 45, `usb_chunk_sizing` by item 46), followed by whichever optional build components are compiled in
+json_log post_write_script auto_ppm usb_chunk_sizing auto_ppm_voting` (`auto_ppm` added by item 45, `usb_chunk_sizing` by item 46, `auto_ppm_voting` by item 47), followed by whichever optional build components are compiled in
 (`rdio_scanner`, `soapysdr`, `pulseaudio`, `nfm`). `mirisdr` was also in that list until
 upstream v7.0.0 removed the driver. It was a build-component name, not a fork capability, so its
 disappearance doesn't break the never-remove rule below, which covers the fork capability names.
@@ -834,6 +834,8 @@ carrier offsets and item 35's live correction. Device keys: `auto_ppm` (bool), `
   `device_auto_ppm_residual_ppm`, `device_auto_ppm_adjustment_count` (auto_ppm devices only);
   LOG_INFO per adjustment, LOG_WARNING once per clamp episode, LOG_ERR on a trip.
 - **No persistence:** each start begins from config `correction`.
+- **Decision rule hardened by item 47** (minimum voters, deadband in Hz, two-reading
+  confirmation) after prod hunting on low-band and mobile-heavy devices.
 - **Estimator change (affects item 43's `freq_offset_hz` too):** hardware testing showed item 43's
   power-weighted estimate, the angle of Σ z[n]·conj(z[n−1]), is badly biased on NFM. The
   FFT-bin channelizer's response is curved across a ±5 kHz-deviation signal, and weighting by
@@ -900,6 +902,44 @@ overran whenever the output pass hadn't finished.
 - Tests: `src/test_input_common.cpp` (sizing and validation); `system_tests/tests/test_rtlsdr_buffer_size.py`
   (parser rejects bad `buffer_size` through the real binary, before any device is opened). The
   system test caught a real bug: libconfig throws on `(long long)` of a plain int setting.
+
+**47. auto_ppm: minimum voters, frequency-scaled deadband, two-reading confirmation**
+(`src/auto_ppm.{h,cpp}`, `src/config.cpp`, `src/live_reconfig.cpp`). Item 45's decision rule
+hunted in production on the first day of v7.2.1 (2026-11-03), and the divergence guard tripped on
+two instances. Neither dongle was actually diverging:
+- **042 (42 MHz):** 17 adjustments in 45 min between −1 and +3 ppm, with only 1–2 voters
+  (residuals +2.80, +0.92, −4.03, +2.28, … ppm). At low band 1 ppm is only 42 Hz, so transmitter
+  tolerance (Red 2 Base −88 Hz vs Red 2 Mobile +57 Hz) plus estimator noise is several ppm. The
+  fixed 0.75 ppm deadband (32 Hz) and 0.25 ppm growth tolerance (10 Hz) sat below that noise.
+- **172:** steps of −0.76, +1.65, −1.17, −0.78, +2.27 ppm, mostly on one voter. Different mobiles
+  on the same frequency disagree by 1–2 ppm.
+
+Three changes, all inside the still-pure `auto_ppm_decide()`:
+- **`auto_ppm_min_voters`** (device key, default 1, 1..32): surviving voters, counted after
+  outlier rejection, must reach it, or the evaluation holds with `"N voter(s), need K"` and no
+  residual. Parse rejects >1 in scan mode (only the current frequency's generation votes) and
+  anything above `channels + reserve_channels`.
+- **`auto_ppm_deadband_hz`** (default 100, 0..1000): deadband = max(0.75 ppm, Hz / median voter
+  frequency). That gives 2.36 ppm at 42.44 MHz, 0.83 at 120 MHz, and the unchanged 0.75 from
+  133 MHz up. 0 restores item 45's deadband. The divergence guard's growth tolerance is now
+  deadband / 3, which is 0.25 at the floor as before.
+- **Persistence (fixed, 2 readings):** an out-of-deadband residual steps only when the previous
+  valid reading had the same sign **and** the contributing voters' total update count grew in
+  between. Without that second condition, a stale EMA re-read 30 s later would confirm itself.
+  - A sign flip restarts the count.
+  - A reading inside the deadband clears it.
+  - Evaluations with no residual leave it as is.
+  - The divergence check still runs first, on the first reading after a step.
+  - **Every step now takes at least two intervals.**
+- Status JSON gains `min_voters`, `deadband_hz`, `deadband_ppm` and `pending_count`. The
+  adjustment log line includes the deadband. A changed key goes under `skipped_requires_restart`.
+- Tests (`src/test_auto_ppm.cpp`):
+  - Replays of the two prod sequences. 042 drops from 17 adjustments to 4 at defaults and to 1
+    with `min_voters = 2`. 172 makes 0 with `min_voters = 2`.
+  - The dev-box NOAA single-reference case still converges −20 → 0, in 8 evaluations.
+  - Persistence edge cases, low-band deadband, and growth-tolerance scaling.
+  - `system_tests/tests/test_auto_ppm.py` covers the parse-time rejections on an rtlsdr config,
+    with no dongle needed.
 
 ### Do not import from `yegors`
 
