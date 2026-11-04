@@ -79,6 +79,10 @@ struct AutoPpmState {
     int pending_sign = 0;
     int pending_count = 0;
     uint64_t pending_updates = 0;
+    int last_step_sign = 0;
+    // Set once two or more channels agree the residual is inside the deadband. From then on a
+    // channel voting alone with a large residual is held until another channel agrees.
+    bool converged = false;
 };
 
 struct AutoPpmDecision {

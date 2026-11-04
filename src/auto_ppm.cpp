@@ -38,11 +38,11 @@ namespace {
 // offset-carrier ATC sites at +/-2.5..7.5 kHz) rather than tuner error.
 const double OUTLIER_WINDOW_PPM = 1.5;
 const double MAX_SPREAD_PPM = 2.0;
-// rtlsdr takes whole ppm; acting on less than this would flap around +/-0.5. The
-// auto_ppm_deadband_hz term can only widen it.
-const double DEADBAND_PPM = 0.75;
-// Slack before a post-step residual counts as having grown, as a fraction of the deadband (0.25
-// ppm at the 0.75 ppm floor), so measurement noise around a near-zero residual doesn't trip the
+// rtlsdr takes whole ppm. At 0.75 a dongle drifting around n + 0.5 flipped between n and n + 1
+// on every reading (prod 2026-11-04). The auto_ppm_deadband_hz term can only widen it.
+const double DEADBAND_PPM = 1.0;
+// Slack before a post-step residual counts as having grown, as a fraction of the deadband (0.33
+// ppm at the 1 ppm floor), so measurement noise around a near-zero residual doesn't trip the
 // divergence guard.
 const double GROWTH_TOLERANCE_FRACTION = 1.0 / 3.0;
 const int DIVERGENCE_STEPS = 2;
@@ -50,6 +50,9 @@ const int DIVERGENCE_STEPS = 2;
 // disagree by a ppm or two, and acting on each in turn hunted back and forth until the
 // divergence guard tripped (prod 2026-11-03).
 const int PERSIST_EVALS = 2;
+// Once converged, a lone channel further off than this is more likely a transmitter off its
+// assigned frequency than the dongle drifting (prod 154: a channel steadily -5 kHz, 33 ppm).
+const double LONE_VOTER_LIMIT_PPM = 5.0;
 
 struct Vote {
     double residual_ppm;
@@ -122,6 +125,8 @@ void reset_tracking(auto_ppm_device* ap) {
     ap->state.pending_sign = 0;
     ap->state.pending_count = 0;
     ap->state.pending_updates = 0;
+    ap->state.last_step_sign = 0;
+    ap->state.converged = false;
     ap->clamp_warned = false;
     ap->next_eval = 0.0;
 }
@@ -202,6 +207,10 @@ AutoPpmDecision auto_ppm_decide(int current_correction, const vector<AutoPpmEsti
 
     double const residual = median_of(kept_residuals);
     double const deadband = max(DEADBAND_PPM, (double)params.deadband_hz / median_of(kept_freqs) * 1e6);
+    if (state->converged && d.contributing == 1 && fabs(residual) > max(LONE_VOTER_LIMIT_PPM, deadband)) {
+        d.reason = "one channel " + json_fixed(residual, "%+.1f") + " ppm off; waiting for another channel to agree";
+        return d;
+    }
     d.residual_valid = true;
     d.residual_ppm = residual;
     d.deadband_ppm = deadband;
@@ -215,6 +224,7 @@ AutoPpmDecision auto_ppm_decide(int current_correction, const vector<AutoPpmEsti
         }
         if (state->growing_steps >= DIVERGENCE_STEPS) {
             state->growing_steps = 0;
+            state->last_step_sign = 0;
             state->pending_sign = 0;
             state->pending_count = 0;
             d.action = AUTO_PPM_REVERT;
@@ -225,6 +235,9 @@ AutoPpmDecision auto_ppm_decide(int current_correction, const vector<AutoPpmEsti
     }
 
     if (fabs(residual) < deadband) {
+        if (d.contributing >= 2) {
+            state->converged = true;
+        }
         state->pending_sign = 0;
         state->pending_count = 0;
         d.reason = "within deadband";
@@ -252,6 +265,13 @@ AutoPpmDecision auto_ppm_decide(int current_correction, const vector<AutoPpmEsti
         d.reason = "held at the auto_ppm_max_ppm limit";
         return d;
     }
+    // Divergence means repeated steps the same way while the error grows. A step back the other
+    // way is hunting, which the persistence rule deals with.
+    int const step_sign = next > current_correction ? 1 : -1;
+    if (step_sign != state->last_step_sign) {
+        state->growing_steps = 0;
+    }
+    state->last_step_sign = step_sign;
     d.action = AUTO_PPM_ADJUST;
     d.new_correction = next;
     d.reason = "adjusting";
@@ -416,6 +436,7 @@ string auto_ppm_status_json(device_t* dev, double now) {
     out += ",\"deadband_hz\":" + to_string(ap->params.deadband_hz);
     out += ",\"deadband_ppm\":" + (have && ap->last.residual_valid ? json_fixed(ap->last.deadband_ppm, "%.2f") : string("null"));
     out += ",\"pending_count\":" + to_string(ap->state.pending_count);
+    out += string(",\"converged\":") + (ap->state.converged ? "true" : "false");
     return out + "}";
 }
 

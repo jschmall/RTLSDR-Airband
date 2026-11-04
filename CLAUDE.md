@@ -803,8 +803,8 @@ carrier offsets and item 35's live correction. Device keys: `auto_ppm` (bool), `
   correction beyond ±100 ppm (`AUTO_PPM_HARD_LIMIT`) are dropped individually. The rest are
   combined by median: anything over 1.5 ppm from it is an outlier (offset-carrier ATC sites are
   ±2.5–7.5 kHz, ~20–60 ppm). It holds when the survivors spread over 2 ppm, or when there are
-  more than two voters but fewer than two survivors. Then a 0.75 ppm deadband, a step limit, and
-  a clamp to ±`auto_ppm_max_ppm`.
+  more than two voters but fewer than two survivors. Then a 0.75 ppm deadband (1 ppm since item
+  48), a step limit, and a clamp to ±`auto_ppm_max_ppm`.
   **Divergence guard:** if the residual grows (by >0.25 ppm) after two consecutive steps, it
   reverts to the configured correction and trips (`disabled_reason` in status) until a
   `reload_diff` or restart.
@@ -834,8 +834,9 @@ carrier offsets and item 35's live correction. Device keys: `auto_ppm` (bool), `
   `device_auto_ppm_residual_ppm`, `device_auto_ppm_adjustment_count` (auto_ppm devices only);
   LOG_INFO per adjustment, LOG_WARNING once per clamp episode, LOG_ERR on a trip.
 - **No persistence:** each start begins from config `correction`.
-- **Decision rule hardened by item 47** (minimum voters, deadband in Hz, two-reading
-  confirmation) after prod hunting on low-band and mobile-heavy devices.
+- **Decision rule hardened by items 47 and 48** (minimum voters, deadband in Hz, two-reading
+  confirmation; same-direction divergence, lone-voter distrust, 1 ppm floor) after prod hunting
+  on low-band and mobile-heavy devices.
 - **Estimator change (affects item 43's `freq_offset_hz` too):** hardware testing showed item 43's
   power-weighted estimate, the angle of Σ z[n]·conj(z[n−1]), is badly biased on NFM. The
   FFT-bin channelizer's response is curved across a ±5 kHz-deviation signal, and weighting by
@@ -922,7 +923,7 @@ Three changes, all inside the still-pure `auto_ppm_decide()`:
 - **`auto_ppm_deadband_hz`** (default 100, 0..1000): deadband = max(0.75 ppm, Hz / median voter
   frequency). That gives 2.36 ppm at 42.44 MHz, 0.83 at 120 MHz, and the unchanged 0.75 from
   133 MHz up. 0 restores item 45's deadband. The divergence guard's growth tolerance is now
-  deadband / 3, which is 0.25 at the floor as before.
+  deadband / 3, which is 0.25 at the floor as before. (Item 48 raised the floor to 1 ppm.)
 - **Persistence (fixed, 2 readings):** an out-of-deadband residual steps only when the previous
   valid reading had the same sign **and** the contributing voters' total update count grew in
   between. Without that second condition, a stale EMA re-read 30 s later would confirm itself.
@@ -940,6 +941,40 @@ Three changes, all inside the still-pure `auto_ppm_decide()`:
   - Persistence edge cases, low-band deadband, and growth-tolerance scaling.
   - `system_tests/tests/test_auto_ppm.py` covers the parse-time rejections on an rtlsdr config,
     with no dongle needed.
+
+**48. auto_ppm: same-direction divergence, lone-voter distrust, 1 ppm floor** (`src/auto_ppm.{h,cpp}`).
+The first overnight run of item 47 on prod (2026-11-04, 10.5 h) fixed 042 and 172 (1 and 0
+adjustments with `auto_ppm_min_voters = 2`), but showed three more faults:
+- **154 tripped without diverging.** SC Fire Tac 2 (153.950) reads a steady −5048 Hz (+32.8 ppm).
+  Voting alone 4 min after start, it stepped the dongle −5 ppm; persistence didn't stop it,
+  because it's wrong the same way every time. Later the guard counted a +1 step at 03:23 and a −1
+  step at 06:31 as "two consecutive adjustments", and tripped when the first reading after the
+  second step came from Tac 2 alone.
+- **169 flipped 16 ↔ 17 ppm** four times on residuals of 0.77–0.94 ppm: a dongle drifting around
+  n + 0.5 against a 0.75 ppm floor, with a whole-ppm driver.
+- **119** (one AM airband channel) hunted between −5 and +2 ppm, alternating between tower and
+  aircraft transmitters. No rule fixes a one-channel device: auto_ppm was turned off there in
+  config.
+
+Three changes, all inside `auto_ppm_decide()`:
+- **Divergence counts only same-direction steps.** A step opposite to the previous one resets
+  `growing_steps` (new `AutoPpmState::last_step_sign`). A real sign error steps the same way
+  repeatedly while the error grows; alternating steps are hunting, which persistence handles.
+- **Lone-voter distrust after convergence.** `AutoPpmState::converged` is set by the first
+  in-deadband reading with ≥2 contributing voters. After that, an evaluation with exactly one
+  contributor and |residual| > max(5 ppm, deadband) (`LONE_VOTER_LIMIT_PPM`) holds with `"one
+  channel +N ppm off; waiting for another channel to agree"`. It has no residual and leaves
+  persistence and the pending post-step check alone. Before convergence a lone voter is trusted,
+  so a single reference (the dev-box NOAA case) still pulls in a large startup error.
+  `reset_tracking()` (enable toggle, re-arm) clears it. This wouldn't have stopped Tac 2's first
+  lone step, which came before any multi-voter agreement; `auto_ppm_min_voters = 2` (now set on
+  154) and the planned per-channel opt-out (#24) cover that.
+- **Deadband floor 0.75 → 1 ppm** (`DEADBAND_PPM`), with growth tolerance 0.33 ppm at the floor.
+  The Hz term now only widens it below 100 MHz at the default 100 Hz.
+- Status JSON gains `converged`. No new config keys, so no new `Features:` name.
+- Tests: replays of 154's trip and 169's toggling; opposite-direction steps; lone voter held after
+  convergence, trusted before it, and two agreeing channels still stepping on a large error. They
+  fail against item 47's rules. The NOAA single-reference case still converges in ≤10 evaluations.
 
 ### Do not import from `yegors`
 

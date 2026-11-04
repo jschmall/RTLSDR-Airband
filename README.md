@@ -168,9 +168,10 @@ devices: ({
 - **Hard limits.** No correction outside `auto_ppm_max_ppm` is ever set, and that limit can't
   be configured above 100 ppm. Estimates that would put the dongle more than 100 ppm off are
   treated as bad measurements. A single adjustment moves at most `auto_ppm_max_step` ppm.
-- **Small errors are left alone.** auto_ppm ignores an error under 0.75 ppm or under
-  `auto_ppm_deadband_hz` at the channels' frequency, whichever is larger. The Hz term only
-  matters below about 133 MHz: at 42 MHz the default 100 Hz is 2.4 ppm. There, ordinary
+- **Small errors are left alone.** auto_ppm ignores an error under 1 ppm or under
+  `auto_ppm_deadband_hz` at the channels' frequency, whichever is larger. The correction is a
+  whole number of ppm, so chasing less than 1 ppm only flips it between neighbours. The Hz term
+  only matters below 100 MHz: at 42 MHz the default 100 Hz is 2.4 ppm. There, ordinary
   transmitter tolerance is several ppm, and chasing it only makes the correction hunt.
 - **It waits for confirmation.** An error has to show up with the same sign in two
   evaluations in a row, the second from newer transmissions, before anything changes. So each
@@ -178,8 +179,13 @@ devices: ({
   channels must also agree (after outliers are dropped). Set it to 2 on a device whose
   channels carry many different mobiles, so no single transmitter can move the correction.
   It must be 1 in scan mode, where only the current frequency votes.
-- **It turns itself off if things get worse.** If the error grows after two adjustments in a row,
-  auto_ppm puts the configured `correction` back, stops, and logs an error. `status` then
+- **A lone channel far off is doubted once settled.** After two or more channels have agreed
+  the error is small, one channel voting on its own that wants a change of more than 5 ppm is
+  ignored until another channel agrees. That's usually a transmitter off its assigned
+  frequency. Before that point a single channel is trusted, so one good reference can still
+  correct a dongle that starts well off.
+- **It turns itself off if things get worse.** If the error grows after two adjustments in a row
+  in the same direction, auto_ppm puts the configured `correction` back, stops, and logs an error. `status` then
   shows the reason. A `reload_diff` (or restart) re-arms it.
 - **Nothing is saved.** Each start begins from the config's `correction`. Every adjustment
   is logged, e.g. `Device #0: auto_ppm correction 2 -> 4 ppm (...)`, and shown in `status`.
