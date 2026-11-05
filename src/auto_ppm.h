@@ -83,6 +83,9 @@ struct AutoPpmState {
     // Set once two or more channels agree the residual is inside the deadband. From then on a
     // channel voting alone with a large residual is held until another channel agrees.
     bool converged = false;
+    // Set by the first reading inside the deadband. From then on a residual has to clear the
+    // deadband by HYSTERESIS_FACTOR before it counts toward a step.
+    bool settled = false;
 };
 
 struct AutoPpmDecision {

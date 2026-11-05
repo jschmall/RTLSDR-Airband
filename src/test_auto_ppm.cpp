@@ -473,6 +473,54 @@ TEST_F(AutoPpmDecideTest, replay_of_lone_voter_trip_on_154) {
     EXPECT_TRUE(state.awaiting_check) << "the lone reading must not be used as the post-step check";
 }
 
+TEST_F(AutoPpmDecideTest, settled_dongle_holds_on_readings_just_past_the_deadband) {
+    // 154 on 2026-11-04/05: settled at -3, it stepped to -2 on +1.16 ppm (6 voters) and back to
+    // -3 on -1.00 an hour later: a dongle near n + 0.5, as on 169, against the 1 ppm floor.
+    vector<AutoPpmEstimate> agree = {est(154740000, 0.2), est(155580000, 0.3)};
+    ASSERT_EQ(auto_ppm_decide(-3, agree, params, &state).reason, "within deadband");
+    EXPECT_TRUE(state.settled);
+    uint32_t updates = 50;
+    for (double r : {1.16, 1.16, -1.00, -1.00, 1.24, 1.24}) {
+        updates += 10;
+        AutoPpmDecision d = auto_ppm_decide(-3, {est(154740000, r, updates), est(155580000, r, updates)}, params, &state);
+        EXPECT_EQ(d.action, AUTO_PPM_HOLD) << r;
+        EXPECT_EQ(d.reason, "within deadband (hysteresis)") << r;
+    }
+    EXPECT_EQ(state.pending_count, 0);
+}
+
+TEST_F(AutoPpmDecideTest, settled_dongle_steps_past_the_hysteresis_band) {
+    auto_ppm_decide(-3, {est(154740000, 0.2), est(155580000, 0.3)}, params, &state);
+    ASSERT_TRUE(state.settled);
+    AutoPpmDecision d = decide2(-3, {est(154740000, 1.4), est(155580000, 1.4)});
+    EXPECT_EQ(d.action, AUTO_PPM_ADJUST);
+    EXPECT_EQ(d.new_correction, -2);
+
+    // Still settled after the step, so drifting back by just over a ppm doesn't undo it.
+    d = decide2(-2, {est(154740000, -1.1), est(155580000, -1.1)});
+    EXPECT_EQ(d.action, AUTO_PPM_HOLD);
+}
+
+TEST_F(AutoPpmDecideTest, hysteresis_applies_only_once_settled) {
+    EXPECT_FALSE(state.settled);
+    AutoPpmDecision d = decide2(0, {est(162550000, 1.1)});
+    EXPECT_EQ(d.action, AUTO_PPM_ADJUST);
+    EXPECT_EQ(d.new_correction, 1);
+}
+
+TEST_F(AutoPpmDecideTest, hysteresis_band_scales_with_the_low_band_deadband) {
+    // 042 on 2026-11-04/05: two steps 12 h apart on -2.64 and +2.55 ppm against a 2.36 ppm
+    // deadband. Settled, it now needs 2.95.
+    auto_ppm_decide(1, {est(42440000, 0.3), est(42900000, 0.4)}, params, &state);
+    ASSERT_TRUE(state.settled);
+    uint32_t updates = 50;
+    for (double r : {-2.64, -2.64, 2.55, 2.55}) {
+        updates += 10;
+        EXPECT_EQ(auto_ppm_decide(1, {est(42440000, r, updates), est(42900000, r, updates)}, params, &state).action, AUTO_PPM_HOLD) << r;
+    }
+    EXPECT_EQ(decide2(1, {est(42440000, 3.2), est(42900000, 3.2)}).action, AUTO_PPM_ADJUST);
+}
+
 class AutoPpmParamsTest : public TestBaseClass {
    protected:
     bool parse(const char* text, AutoPpmParams* out, string* error) {
@@ -769,6 +817,7 @@ TEST_F(AutoPpmTickTest, status_json) {
     EXPECT_NE(json.find("\"deadband_ppm\":1.00"), string::npos) << json;
     EXPECT_NE(json.find("\"pending_count\":0"), string::npos) << json;
     EXPECT_NE(json.find("\"converged\":false"), string::npos) << json;
+    EXPECT_NE(json.find("\"settled\":false"), string::npos) << json;
 
     dev.auto_ppm = nullptr;
     EXPECT_EQ(auto_ppm_status_json(&dev, now), "null");

@@ -53,6 +53,10 @@ const int PERSIST_EVALS = 2;
 // Once converged, a lone channel further off than this is more likely a transmitter off its
 // assigned frequency than the dongle drifting (prod 154: a channel steadily -5 kHz, 33 ppm).
 const double LONE_VOTER_LIMIT_PPM = 5.0;
+// Once settled, a residual must exceed the deadband by this factor to count toward a step. At the
+// 1 ppm floor a dongle near n + 0.5 still stepped n -> n + 1 -> n about once an hour on readings
+// of 1.0-1.2 ppm (prod 154, 2026-11-04).
+const double HYSTERESIS_FACTOR = 1.25;
 
 struct Vote {
     double residual_ppm;
@@ -127,6 +131,7 @@ void reset_tracking(auto_ppm_device* ap) {
     ap->state.pending_updates = 0;
     ap->state.last_step_sign = 0;
     ap->state.converged = false;
+    ap->state.settled = false;
     ap->clamp_warned = false;
     ap->next_eval = 0.0;
 }
@@ -234,13 +239,15 @@ AutoPpmDecision auto_ppm_decide(int current_correction, const vector<AutoPpmEsti
         }
     }
 
-    if (fabs(residual) < deadband) {
+    double const step_threshold = state->settled ? deadband * HYSTERESIS_FACTOR : deadband;
+    if (fabs(residual) < step_threshold) {
         if (d.contributing >= 2) {
             state->converged = true;
         }
+        state->settled = true;
         state->pending_sign = 0;
         state->pending_count = 0;
-        d.reason = "within deadband";
+        d.reason = fabs(residual) < deadband ? "within deadband" : "within deadband (hysteresis)";
         return d;
     }
     long const target = lround((double)current_correction + residual);
@@ -437,6 +444,7 @@ string auto_ppm_status_json(device_t* dev, double now) {
     out += ",\"deadband_ppm\":" + (have && ap->last.residual_valid ? json_fixed(ap->last.deadband_ppm, "%.2f") : string("null"));
     out += ",\"pending_count\":" + to_string(ap->state.pending_count);
     out += string(",\"converged\":") + (ap->state.converged ? "true" : "false");
+    out += string(",\"settled\":") + (ap->state.settled ? "true" : "false");
     return out + "}";
 }
 

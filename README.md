@@ -174,6 +174,9 @@ devices: ({
   whole number of ppm, so chasing less than 1 ppm only flips it between neighbours. The Hz term
   only matters below 100 MHz: at 42 MHz the default 100 Hz is 2.4 ppm. There, ordinary
   transmitter tolerance is several ppm, and chasing it only makes the correction hunt.
+  Once an error has been inside that band, it has to grow 25% past it (1.25 ppm at the floor)
+  before auto_ppm acts again, so a dongle sitting halfway between two whole-ppm values doesn't
+  flip between them.
 - **It waits for confirmation.** An error has to show up with the same sign in two
   evaluations in a row, the second from newer transmissions, before anything changes. So each
   step takes at least two `auto_ppm_interval`s. With `auto_ppm_min_voters` above 1, that many

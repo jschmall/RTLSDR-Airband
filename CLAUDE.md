@@ -1013,6 +1013,23 @@ Three changes, all inside `auto_ppm_decide()`:
   convergence, trusted before it, and two agreeing channels still stepping on a large error. They
   fail against item 47's rules. The NOAA single-reference case still converges in ≤10 evaluations.
 
+**50. auto_ppm: hysteresis on the deadband** (`src/auto_ppm.{h,cpp}`). The first night on item 48
+(2026-11-04/05, 23.5 h) had no trips, but two pairs of steps that cancelled out:
+- 154 stepped −3 → −2 on +1.16 ppm (6/8 voters) and back to −3 an hour later on −1.00. The check
+  was `fabs(residual) < deadband`, so exactly 1.00 counted as outside it.
+- 042 stepped 1 → −2 and back 12 h apart, on −2.64 and +2.55 against a 2.36 ppm deadband.
+
+Both are a dongle sitting near n + 0.5 ppm with a driver that only takes whole ppm, as on 169
+(item 48). `AutoPpmState::settled` is set by the first reading inside the deadband. From then on a
+residual must reach deadband × 1.25 (`HYSTERESIS_FACTOR`: 1.25 ppm at the floor, 2.95 at 42 MHz)
+before persistence counts it. Readings in between hold as `"within deadband (hysteresis)"` and
+reset persistence like any in-deadband reading. A step doesn't clear `settled`, so a reading just
+over the deadband the other way doesn't undo it. Before the first in-deadband reading, the
+deadband alone decides, so startup convergence is unchanged. `reset_tracking()` clears it, and
+status JSON gains `settled`. The cost is that a sustained error between 1 and 1.25 ppm (about
+200 Hz at 160 MHz) is left alone. Tests replay both prod pairs, check that a settled device still
+steps past the band, and that the hysteresis only applies once settled.
+
 ### Do not import from `yegors`
 
 The `yegors` fork also contains SRT output support and its own UDP path. The UDP path there is

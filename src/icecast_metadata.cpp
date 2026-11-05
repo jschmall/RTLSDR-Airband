@@ -107,8 +107,7 @@ shout_t* make_metadata_shout(const IcecastMetaTarget& t) {
         return NULL;
     }
     bool ok = shout_set_host(s, t.host.c_str()) == SHOUTERR_SUCCESS && shout_set_protocol(s, SHOUT_PROTOCOL_HTTP) == SHOUTERR_SUCCESS && shout_set_port(s, t.port) == SHOUTERR_SUCCESS &&
-              shout_set_mount(s, t.mount.c_str()) == SHOUTERR_SUCCESS && shout_set_user(s, t.username.c_str()) == SHOUTERR_SUCCESS &&
-              shout_set_password(s, t.password.c_str()) == SHOUTERR_SUCCESS;
+              shout_set_mount(s, t.mount.c_str()) == SHOUTERR_SUCCESS && shout_set_user(s, t.username.c_str()) == SHOUTERR_SUCCESS && shout_set_password(s, t.password.c_str()) == SHOUTERR_SUCCESS;
 #ifdef LIBSHOUT_HAS_TLS
     ok = ok && shout_set_tls(s, t.tls_mode) == SHOUTERR_SUCCESS;
 #endif /* LIBSHOUT_HAS_TLS */
