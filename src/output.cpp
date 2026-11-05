@@ -44,11 +44,15 @@
 #include <syslog.h>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include "auto_ppm.h"
 #include "config.h"
 #include "helper_functions.h"
@@ -1557,23 +1561,16 @@ static void output_rdio_scanner_health(FILE* f) {
 }
 #endif /* WITH_RDIO_SCANNER */
 
-void write_stats_file(timeval* last_stats_write) {
-    if (!stats_filepath) {
-        return;
-    }
-
-    timeval current_time;
-    gettimeofday(&current_time, NULL);
-
-    if (!do_exit && delta_sec(last_stats_write, &current_time) < stats_update_interval) {
-        return;
-    }
-
-    *last_stats_write = current_time;
-
-    FILE* file = fopen(stats_filepath, "w");
+// The text is built in memory first. Reading channel and device state then takes a bounded
+// time, which the grace period of reclaim_pending_channel_frees() (live_reconfig.cpp) relies on.
+// Only the file write afterwards can block, e.g. for the ~12 s a nightly VM backup freezes the
+// filesystem.
+static void write_stats_file() {
+    char* text = NULL;
+    size_t text_len = 0;
+    FILE* file = open_memstream(&text, &text_len);
     if (!file) {
-        log(LOG_WARNING, "Cannot open output file %s (%s)\n", stats_filepath, strerror(errno));
+        log(LOG_WARNING, "Cannot build stats (%s)\n", strerror(errno));
         return;
     }
 
@@ -1611,7 +1608,61 @@ void write_stats_file(timeval* last_stats_write) {
     output_rdio_scanner_health(file);
 #endif /* WITH_RDIO_SCANNER */
 
-    fclose(file);
+    if (fclose(file) != 0) {
+        free(text);
+        return;
+    }
+    FILE* out = fopen(stats_filepath, "w");
+    if (!out) {
+        log(LOG_WARNING, "Cannot open output file %s (%s)\n", stats_filepath, strerror(errno));
+    } else {
+        fwrite(text, 1, text_len, out);
+        fclose(out);
+    }
+    free(text);
+}
+
+// The stats file used to be written from the output thread, so a slow write stalled every
+// output on the instance (prod, 2026-11-05: ~12 s of audio lost on all 12 instances during the
+// backup's filesystem freeze). It now has a thread of its own.
+namespace {
+std::mutex stats_mutex;
+std::condition_variable stats_cv;
+bool stats_stop = false;
+std::thread stats_worker;
+
+void stats_thread_main() {
+    using clock = std::chrono::steady_clock;
+    auto const interval = std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(stats_update_interval));
+    std::unique_lock<std::mutex> lock(stats_mutex);
+    while (!stats_stop) {
+        auto const next = clock::now() + interval;
+        lock.unlock();
+        write_stats_file();
+        lock.lock();
+        stats_cv.wait_until(lock, next, [] { return stats_stop; });
+    }
+}
+}  // namespace
+
+void stats_writer_start() {
+    if (stats_filepath) {
+        stats_worker = std::thread(stats_thread_main);
+    }
+}
+
+void stats_writer_shutdown() {
+    if (!stats_worker.joinable()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex);
+        stats_stop = true;
+    }
+    stats_cv.notify_all();
+    stats_worker.join();
+    // Final write, after the output threads have flushed, so the counters cover all output.
+    write_stats_file();
 }
 
 // send_tx_tags content for a device channel: on-air label (or frequency fallback) while
@@ -1651,7 +1702,6 @@ void* output_thread(void* param) {
     struct freq_tag tag;
     struct timeval tv;
     int new_freq = -1;
-    timeval last_stats_write = {0, 0};
 
     debug_print("Starting output thread, devices %d:%d, mixers %d:%d, signal %p\n", output_param->device_start, output_param->device_end, output_param->mixer_start, output_param->mixer_end,
                 output_param->mp3_signal);
@@ -1735,9 +1785,6 @@ void* output_thread(void* param) {
             // in multichannel mode
             new_freq = -1;
         }
-        if (output_param->device_start == 0) {
-            write_stats_file(&last_stats_write);
-        }
         // Frees whatever channel_teardown_for_removal() (live_reconfig.cpp) queued at least
         // RECLAIM_GRACE_PERIOD_SEC ago - see that function's comment for why the actual free is
         // deferred this long instead of running inline during teardown. Cheap no-op on every pass
@@ -1758,13 +1805,6 @@ void* output_thread(void* param) {
             memcpy(channel->waveout, channel->waveout + WAVE_BATCH, AGC_EXTRA * sizeof(float));
         }
         dev->waveavail = 0;
-    }
-
-    // Final stats flush: do_exit=1 bypasses the stats_update_interval throttle, so this always
-    // writes regardless of run duration. Called after the post-loop flush above
-    // so counters reflect all processed output.
-    if (output_param->device_start == 0) {
-        write_stats_file(&last_stats_write);
     }
 
     return 0;

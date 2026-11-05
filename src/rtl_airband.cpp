@@ -1282,6 +1282,7 @@ int main(int argc, char* argv[]) {
     rdio_scanner_start();
 #endif /* WITH_RDIO_SCANNER */
 
+    stats_writer_start();
     stats_http_start();
 
     icecast_metadata_start();
@@ -1332,6 +1333,7 @@ int main(int argc, char* argv[]) {
         output_params[i].mp3_signal->send();
         pthread_join(output_threads[i], NULL);
     }
+    stats_writer_shutdown();
 
     for (int i = 0; i < device_count; i++) {
         device_t* dev = devices + i;

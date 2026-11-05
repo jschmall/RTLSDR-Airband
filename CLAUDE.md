@@ -674,12 +674,14 @@ loop iterates `channel->freqlist` with no `enabled` check at all, every `stats_u
   freeing them immediately — a slot reused by a later `parse_channel()` call just overwrites the
   pointers with fresh ones, the old values already safely captured. Anything past
   `reclaim_grace_period_sec` (30s in production) gets actually freed. The safety margin is set
-  by how long one `write_stats_file()` call runs (well under a second), not by the stats cycle,
-  so a `stats_update_interval` (upstream #579) above 15s doesn't weaken it. `lame`/`lamebuf` are unaffected — those still free immediately,
+  by how long one `write_stats_file()` call spends reading this state (well under a second), not
+  by the stats cycle, so a `stats_update_interval` (upstream #579) above 15s doesn't weaken it.
+  Since item 51 that reading happens in memory, before the file write that can block. `lame`/`lamebuf` are unaffected — those still free immediately,
   since neither reader ever touches them.
 - `free_output_data()` mirrors, in reverse, every heap allocation `parse_outputs()` makes per
-  output type — `icecast_data`/`udp_stream_data`/`pulse_data` are `XCALLOC`'d with `strdup()`'d
-  string fields (`free()`); `file_data` (and nested `rdio_scanner_data`) are `new`'d with
+  output type — `udp_stream_data`/`pulse_data` are `XCALLOC`'d with `strdup()`'d
+  string fields (`free()`); `icecast_data` is `new`'d with `strdup()`'d strings (`delete`, since
+  item 49 — item 26 had changed it to `new` and this was still `free()`); `file_data` (and nested `rdio_scanner_data`) are `new`'d with
   `std::string` members (`delete`, not `free()` — a mismatch here would itself be the
   heap-corruption bug this fix exists to prevent); `mixer_data` owns no nested pointers.
 - Confirmed clean under ASan/UBSan **with LeakSanitizer specifically enabled** for these two
@@ -1029,6 +1031,31 @@ deadband alone decides, so startup convergence is unchanged. `reset_tracking()` 
 status JSON gains `settled`. The cost is that a sustained error between 1 and 1.25 ppm (about
 200 Hz at 160 MHz) is left alone. Tests replay both prod pairs, check that a settled device still
 steps past the band, and that the hysteresis only applies once settled.
+
+#### Output thread isolation
+
+**51. The stats file is written from its own thread** (`src/output.cpp`, `src/rtl_airband.{h,cpp}`).
+`write_stats_file()` ran on the output thread (the one owning device 0), so a stats write that
+blocked stalled every output on the instance. On prod (2026-11-05) the nightly VM backup calls
+qemu-ga `guest-fsfreeze` at ~01:07 PST. The VM's ext4 freezes for ~12 s, the stats `fopen()`/write
+blocks, and all 12 instances lose ~12 s of audio together: 48–149 output overruns each, 1158 in one
+minute. The disk itself was 1–4% busy, so it was never contention. Recordings go to NFS, which
+the freeze doesn't touch.
+- `stats_writer_start()` (called from `main()` after the output threads start) runs a thread that
+  writes immediately, then every `stats_update_interval`. It waits on a condition variable, so
+  shutdown is prompt. `stats_writer_shutdown()` runs after the output threads are joined and
+  writes once more, so the final counters cover all output, as the old post-loop write did.
+- The text is built with `open_memstream()` and written to `stats_filepath` only afterwards. The
+  part that reads channel and device state therefore stays bounded, which item 41's reclaim grace
+  period relies on. Only the file write can block.
+- File semantics are unchanged: same path, truncated and rewritten in place.
+- Not unit tested: `output.cpp` isn't linked into `unittests` (item 20).
+  `system_tests/tests/test_stats_writer_stall.py` points `stats_filepath` at a FIFO with no reader
+  for 5 s, so `fopen()` blocks the way a frozen filesystem does. Over a 10 s transmission the old
+  binary recorded 6.3 s, and this one records all of it. `test_stats_update_interval.py` still
+  passes.
+- The freeze still blocks anything else that writes to local disk. On prod that is only the stats
+  thread and logging. The output threads write recordings to NFS and the network.
 
 ### Do not import from `yegors`
 

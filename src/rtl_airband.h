@@ -707,6 +707,9 @@ void disable_device_outputs(device_t* dev);
 void disable_channel_outputs(channel_t* channel, bool permanent = false);
 void* output_check_thread(void* params);
 void* output_thread(void* params);
+void stats_writer_start();
+// Stops the stats thread and writes the file once more. Call after the output threads have exited.
+void stats_writer_shutdown();
 
 // rtl_airband.cpp
 extern bool use_localtime;
