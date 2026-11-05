@@ -3191,9 +3191,9 @@ TEST_F(ReclaimPendingChannelFreesTest, frees_every_non_mixer_output_type_without
     channel.outputs = (output_t*)XCALLOC(kOutputCount, sizeof(output_t));
     int idx = 0;
 
-    // O_ICECAST - every string field strdup'd (config.cpp).
+    // O_ICECAST - new'd, every string field strdup'd (config.cpp).
     channel.outputs[idx].type = O_ICECAST;
-    icecast_data* idata = (icecast_data*)XCALLOC(1, sizeof(icecast_data));
+    icecast_data* idata = new icecast_data();
     idata->hostname = strdup("icecast.example.com");
     idata->username = strdup("source");
     idata->password = strdup("hunter2");
@@ -3201,6 +3201,7 @@ TEST_F(ReclaimPendingChannelFreesTest, frees_every_non_mixer_output_type_without
     idata->name = strdup("Test Stream");
     idata->genre = strdup("Scanner");
     idata->description = strdup("A test stream");
+    idata->meta = icecast_metadata_target_new(idata);
     channel.outputs[idx].data = idata;
     idx++;
 

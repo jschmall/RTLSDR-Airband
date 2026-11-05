@@ -31,6 +31,7 @@
 #include <complex>
 #include <cstdio>
 #include <libconfig.h++>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,6 +50,7 @@
 #endif /* WITH_PULSEAUDIO */
 
 #include "filters.h"
+#include "icecast_metadata.h"
 #include "input-common.h"  // input_t
 #include "logging.h"
 #include "squelch.h"
@@ -165,8 +167,9 @@ struct icecast_data {
     // a subset of disconnect_count, called out separately since it means the local
     // encode rate outpaced what Icecast could drain, not a network-level failure
     size_t backlog_exceeded_count;
-    // number of times a send_tx_tags metadata update was successfully applied
-    size_t tx_tag_update_count;
+    // Metadata updates go through a background worker (icecast_metadata.h). Null unless
+    // send_tx_tags or send_scan_freq_tags is set.
+    std::shared_ptr<IcecastMetaTarget> meta;
 };
 
 #ifdef WITH_RDIO_SCANNER

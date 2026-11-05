@@ -143,8 +143,8 @@ namespace {
 void free_output_data(output_t* output) {
     switch (output->type) {
         case O_ICECAST: {
-            // XCALLOC'd (config.cpp) - every string field is strdup()'d individually, plain
-            // free() is correct. shout/shout_free() already ran in disable_channel_outputs().
+            // new'd (config.cpp), with every string field strdup()'d. shout/shout_free() already
+            // ran in disable_channel_outputs(). delete releases the metadata target too.
             icecast_data* d = (icecast_data*)output->data;
             free(const_cast<char*>(d->hostname));
             free(const_cast<char*>(d->username));
@@ -153,7 +153,7 @@ void free_output_data(output_t* output) {
             free(const_cast<char*>(d->name));
             free(const_cast<char*>(d->genre));
             free(const_cast<char*>(d->description));
-            free(d);
+            delete d;
             break;
         }
         case O_FILE:

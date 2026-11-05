@@ -29,7 +29,8 @@ input (below), and `v5.3.0` introduced live reconfiguration and `send_tx_tags` s
   source channel is currently talking) configured `label` as the Icecast "song" tag when a
   transmission starts, and clear it when squelch closes — an on-air indicator for plain
   (non-scanning) channels and mixers. Complements the existing `send_scan_freq_tags`, which
-  only applies in scan mode.
+  only applies in scan mode. Updates for both are sent from a background thread, so a slow
+  Icecast server never holds up the audio.
 - **Configurable `udp_stream` output** — choose the bit depth (32/16/8-bit PCM) and
   sample rate sent over UDP, to match what a downstream consumer like trunk-recorder
   expects.
@@ -304,7 +305,9 @@ rather than just knowing that it is.
 |---|---|
 | `icecast_disconnect_count` | Icecast output's connection was lost (network error, exceeded send backlog, or the owning device failing) and had to be reconnected. |
 | `icecast_backlog_exceeded_count` | Subset of the above — specifically caused by the local encode rate outpacing what Icecast could drain. |
-| `icecast_tx_tag_update_count` | Number of times a `send_tx_tags` metadata update (on-air label set/cleared) was successfully applied. |
+| `icecast_tx_tag_update_count` | Number of times a `send_tx_tags` or `send_scan_freq_tags` metadata update (on-air label set/cleared) was successfully applied. |
+| `icecast_metadata_failure_count` | A metadata update the Icecast server didn't accept, or that never reached it. Audio is unaffected. |
+| `icecast_metadata_superseded_count` | A metadata update replaced by a newer one before it was sent, e.g. a transmission that ended while its start tag was still queued. |
 | `lame_encode_failure_count` | `lame_encode_buffer_ieee_float()` returned an error, for any output that encodes mp3 (icecast, file). |
 | `file_write_failure_count` | Short/failed `fwrite()` on a file or rawfile output; the output is disabled immediately after, so this should stay at 0 on a healthy instance. |
 | `udp_stream_dropped_packet_count` | A `udp_stream` packet was dropped by a bounds check (length/buffer-size mismatch) instead of overrunning a buffer. |

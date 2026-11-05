@@ -658,37 +658,19 @@ void process_outputs(channel_t* channel, int cur_scan_freq, const std::string& t
                 shout_free(icecast->shout);
                 icecast->shout = NULL;
             } else if (icecast->send_scan_freq_tags && cur_scan_freq >= 0) {
-                shout_metadata_t* meta = shout_metadata_new();
-                char description[32];
                 if (channel->freqlist[channel->freq_idx].label != NULL) {
-                    if (shout_metadata_add(meta, "song", channel->freqlist[channel->freq_idx].label) != SHOUTERR_SUCCESS) {
-                        log(LOG_WARNING, "Failed to add shout metadata\n");
-                    }
+                    icecast_metadata_submit(icecast->meta, channel->freqlist[channel->freq_idx].label);
                 } else {
+                    char description[32];
                     snprintf(description, sizeof(description), "%.3f MHz", channel->freqlist[channel->freq_idx].frequency / 1000000.0);
-                    if (shout_metadata_add(meta, "song", description) != SHOUTERR_SUCCESS) {
-                        log(LOG_WARNING, "Failed to add shout metadata\n");
-                    }
+                    icecast_metadata_submit(icecast->meta, description);
                 }
-                if (SHOUT_SET_METADATA(icecast->shout, meta) != SHOUTERR_SUCCESS) {
-                    log(LOG_WARNING, "Failed to add shout metadata\n");
-                }
-                shout_metadata_free(meta);
             } else if (icecast->send_tx_tags) {
                 struct timeval now;
                 gettimeofday(&now, NULL);
                 std::string out_value;
                 if (icecast_tx_tag_step(&icecast->tx_tag_state, tx_tag, now, shout_metadata_delay, &out_value)) {
-                    shout_metadata_t* meta = shout_metadata_new();
-                    if (shout_metadata_add(meta, "song", out_value.c_str()) != SHOUTERR_SUCCESS) {
-                        log(LOG_WARNING, "Failed to add shout metadata\n");
-                    }
-                    if (SHOUT_SET_METADATA(icecast->shout, meta) != SHOUTERR_SUCCESS) {
-                        log(LOG_WARNING, "Failed to set shout metadata\n");
-                    } else {
-                        icecast->tx_tag_update_count++;
-                    }
-                    shout_metadata_free(meta);
+                    icecast_metadata_submit(icecast->meta, out_value);
                 }
             }
         } else if (channel->outputs[k].type == O_FILE || channel->outputs[k].type == O_RAWFILE) {
@@ -1269,32 +1251,44 @@ static void output_icecast_health(FILE* f) {
     }
     fprintf(f, "\n");
 
-    fprintf(f,
-            "# HELP icecast_tx_tag_update_count Number of times a send_tx_tags metadata update "
-            "(on-air label set on transmission start, cleared on transmission end) was successfully applied.\n"
-            "# TYPE icecast_tx_tag_update_count counter\n");
-    for (int i = 0; i < device_count; i++) {
-        device_t* dev = devices + i;
-        for (int j = 0; j < dev->channel_count; j++) {
-            channel_t* channel = dev->channels + j;
-            for (int k = 0; k < channel->output_count; k++) {
-                if (channel->outputs[k].type != O_ICECAST)
-                    continue;
-                icecast_data* icecast = (icecast_data*)channel->outputs[k].data;
-                fprintf(f, "icecast_tx_tag_update_count{device=\"%d\",channel=\"%d\",output=\"%d\"}\t%zu\n", i, j, k, icecast->tx_tag_update_count);
+    // Counted by the metadata worker. Outputs without send_tx_tags/send_scan_freq_tags report 0.
+    struct MetaCounter {
+        const char* name;
+        const char* help;
+        std::atomic<size_t> IcecastMetaTarget::* field;
+    };
+    const MetaCounter meta_counters[] = {
+        {"icecast_tx_tag_update_count",
+         "Number of times a send_tx_tags or send_scan_freq_tags metadata update (on-air label set on transmission start, cleared on transmission end) was successfully applied.",
+         &IcecastMetaTarget::update_count},
+        {"icecast_metadata_failure_count", "Number of metadata updates the Icecast server didn't accept, or that failed to reach it.", &IcecastMetaTarget::failure_count},
+        {"icecast_metadata_superseded_count", "Number of metadata updates replaced by a newer one before they were sent.", &IcecastMetaTarget::superseded_count},
+    };
+    for (const MetaCounter& c : meta_counters) {
+        fprintf(f, "# HELP %s %s\n# TYPE %s counter\n", c.name, c.help, c.name);
+        for (int i = 0; i < device_count; i++) {
+            device_t* dev = devices + i;
+            for (int j = 0; j < dev->channel_count; j++) {
+                channel_t* channel = dev->channels + j;
+                for (int k = 0; k < channel->output_count; k++) {
+                    if (channel->outputs[k].type != O_ICECAST)
+                        continue;
+                    icecast_data* icecast = (icecast_data*)channel->outputs[k].data;
+                    fprintf(f, "%s{device=\"%d\",channel=\"%d\",output=\"%d\"}\t%zu\n", c.name, i, j, k, icecast->meta ? ((*icecast->meta).*c.field).load() : (size_t)0);
+                }
             }
         }
-    }
-    for (int i = 0; i < mixer_count; i++) {
-        mixer_t* mixer = mixers + i;
-        for (int k = 0; k < mixer->channel.output_count; k++) {
-            if (mixer->channel.outputs[k].type != O_ICECAST)
-                continue;
-            icecast_data* icecast = (icecast_data*)mixer->channel.outputs[k].data;
-            fprintf(f, "icecast_tx_tag_update_count{mixer=\"%d\",output=\"%d\"}\t%zu\n", i, k, icecast->tx_tag_update_count);
+        for (int i = 0; i < mixer_count; i++) {
+            mixer_t* mixer = mixers + i;
+            for (int k = 0; k < mixer->channel.output_count; k++) {
+                if (mixer->channel.outputs[k].type != O_ICECAST)
+                    continue;
+                icecast_data* icecast = (icecast_data*)mixer->channel.outputs[k].data;
+                fprintf(f, "%s{mixer=\"%d\",output=\"%d\"}\t%zu\n", c.name, i, k, icecast->meta ? ((*icecast->meta).*c.field).load() : (size_t)0);
+            }
         }
+        fprintf(f, "\n");
     }
-    fprintf(f, "\n");
 }
 
 static void output_lame_encode_failures(FILE* f) {

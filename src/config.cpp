@@ -178,6 +178,9 @@ static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, in
                 output_error(i, j, o, parsing_mixers, "tls is not supported: rtl_airband was built against a libshout without TLS support");
 #endif /* LIBSHOUT_HAS_TLS */
             }
+            if (idata->send_tx_tags || idata->send_scan_freq_tags) {
+                idata->meta = icecast_metadata_target_new(idata);
+            }
 
             channel->outputs[oo].has_mp3_output = true;
         } else if (!strncmp(outs[o]["type"], "file", 4)) {

@@ -217,3 +217,71 @@ def test_icecast_tx_tags_mixer(
         "Channel B never transmitted in this fixture - it must never appear "
         "as a tag value"
     )
+
+
+def _mixer_output_overruns(stats_path: Path) -> int:
+    for line in stats_path.read_text().splitlines():
+        if line.startswith('output_overrun_count{mixer="0"}'):
+            return int(line.split()[-1])
+    raise AssertionError(f"no mixer output_overrun_count in {stats_path}")
+
+
+def test_slow_metadata_server_does_not_stall_mixer_audio(
+    binary_under_test: BinaryUnderTest,
+    test_output_dir: Path,
+    cache_dir: Path,
+) -> None:
+    """A metadata request that takes a second must not hold up the mixer's audio.
+
+    In production each update took ~350 ms (DNS lookup, connect, HTTP round trip) and ran on the
+    output thread, dropping 2-3 mixed batches at every transmission start and end. Runs in real
+    time whatever the test mode: the mixer is paced by the wall clock, so a sped-up replay overruns
+    it regardless.
+    """
+    iq_file = iq_generator.get_or_generate_am(
+        offset_hz=CHANNEL_OFFSET_HZ,
+        audio_hz=AUDIO_TONE_HZ,
+        duration_s=DURATION_S,
+        cache_dir=cache_dir,
+    )
+
+    config_path = test_output_dir / "rtl_airband.conf"
+    stats_path = test_output_dir / "stats.txt"
+
+    with FakeIcecastServer(metadata_delay_s=1.0) as server:
+        config_writer.write_config(
+            config_path=config_path,
+            iq_filepath=iq_file,
+            sample_rate=SAMPLE_RATE,
+            centerfreq_hz=CENTERFREQ_HZ,
+            channels=[
+                {
+                    "freq_hz": CENTERFREQ_HZ + CHANNEL_OFFSET_HZ,
+                    "label": LABEL,
+                    "mixer_output": {"name": "mix1", "balance": 0.0},
+                },
+            ],
+            mixers=[
+                {
+                    "name": "mix1",
+                    "label": "mix1_output",
+                    "extra_output_blocks": [_icecast_block(server.port, MOUNTPOINT)],
+                }
+            ],
+            output_dir=test_output_dir,
+            speedup_factor=1.0,
+            mode="multichannel",
+            stats_filepath=stats_path,
+            shout_metadata_delay=0,
+        )
+
+        run_rtl_airband(binary_under_test.path, config_path, timeout_s=TIMEOUT_S)
+
+        songs = [
+            u.song for u in sorted(server.metadata_updates, key=lambda u: u.received_at)
+        ]
+
+    assert LABEL in songs, f"Expected the label to reach the server, got: {songs}"
+    # Blocking on the 1 s reply costs about 8 batches per update.
+    overruns = _mixer_output_overruns(stats_path)
+    assert overruns <= 2, f"mixer output overran {overruns} times"

@@ -67,7 +67,9 @@ class MetadataUpdate:
 class FakeIcecastServer:
     """Context manager wrapping a background fake Icecast source server."""
 
-    def __init__(self) -> None:
+    def __init__(self, metadata_delay_s: float = 0.0) -> None:
+        # How long to wait before answering a metadata request, like a slow remote server.
+        self._metadata_delay_s = metadata_delay_s
         self._listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listen_sock.bind(("127.0.0.1", 0))
@@ -158,6 +160,8 @@ class FakeIcecastServer:
             self.metadata_updates.append(
                 MetadataUpdate(mount=mount, song=song, received_at=time.monotonic())
             )
+        if self._metadata_delay_s:
+            time.sleep(self._metadata_delay_s)
         conn.sendall(
             b"HTTP/1.0 200 OK\r\n"
             b"Content-Type: text/xml\r\n"

@@ -299,6 +299,7 @@ add_library (rtl_airband_base OBJECT
 	logging.cpp
 	filters.cpp
 	helper_functions.cpp
+	icecast_metadata.cpp
 	stats_http.cpp
 	${CMAKE_CURRENT_BINARY_DIR}/version.cpp
 	${rtl_airband_extra_sources}
@@ -369,6 +370,7 @@ if(BUILD_UNITTESTS)
 		ctcss.cpp
 		generate_signal.cpp
 		helper_functions.cpp
+		icecast_metadata.cpp
 		udp_stream.cpp
 		util.cpp
 		mixer.cpp

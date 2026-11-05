@@ -192,6 +192,43 @@ reader now exists, potentially on a different output thread). System-tested agai
 Keep-Alive` echoed back to stream at all, and it always opens a second, independent `GET
 /admin/metadata?...` connection for metadata regardless of the first request's outcome — the
 fixture now accepts multiple concurrent connections instead of one blocking `accept()`.
+Item 49 moved the metadata request itself off the output thread.
+
+**49. Icecast metadata updates sent from a background thread** (`src/icecast_metadata.{h,cpp}`,
+new; `src/output.cpp`, `src/config.cpp`, `src/rtl_airband.{h,cpp}`, `src/live_reconfig.cpp`).
+The mixer output overruns that were still open after item 46 (042 ~73/h, 151 ~103/h, more by day)
+came from `send_tx_tags`.
+- **Found by measuring prod** (observe-only bpftrace, 2026-11-05). Each metadata update on the
+  mixer's output thread did a DNS lookup (musl doesn't cache), a new TCP connection to
+  Broadcastify's `/admin/metadata`, and libshout's `select()` loop at 1 ms until the reply came:
+  ~350 ms per update. The mixer thread counts an overrun once a batch has waited ~125 ms, so
+  every transmission start and end dropped 2–3 batches of the mixed feed. `send_scan_freq_tags`
+  had the same blocking call.
+- **The fix.** `process_outputs()` now only queues the value (`icecast_metadata_submit()`). One
+  worker thread sends it. Each output holds a `std::shared_ptr<IcecastMetaTarget>` (created at
+  parse time when either tag option is set) with a copy of the connection settings. The worker
+  uses its own never-opened `shout_t` per target, never the output's streaming one, so the two
+  threads share no libshout object. libshout 2.4.6's `shout_set_metadata()` builds its own
+  connection from the `shout_t`'s settings. Its stray `shout_connection_set_callback(self->connection, ...)`
+  returns early on a NULL connection. The copy also means a live channel removal can free
+  `icecast_data` while a request is in flight.
+- **Coalescing.** At most one pending value per target. A newer value replaces a waiting one
+  (counted in `icecast_metadata_superseded_count`), since only the latest tag matters.
+- **Shutdown** waits 2 s for an in-flight request, then detaches the worker (logged). A request
+  to an unreachable server can block for a TCP connect timeout, and that shouldn't hold up a
+  restart. The queue is heap-allocated and never freed, so a detached worker can't touch
+  destroyed statics while the process exits.
+- **Metrics.** `icecast_tx_tag_update_count` (name kept) now counts `send_scan_freq_tags` updates
+  too. New `icecast_metadata_failure_count` and `icecast_metadata_superseded_count`.
+- **Side fix.** Item 26 changed `icecast_data` to `new` (it gained a `std::string`), but
+  `free_output_data()` (item 41) still released it with `free()`, so every live removal or edit
+  of a channel with an Icecast output was a new/free mismatch. It now uses `delete`, as does the
+  test fixture that copied the old pattern.
+- **Tests.** `src/test_icecast_metadata.cpp` (queue order, coalescing, a value submitted mid-send
+  is queued again, shutdown, target lifetime, settings copied). In
+  `system_tests/tests/test_icecast_tx_tags.py`, a mixer with `send_tx_tags` runs in real time
+  against `fake_icecast_server.py` answering metadata after 1 s. The old code overran the mixer
+  21 times; the fix stays at ≤ 2.
 
 #### Observability / metrics
 

@@ -1284,6 +1284,8 @@ int main(int argc, char* argv[]) {
 
     stats_http_start();
 
+    icecast_metadata_start();
+
     auto_ppm_start();
 
     if (control_socket_path) {
@@ -1353,6 +1355,8 @@ int main(int argc, char* argv[]) {
     log(LOG_INFO, "Closing rdio_scanner upload queue\n");
     rdio_scanner_shutdown();
 #endif /* WITH_RDIO_SCANNER */
+
+    icecast_metadata_shutdown();
 
     stats_http_shutdown();
     control_socket_shutdown();
