@@ -1063,16 +1063,23 @@ The `yegors` fork also contains SRT output support and its own UDP path. The UDP
 non-functional — its `O_UDP_STREAM` branch in `process_outputs()` checks squelch and then never
 calls `udp_stream_write()`. Neither the SRT work nor that UDP code should be pulled in.
 
-### Upstreaming
+### Never open anything upstream
 
-Bug fixes that are not personal preference — the `sendto` fix in particular — are candidates for
-PRs to `rtl-airband/RTLSDR-Airband`. Open an issue describing the bug before sending a PR.
-The `post_write_script` / `min_rx_seconds` features originated with `yegors`; credit accordingly
-if they are ever proposed upstream.
+**Never open a PR, issue, or comment on `rtl-airband/RTLSDR-Airband`** (or any other upstream
+repo), for any reason, including bug fixes that would plainly benefit upstream. All work on this
+fork stays on this fork. Upstream is read-only: fetch from it and merge it, nothing else. PRs
+opened there by mistake have had to be deleted by hand more than once. If something should go
+upstream, the user does it personally.
+
+`gh pr create` in this clone is dangerous: the `github` remote is a GitHub fork of rtl-airband, so
+`gh` defaults the PR's base repo to the upstream parent. Never use it here (see Working Norms).
+`~/.claude/hooks/guard-github.sh` denies it outright.
+
+The `post_write_script` / `min_rx_seconds` features originated with `yegors` (attribution only).
 
 ## Working Norms
 
-- **Never commit directly to `main`.** Check `git branch --show-current` before committing; if it is `main`, create a branch first. All changes reach `main` through a pull request. Name branches `<prefix>/<short_description>`, where the prefix is the contributor's GitHub username or a category such as `dev` or `fix` (e.g. `dev/drop_macos14_ci`).
+- **Never commit directly to `main`.** Check `git branch --show-current` before committing; if it is `main`, create a branch first. All changes reach `main` through a pull request **on Forgejo (`origin`)**, opened via its API (`POST /api/v1/repos/jschmall/RTLSDR-Airband/pulls`), never with `gh pr create`. Name branches `<prefix>/<short_description>`, where the prefix is the contributor's GitHub username or a category such as `dev` or `fix` (e.g. `dev/drop_macos14_ci`).
 - **Keep this file updated** as changes are made to the codebase.
 - **Never guess or make assumptions** — ask clarifying questions when requirements are unclear.
 - **All code changes should include unit tests.** When possible, write tests first and implement code to make them pass (TDD).
