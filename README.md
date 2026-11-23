@@ -239,13 +239,13 @@ The last column was measured through the real binary on a generated signal.
   An `ampfactor` change can't restore the old balance exactly. Check anything downstream
   that depends on level, such as VOX or a tone decoder.
 
-  | Deviation | Level change with `atan2` (calculated) |
+  | Peak deviation of a sine tone | Level change with `atan2` (calculated) |
   |---|---|
   | 50 Hz | -3.8 dB |
-  | 350 Hz | -2.9 dB |
-  | 1 kHz | -1.4 dB |
-  | 2 kHz | 0 dB |
-  | 3 kHz | +0.5 dB |
+  | 350 Hz | -3.0 dB |
+  | 1 kHz | -1.7 dB |
+  | 2 kHz | -0.4 dB |
+  | 3 kHz | +0.3 dB |
 
 - **It applies to every NFM channel in the instance**, and overrides `-Q`. CTCSS squelch isn't
   affected by the level change, since it compares tones with each other.

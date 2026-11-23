@@ -1068,8 +1068,9 @@ behavior), `"atan2"` (exact), `"quadri"` (the existing `-Q`).
   live UDP audio from two channels. Through the binary on generated IQ: `fast_atan2`
   −34.8, `atan2` −83.4, `quadri` −62.6 dB.
 - **Level change.** `fast_atan2()`'s slope at 0 is π/2 times too steep (3.9 dB), and the output matches at a
-  45° step (2 kHz deviation at 16 kHz). So `atan2` is −3.8 dB at 50 Hz, −2.9 at 350 Hz, −1.4 at
-  1 kHz and +0.5 at 3 kHz. No single `ampfactor` undoes that. The CTCSS detector compares tones
+  45° step (2 kHz deviation at 16 kHz). For a sine tone, `atan2` is −3.8 dB at 50 Hz peak
+  deviation, −3.0 at 350 Hz (also measured end to end), −1.7 at 1 kHz, −0.4 at 2 kHz and +0.3 at
+  3 kHz. No single `ampfactor` undoes that. The CTCSS detector compares tones
   relatively, so squelch is unaffected.
 - **Global on purpose.** One instance runs one SDR, so a global already limits a trial to one
   instance. A per-channel key could be added later with the global as its default. Read once at
