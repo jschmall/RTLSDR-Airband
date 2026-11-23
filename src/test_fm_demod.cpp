@@ -61,6 +61,7 @@ TEST_F(FmDemodTest, atan2_does_not_depend_on_amplitude) {
 TEST_F(FmDemodTest, atan2_of_silence_is_zero) {
     EXPECT_EQ(polar_disc_atan2(0.0f, 0.0f, 0.0f, 0.0f), 0.0f);
     EXPECT_EQ(polar_disc_atan2(1.0f, 1.0f, 0.0f, 0.0f), 0.0f);
+    EXPECT_EQ(polar_disc_atan2(-1.0f, -1.0f, 0.0f, 0.0f), 0.0f);
 }
 
 // A CTCSS tone must not come out with harmonics: 136.5 Hz would put one on the 410.8 Hz paging tone.

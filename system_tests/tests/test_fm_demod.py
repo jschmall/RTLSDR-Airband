@@ -27,7 +27,12 @@ TIMEOUT_S = (DURATION_S + 2 * iq_generator.NOISE_PAD_S) * 3 + 30
 
 
 def _run(
-    binary: Path, out_dir: Path, iq_file: Path, speedup: float, fm_demod: str | None
+    binary: Path,
+    out_dir: Path,
+    iq_file: Path,
+    speedup: float,
+    fm_demod: str | None,
+    extra_args: tuple[str, ...] = (),
 ) -> np.ndarray:
     """Run rtl_airband on iq_file and return the udp_stream samples."""
     received: list[bytes] = []
@@ -74,7 +79,9 @@ def _run(
             if fm_demod is not None:
                 config = config_path.read_text()
                 config_path.write_text(f'fm_demod = "{fm_demod}";\n' + config)
-            run_rtl_airband(binary, config_path, timeout_s=TIMEOUT_S)
+            run_rtl_airband(
+                binary, config_path, timeout_s=TIMEOUT_S, extra_args=extra_args
+            )
         finally:
             done.set()
             thread.join()
@@ -95,19 +102,23 @@ def _harmonics_db(samples: np.ndarray) -> tuple[float, float, float]:
     return level[0], ratio[0], ratio[1]
 
 
-def test_exact_atan2_removes_ctcss_harmonics(
-    nfm_binary, test_output_dir: Path, cache_dir: Path, speedup_factor: float
-) -> None:
-    """The default demodulator adds a third harmonic; fm_demod = "atan2" must not."""
-    if nfm_binary is None:
-        pytest.skip("No NFM binary provided via --nfm-binary")
-    iq_file = iq_generator.get_or_generate_nfm(
+def _ctcss_iq(cache_dir: Path) -> Path:
+    return iq_generator.get_or_generate_nfm(
         offset_hz=CHANNEL_OFFSET_HZ,
         audio_hz=CTCSS_HZ,
         duration_s=DURATION_S,
         cache_dir=cache_dir,
         deviation_hz=DEVIATION_HZ,
     )
+
+
+def test_exact_atan2_removes_ctcss_harmonics(
+    nfm_binary, test_output_dir: Path, cache_dir: Path, speedup_factor: float
+) -> None:
+    """The default demodulator adds a third harmonic; fm_demod = "atan2" must not."""
+    if nfm_binary is None:
+        pytest.skip("No NFM binary provided via --nfm-binary")
+    iq_file = _ctcss_iq(cache_dir)
     results = {}
     for name in (None, "fast_atan2", "atan2", "quadri"):
         samples = _run(nfm_binary, test_output_dir, iq_file, speedup_factor, name)
@@ -118,8 +129,27 @@ def test_exact_atan2_removes_ctcss_harmonics(
     assert results["fast_atan2"][2] > -45, results
     assert results["atan2"][1] < -55, results
     assert results["atan2"][2] < -55, results
+    assert results["quadri"][2] < -55, results
     expected = 2 * DEVIATION_HZ / WAVE_RATE
     assert results["atan2"][0] == pytest.approx(expected, rel=0.05)
+
+
+def test_fm_demod_overrides_q_flag(
+    nfm_binary, test_output_dir: Path, cache_dir: Path, speedup_factor: float
+) -> None:
+    """-Q alone selects quadri; an fm_demod key wins over it."""
+    if nfm_binary is None:
+        pytest.skip("No NFM binary provided via --nfm-binary")
+    iq_file = _ctcss_iq(cache_dir)
+    results = {}
+    for name in (None, "fast_atan2"):
+        samples = _run(
+            nfm_binary, test_output_dir, iq_file, speedup_factor, name, ("-Q",)
+        )
+        results[name] = _harmonics_db(samples)
+
+    assert results[None][2] < -55, results
+    assert results["fast_atan2"][2] > -45, results
 
 
 @pytest.mark.parametrize("value", ['"atan"', '""', "1", "true"])

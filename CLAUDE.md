@@ -394,7 +394,7 @@ the top-level globals. A change to a *global* setting — `shout_metadata_delay`
 `fft_size`, or upstream's `split_min_file_time`/`split_max_file_time`/`split_max_idle_time` —
 is silently ignored with no `skipped_requires_restart` entry. The same goes for the newer upstream
 globals `stats_update_interval` (#579), `split_include_transmission_start` (#574) and
-`split_tx_drop_shorter_than` (#580). Any of them needs a restart (or SIGHUP,
+`split_tx_drop_shorter_than` (#580), and for `fm_demod` (item 52). Any of them needs a restart (or SIGHUP,
 item 7). *Per-output* `split_*` values are covered for free: item 31's `config_signature` is a
 full `serialize_setting()` of the raw channel block, so editing one rebuilds that channel like any
 other output change.
@@ -814,7 +814,7 @@ and signal levels and per-device buffer counters only, and the control socket ha
 `src/helper_functions.cpp`, printed from `main()`). The version line is unchanged; a second line
 reads `Features: fork control_socket device_status reserve mixer_remote send_tx_tags stats_http
 json_log post_write_script auto_ppm usb_chunk_sizing auto_ppm_voting` (`auto_ppm` added by item 45, `usb_chunk_sizing` by item 46, `auto_ppm_voting` by item 47), followed by whichever optional build components are compiled in
-(`rdio_scanner`, `soapysdr`, `pulseaudio`, `nfm`). `mirisdr` was also in that list until
+(`rdio_scanner`, `soapysdr`, `pulseaudio`, `nfm`). NFM builds also list `fm_demod` (item 52) after `nfm`. `mirisdr` was also in that list until
 upstream v7.0.0 removed the driver. It was a build-component name, not a fork capability, so its
 disappearance doesn't break the never-remove rule below, which covers the fork capability names.
 - **Why:** upstream tags in the same `vN.x` range as this fork, and `v6.3.0`/`v6.3.1` exist in
@@ -1056,6 +1056,34 @@ the freeze doesn't touch.
   passes.
 - The freeze still blocks anything else that writes to local disk. On prod that is only the stats
   thread and logging. The output threads write recordings to NFS and the network.
+
+#### Demodulation
+
+**52. `fm_demod` selects the FM demodulator** (`src/fm_demod.{h,cpp}`, new; `src/rtl_airband.cpp`,
+`src/helper_functions.cpp`). Root-level key, NFM builds only: `"fast_atan2"` (default, unchanged
+behavior), `"atan2"` (exact), `"quadri"` (the existing `-Q`).
+- **Why.** `fast_atan2()` is a coarse approximation whose error adds a third harmonic to a CTCSS
+  tone. 136.5 Hz puts one at 409.5 Hz, close enough to a 410.8 Hz paging tone for a tone decoder
+  to raise false alerts on quiet carriers. Third harmonic relative to the tone: about −35 dB on
+  live UDP audio from two channels. Through the binary on generated IQ: `fast_atan2`
+  −34.8, `atan2` −83.4, `quadri` −62.6 dB.
+- **Level change.** `fast_atan2()`'s slope at 0 is π/2 times too steep (3.9 dB), and the output matches at a
+  45° step (2 kHz deviation at 16 kHz). So `atan2` is −3.8 dB at 50 Hz, −2.9 at 350 Hz, −1.4 at
+  1 kHz and +0.5 at 3 kHz. No single `ampfactor` undoes that. The CTCSS detector compares tones
+  relatively, so squelch is unaffected.
+- **Global on purpose.** One instance runs one SDR, so a global already limits a trial to one
+  instance. A per-channel key could be added later with the global as its default. Read once at
+  startup, after `getopt()`, so the key overrides `-Q`. `reload_diff` ignores it (see the known
+  limitation under item 27). SIGHUP re-reads it, and a bad value then exits like any config error.
+- **The zero guard in `polar_disc_atan2()` is needed.** With a zero previous sample (as at startup)
+  and I and Q both negative, the real part is −0, and atan2(0, −0) is π: one full-scale sample.
+  It survives `-ffast-math` (checked in the disassembly of the generic and native release objects).
+  The unit tests are compiled without `-ffast-math`, so they can't check that.
+- **CPU.** One `atan2f` per demodulated sample, measured at 17 ns on the dev box. Item 45 already
+  does one double `atan2` per squelch-open sample.
+- **Tests.** `src/test_fm_demod.cpp`; `system_tests/tests/test_fm_demod.py` (harmonics of all three
+  through the NFM binary, `-Q` precedence, bad values rejected). Not validated on recorded off-air
+  IQ, real hardware or ARM.
 
 ### Do not import from `yegors`
 

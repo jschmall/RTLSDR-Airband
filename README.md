@@ -51,6 +51,9 @@ input (below), and `v5.3.0` introduced live reconfiguration and `send_tx_tags` s
   made the demod emit two batches back to back, a main cause of `output_overrun_count`. Total
   USB buffering is unchanged. `buffer_size` (bytes, a multiple of 512) on an `rtlsdr` device
   overrides it; `buffer_size = 320000; buffers = 10;` restores the old behavior.
+- **Selectable FM demodulator (`fm_demod`)** — use the exact arctangent instead of the default
+  approximation, which adds harmonics to low-frequency tones. See
+  [FM Demodulator](#fm-demodulator), below.
 - **SIGHUP config reload** — SIGHUP now triggers a clean restart to pick up config
   changes, instead of just exiting.
 - **Assorted stability fixes** — buffer overflow, thread-safety, and error-handling
@@ -213,12 +216,48 @@ devices: ({
 `device_ppm_correction`, `device_auto_ppm_residual_ppm` and
 `device_auto_ppm_adjustment_count`.
 
+### FM Demodulator
+
+The default NFM demodulator is a fast approximation of the arctangent. It adds a third harmonic
+about 35 dB below a CTCSS tone: 136.5 Hz puts one at 409.5 Hz, close enough to a 410.8 Hz paging
+tone to trip a tone decoder on a quiet carrier. `fm_demod` selects another one:
+
+```
+fm_demod = "atan2";   # at the top level of the config, not inside a device or channel
+```
+
+| Value | Demodulator | Third harmonic of a 136.5 Hz tone, 350 Hz deviation |
+|---|---|---|
+| `"fast_atan2"` (default) | Fast approximation | -34.8 dB |
+| `"atan2"` | Exact arctangent | -83.4 dB |
+| `"quadri"` | Quadri correlator, same as `-Q` | -62.6 dB |
+
+The last column was measured through the real binary on a generated signal.
+
+- **`atan2` changes the audio level.** The approximation is too loud at small deviations, so
+  quiet audio comes out lower with `atan2`, by up to 3.9 dB, while loud peaks stay about the same.
+  An `ampfactor` change can't restore the old balance exactly. Check anything downstream
+  that depends on level, such as VOX or a tone decoder.
+
+  | Deviation | Level change with `atan2` (calculated) |
+  |---|---|
+  | 50 Hz | -3.8 dB |
+  | 350 Hz | -2.9 dB |
+  | 1 kHz | -1.4 dB |
+  | 2 kHz | 0 dB |
+  | 3 kHz | +0.5 dB |
+
+- **It applies to every NFM channel in the instance**, and overrides `-Q`. CTCSS squelch isn't
+  affected by the level change, since it compares tones with each other.
+- **Changing it needs a restart** (or SIGHUP). `reload_diff` ignores it without saying so.
+- **An unknown value is a config error.** Builds without NFM ignore the key.
+
 ### Feature List
 
 `rtl_airband -v` prints a second line after the version: `Features: fork control_socket
 device_status ...`. It lists this fork's capabilities, followed by the optional components
 compiled in (`rdio_scanner`, `soapysdr`, `pulseaudio`, `nfm`; `mirisdr` until upstream v7.0.0
-removed that driver). Tools such as
+removed that driver). `fm_demod` follows `nfm`, since only NFM builds have it. Tools such as
 [rtl-airband-panel](https://github.com/jschmall/rtl-airband-panel) use it to tell this fork
 from a stock build, since both use the same `vN.x` version numbers. Names are only ever added,
 never renamed or removed.

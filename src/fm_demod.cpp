@@ -36,7 +36,7 @@ bool parse_fm_demod(const char* name, fm_demod_algo* algo) {
 float polar_disc_atan2(float ar, float aj, float br, float bj) {
     float const cr = ar * br + aj * bj;
     float const cj = aj * br - ar * bj;
-    // atan2(0, 0) is a plain 0 only without -ffast-math
+    // cr can be -0, and atan2(0, -0) is pi: a full-scale click
     if (cr == 0.0f && cj == 0.0f) {
         return 0.0f;
     }
