@@ -1083,8 +1083,18 @@ behavior), `"atan2"` (exact), `"quadri"` (the existing `-Q`).
 - **CPU.** One `atan2f` per demodulated sample, measured at 17 ns on the dev box. Item 45 already
   does one double `atan2` per squelch-open sample.
 - **Tests.** `src/test_fm_demod.cpp`; `system_tests/tests/test_fm_demod.py` (harmonics of all three
-  through the NFM binary, `-Q` precedence, bad values rejected). Not validated on recorded off-air
-  IQ, real hardware or ARM.
+  through the NFM binary, `-Q` precedence, bad values rejected).
+- **Off-air check** (25 min of recorded 1.024 Msps IQ, a low-band NFM channel with a 100 Hz CTCSS
+  tone, replayed through the release binary once per demodulator; 117 half-second quiet-carrier
+  windows). Third harmonic: `fast_atan2` −35.8 dB, `atan2` −65.7 (noise limit about −68). The
+  tone measured 2.3 dB lower with `atan2`. No new clicks: all 3512 sample steps over 0.3 also
+  occur with `fast_atan2`, and none grew more than 3.5%. 70 squelch openings and 800 of 800 CTCSS
+  windows in both. CPU difference 0.4 s in 56 s at 6x playback, one channel.
+- **`quadri` did badly on that weak signal.** Its denominator has a `+ 1.0f`, so its output depends
+  on amplitude: the tone came out 15 dB lower than with `fast_atan2`, with a second harmonic at
+  −18.6 dB. The −62.6 dB above is from a strong generated signal.
+- **Not validated:** a live dongle with `atan2`, a 136.5 Hz channel off the air, a downstream tone
+  decoder, or ARM.
 
 ### Do not import from `yegors`
 

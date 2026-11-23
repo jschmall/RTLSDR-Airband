@@ -232,7 +232,10 @@ fm_demod = "atan2";   # at the top level of the config, not inside a device or c
 | `"atan2"` | Exact arctangent | -83.4 dB |
 | `"quadri"` | Quadri correlator, same as `-Q` | -62.6 dB |
 
-The last column was measured through the real binary on a generated signal.
+The last column was measured through the real binary on a generated signal. On recorded off-air
+audio with a 100 Hz CTCSS tone, the third harmonic was -35.8 dB with `fast_atan2` and -65.7 dB with
+`atan2`, which is close to the noise there. `quadri` depends on signal strength: on that weaker signal its audio was
+about 15 dB quieter than the default, with a second harmonic at -18.6 dB. Prefer `atan2`.
 
 - **`atan2` changes the audio level.** The approximation is too loud at small deviations, so
   quiet audio comes out lower with `atan2`, by up to 3.9 dB, while loud peaks stay about the same.
