@@ -487,8 +487,10 @@ TEST_F(HelperFunctionsTest, fork_features_names_the_fork_and_its_capabilities) {
     }
 #ifdef NFM
     EXPECT_NE(features.find(" nfm "), std::string::npos);
+    EXPECT_NE(features.find(" fm_demod "), std::string::npos);
 #else
     EXPECT_EQ(features.find(" nfm "), std::string::npos);
+    EXPECT_EQ(features.find(" fm_demod "), std::string::npos);
 #endif
 }
 

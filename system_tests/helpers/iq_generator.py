@@ -283,28 +283,29 @@ def get_or_generate_ctcss(
 
 def get_or_generate_nfm(
     offset_hz: int,
-    audio_hz: int,
+    audio_hz: float,
     duration_s: float,
     cache_dir: Path,
+    deviation_hz: int = 3000,
 ) -> Path:
     """
     Generate an NFM signal at *offset_hz* with *audio_hz* audio tone.
     Returns path to the cached .iq file.
     """
+    deviation_tag = "" if deviation_hz == 3000 else f"_dev{deviation_hz}"
     filename = (
-        f"nfm_sr{SAMPLE_RATE}_off{offset_hz}_audio{audio_hz}"
+        f"nfm_sr{SAMPLE_RATE}_off{offset_hz}_audio{audio_hz}{deviation_tag}"
         f"_dur{duration_s}_pad{NOISE_PAD_S}.iq"
     )
     path = cache_dir / filename
     if path.exists():
         return _register_hit(path)
 
-    deviation = 3000  # Hz, narrow FM ±3 kHz
     num_samples = int(SAMPLE_RATE * duration_s)
     t = np.linspace(0, duration_s, num_samples, dtype=np.float32, endpoint=False)
     audio = np.sin(_TWO_PI * np.float32(audio_hz) * t)
     del t
-    instantaneous_freq = np.float32(offset_hz) + np.float32(deviation) * audio
+    instantaneous_freq = np.float32(offset_hz) + np.float32(deviation_hz) * audio
     del audio
     # FM phase modulation: integrate instantaneous frequency to get phase.
     # cumsum must use float64 to avoid phase drift over millions of samples.

@@ -104,7 +104,7 @@ std::string fork_features() {
     features += " pulseaudio";
 #endif
 #ifdef NFM
-    features += " nfm";
+    features += " nfm fm_demod";
 #endif
     return features;
 }

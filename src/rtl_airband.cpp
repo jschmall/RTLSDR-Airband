@@ -62,6 +62,7 @@
 #include "auto_ppm.h"
 #include "control_socket.h"
 #include "device_stats.h"
+#include "fm_demod.h"
 #include "helper_functions.h"
 #include "input-common.h"
 #include "live_reconfig.h"
@@ -110,7 +111,6 @@ size_t fft_size = 1 << fft_size_log;
 
 #ifdef NFM
 float alpha = exp(-1.0f / (WAVE_RATE * 2e-4));
-enum fm_demod_algo { FM_FAST_ATAN2, FM_QUADRI_DEMOD };
 enum fm_demod_algo fm_demod = FM_FAST_ATAN2;
 #endif /* NFM */
 
@@ -672,6 +672,8 @@ void* demodulate(void* params) {
                                 waveout = polar_disc_fast(real, imag, channel->pr, channel->pj);
                             } else if (fm_demod == FM_QUADRI_DEMOD) {
                                 waveout = fm_quadri_demod(real, imag, channel->pr, channel->pj);
+                            } else if (fm_demod == FM_ATAN2) {
+                                waveout = polar_disc_atan2(real, imag, channel->pr, channel->pj);
                             }
                             channel->pr = real;
                             channel->pj = imag;
@@ -788,7 +790,7 @@ void usage() {
 \t-f\t\t\tRun in foreground, display textual waterfalls\n\
 \t-F\t\t\tRun in foreground, do not display waterfalls (for running as a systemd service)\n";
 #ifdef NFM
-    cout << "\t-Q\t\t\tUse quadri correlator for FM demodulation (default is atan2)\n";
+    cout << "\t-Q\t\t\tUse quadri correlator for FM demodulation (default is a fast atan2 approximation; the fm_demod config option overrides this)\n";
 #endif /* NFM */
 #ifdef DEBUG
     cout << "\t-d <file>\t\tLog debugging information to <file> (default is " << DEBUG_PATH << ")\n";
@@ -1001,6 +1003,10 @@ int main(int argc, char* argv[]) {
 #ifdef NFM
         if (root.exists("tau"))
             alpha = ((int)root["tau"] == 0 ? 0.0f : exp(-1.0f / (WAVE_RATE * 1e-6 * (int)root["tau"])));
+        if (root.exists("fm_demod") && (root["fm_demod"].getType() != Setting::TypeString || !parse_fm_demod(root["fm_demod"], &fm_demod))) {
+            cerr << "Configuration error: fm_demod must be " << fm_demod_names << "\n";
+            error();
+        }
 #endif /* NFM */
 
         Setting& devs = config.lookup("devices");

@@ -298,6 +298,7 @@ add_library (rtl_airband_base OBJECT
 	udp_stream.cpp
 	logging.cpp
 	filters.cpp
+	fm_demod.cpp
 	helper_functions.cpp
 	icecast_metadata.cpp
 	stats_http.cpp
@@ -367,6 +368,7 @@ if(BUILD_UNITTESTS)
 		squelch.cpp
 		logging.cpp
 		filters.cpp
+		fm_demod.cpp
 		ctcss.cpp
 		generate_signal.cpp
 		helper_functions.cpp
