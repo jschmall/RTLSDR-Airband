@@ -35,6 +35,27 @@ TEST_F(FiltersTest, default_notch) {
     EXPECT_FALSE(notch.enabled());
 }
 
+TEST_F(FiltersTest, lowpass_below_nyquist_settles_to_unity_gain) {
+    LowpassFilter lowpass(7999.5f, 16000.0f);
+    ASSERT_TRUE(lowpass.enabled());
+    float r = 0.0f, j = 0.0f;
+    for (int i = 0; i < 200000; i++) {
+        r = 1.0f;
+        j = 0.0f;
+        lowpass.apply(r, j);
+    }
+    EXPECT_NEAR(r, 1.0f, 0.02f);  // the pole is so close to the unit circle that float rounding shows
+}
+
+TEST_F(FiltersTest, lowpass_at_or_above_nyquist_is_disabled) {
+    for (float freq : {8000.0f, 8000.5f, 8500.0f, 20000.0f}) {
+        LowpassFilter lowpass(freq, 16000.0f);
+        EXPECT_FALSE(lowpass.enabled()) << freq;
+    }
+    EXPECT_FALSE(LowpassFilter(4000.0f, 8000.0f).enabled());
+    EXPECT_TRUE(LowpassFilter(3999.5f, 8000.0f).enabled());
+}
+
 TEST_F(FiltersTest, default_lowpass) {
     LowpassFilter lowpass;
     EXPECT_FALSE(lowpass.enabled());

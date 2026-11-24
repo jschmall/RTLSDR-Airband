@@ -21,6 +21,7 @@
 #include <thread>
 
 #include "live_reconfig.h"
+#include "logging.h"
 #include "rtl_airband.h"
 
 using namespace std;
@@ -2080,6 +2081,64 @@ devices:
     EXPECT_EQ(chans[1].output_count, 1);
     // The existing (index 0) channel must be untouched.
     EXPECT_EQ(chans[0].output_count, 0);
+}
+
+TEST_F(ChannelAppendTest, bandwidth_at_or_above_wave_rate_warns_and_leaves_the_filter_off) {
+    int const values[] = {WAVE_RATE, WAVE_RATE + 1000, WAVE_RATE - 1};
+    bool const filter_on[] = {false, false, true};
+    for (int k = 0; k < 3; k++) {
+        input_t input = {};
+        input.driver_type = "rtlsdr";
+        input.sample_rate = 2000000;
+        input.centerfreq = 120000000;
+        channel_t chans[2] = {};
+        chans[0].enabled = true;
+        size_t bins[2] = {0, 0};
+        size_t base_bins[2] = {0, 0};
+        device_t dev = {};
+        dev.input = &input;
+        dev.mode = R_MULTICHANNEL;
+        dev.channel_count = 1;
+        dev.channel_capacity = 2;
+        dev.channels = chans;
+        dev.bins = bins;
+        dev.base_bins = base_bins;
+        dev.pending_centerfreq_request = -1;
+        devices = &dev;
+        device_count = 1;
+
+        std::string path = write_config(R"(
+devices:
+({
+  type = "rtlsdr";
+  index = 0;
+  centerfreq = 120000000;
+  sample_rate = 2000000;
+  channels: (
+    { freq = 120000000; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "x"; } ); },
+    { freq = 120050000; bandwidth = )" + std::to_string(values[k]) +
+                                        R"(; outputs: ( { type = "file"; directory = "/tmp"; filename_template = "y"; } ); }
+  );
+});
+)");
+        ConfigSnapshot snapshot;
+        std::string parse_error;
+        ASSERT_TRUE(parse_config_snapshot(path, &snapshot, &parse_error)) << parse_error;
+        chans[0].config_signature = strdup(snapshot.devices[0].channel_signature[0].c_str());
+
+        LogDestination const old_destination = log_destination;
+        log_destination = STDERR;
+        testing::internal::CaptureStderr();
+        DiffResult result = compute_and_apply_diff(snapshot);
+        std::string const err = testing::internal::GetCapturedStderr();
+        log_destination = old_destination;
+
+        EXPECT_EQ(dev.channel_count.load(), 2) << values[k];
+        EXPECT_TRUE(result.skipped_requires_restart.empty()) << values[k];
+        EXPECT_EQ(chans[1].needs_raw_iq, 1) << values[k];
+        EXPECT_EQ(chans[1].freqlist[0].lowpass_filter.enabled(), filter_on[k]) << values[k];
+        EXPECT_EQ(err.find("bandwidth") != std::string::npos, !filter_on[k]) << err;
+    }
 }
 
 TEST_F(ChannelAppendTest, appends_multiple_new_channels_within_capacity) {

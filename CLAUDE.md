@@ -1121,6 +1121,17 @@ startup, live retune and live `sample_rate` change). Upstream computes
   its bin-collision check. It must change with this.
 - This replaces two tests that pinned the old formula. Expect a conflict if upstream changes it.
 
+**54. A channel `bandwidth` at or above the sample rate leaves the lowpass filter off**
+(`src/filters.cpp`, `make_channel_lowpass()` in `src/config.cpp`). `LowpassFilter`'s poles reach the
+unit circle at `WAVE_RATE / 2` (bandwidth 16000 in NFM builds, 8000 in AM-only ones) and leave it
+above that, so the filter diverged. The constructor now disables itself there, and the parser logs a
+warning. `needs_raw_iq` stays set.
+- **A warning, not a config error**, because `reload_diff` removes the old channel before parsing the
+  new one: an error would take the channel off the air.
+- **Logged with `log()`, not `cerr`.** `try_append_channels()` captures `cerr` and drops it when the
+  parse succeeds, so other `cerr` warnings in `parse_channel()` never show on a live edit.
+- Just below the limit the filter is stable but float rounding shows (1.5% at 15999, 0.1% at 15990).
+
 ### Do not import from `yegors`
 
 The `yegors` fork also contains SRT output support and its own UDP path. The UDP path there is

@@ -74,6 +74,14 @@ LowpassFilter::LowpassFilter(float freq, float sample_freq) : enabled_(true) {
         return;
     }
 
+    // At half the sample rate the poles reach the unit circle and above it they are outside, so the
+    // filter would blow up. There is nothing up there left to remove anyway.
+    if (freq >= sample_freq / 2) {
+        debug_print("Frequency %f Hz is not below half of %f, disabling lowpass filter\n", freq, sample_freq);
+        enabled_ = false;
+        return;
+    }
+
     debug_print("Adding lowpass filter at %f Hz with a sample rate of %f\n", freq, sample_freq);
 
     double raw_alpha = (double)freq / sample_freq;
