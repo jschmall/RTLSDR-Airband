@@ -17,6 +17,7 @@
  * along with this program; if not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <dlfcn.h>
 #include <sys/stat.h>
 
 #include "test_base_class.h"
@@ -481,6 +482,10 @@ TEST_F(HelperFunctionsTest, setting_as_bool_or_rejects_non_bool) {
 }
 
 TEST_F(HelperFunctionsTest, loaded_library_path_is_the_real_file_a_symbol_comes_from) {
+    // a fully static musl binary has no dynamic loader to ask
+    if (dlopen(NULL, RTLD_LAZY) == NULL) {
+        GTEST_SKIP() << dlerror();
+    }
     string const path = loaded_library_path("sqrtf");
     ASSERT_FALSE(path.empty());
     EXPECT_EQ(path[0], '/') << path;
