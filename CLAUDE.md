@@ -1108,13 +1108,19 @@ startup, live retune and live `sample_rate` change). Upstream computes
   at 4096 and 40 at 8192, where the window reaches about 7 bins: effectively deaf.
 - **Now** `lround((freq - cf) * N / fs)`, wrapped into 0..N-1. A channel exactly between two bins
   takes the one further from `centerfreq`.
-- **Not affected:** `compute_channel_dm_dphi()` and the offset estimator / auto_ppm both use the
-  channel frequency, never the bin. Simulated estimates (tone, FM, C4FM-like) agree within 1–2 Hz
-  for bin errors of 0 to 1, except a tone at −15 dB SNR, which read −10 Hz at a full bin. Item 45's P25 bias didn't reproduce in that model, so
-  whether this changes it is unknown. AFC still searches outward from `base_bins`. A channel on
+- **Derotation isn't affected:** `compute_channel_dm_dphi()` and the estimator's expected rotation use
+  the channel frequency, never the bin.
+- **The offset estimate changes only for weak signals.** In a simulation, a carrier 7 dB or more above the noise in its
+  bin reads the same at any bin error. Below that it is pulled towards the bin's center: at 1.024
+  Msps and a full bin, −256 Hz at 3 dB, −596 Hz at 0 dB, −1625 Hz on noise alone. At a centered bin
+  the readings stay within ±70 Hz. Seen on a live dongle too: channels with no usable carrier read
+  −850..−1580 Hz on the old bin and −125..+82 Hz on the new one. So auto_ppm gets steadier votes
+  from weak channels. Item 45's P25 bias didn't reproduce in the simulation. AFC still searches outward from `base_bins`. A channel on
   `centerfreq` now has base bin 0 rather than N−1, so AFC can't step below it (it couldn't step
   above before). No unit test covers AFC: the class lives in `rtl_airband.cpp`, which the test
   binary doesn't link.
+- **Measured** with a carrier exactly on a bin, through the v7.5.0 and fixed binaries (file input):
+  −17.99 to −16.05 dBFS, +1.94. No live carrier strong enough to repeat it was available.
 - **Levels move.** Signal and noise readings rise by up to 1.9 dB on channels that were a full bin
   off, so a manual `squelch_threshold` tuned to the old reading may need adjusting.
 - **rtl-airband-panel has its own copy** (`compute_bin()` in `crates/airband-validate`), used for
@@ -1136,9 +1142,10 @@ warning. `needs_raw_iq` stays set.
 `describe_library()` in `src/helper_functions.cpp`; `src/rtl_airband.cpp`, `src/config.h.in`). A
 `librtlsdr:` line, printed after `Features:` when built `WITH_RTLSDR`, gives the real file that
 exports `rtlsdr_open`, or `static`, plus the pkg-config version seen at build time.
-- **Why.** A 2026-11-23 deploy changed librtlsdr from an RTL-SDR Blog build to Ubuntu's 2.0.1, with
-  no visible sign but a several-dB change in received levels. librtlsdr has no version function, and
-  which register differences cause it is unproven.
+- **Why.** A 2026-11-23 deploy reportedly changed the librtlsdr build, with no visible sign but a
+  several-dB change in received levels (reported by the monitoring session, cause unproven).
+  librtlsdr has no version function. Don't identify a build by its strings: Ubuntu's 2.0.1 prints
+  "RTL-SDR Blog V4 Detected" too.
 - **Goes through `dlsym()`**, since in a non-PIE executable `&rtlsdr_open` can be a stub in the
   executable itself. A `static` build can't name the library, so only the pkg-config version helps.
 - **Which library a release uses is a per-release decision.** This repo's Dockerfile and
