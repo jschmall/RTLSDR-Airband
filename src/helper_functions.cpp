@@ -17,9 +17,12 @@
  * along with this program; if not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <dlfcn.h>     // dlsym, dladdr
+#include <limits.h>    // PATH_MAX
 #include <sys/stat.h>  // struct stat, S_ISDIR
 #include <cstddef>     // size_t
 #include <cstdio>      // snprintf
+#include <cstdlib>     // realpath
 #include <cstring>     // strerror
 #include <libconfig.h++>
 
@@ -107,6 +110,25 @@ std::string fork_features() {
     features += " nfm fm_demod";
 #endif
     return features;
+}
+
+// Empty if no shared library exports the symbol, which is what a static link looks like. Goes
+// through dlsym(): in a non-PIE executable the function's own address can be a stub in the executable.
+std::string loaded_library_path(const char* symbol) {
+    void* address = dlsym(RTLD_DEFAULT, symbol);
+    Dl_info info, self;
+    if (address == NULL || dladdr(address, &info) == 0 || info.dli_fname == NULL) {
+        return "";
+    }
+    if (dladdr((void*)&loaded_library_path, &self) != 0 && self.dli_fbase == info.dli_fbase) {
+        return "";
+    }
+    char resolved[PATH_MAX];
+    return realpath(info.dli_fname, resolved) != NULL ? resolved : info.dli_fname;
+}
+
+std::string describe_library(const std::string& path, const std::string& build_version) {
+    return (path.empty() ? "static" : path) + " (pkg-config at build: " + (build_version.empty() ? "unknown" : build_version) + ")";
 }
 
 double rusage_cpu_seconds(const struct rusage& ru) {

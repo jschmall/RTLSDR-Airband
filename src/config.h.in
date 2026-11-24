@@ -21,6 +21,7 @@
 #ifndef _CONFIG_H
 #define _CONFIG_H
 #cmakedefine WITH_RTLSDR
+#define RTLSDR_BUILD_VERSION "@RTLSDR_PKG_VERSION@"
 #cmakedefine WITH_SOAPYSDR
 #cmakedefine WITH_PROFILING
 #cmakedefine WITH_PULSEAUDIO

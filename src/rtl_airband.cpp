@@ -880,6 +880,9 @@ int main(int argc, char* argv[]) {
             case 'v':
                 cout << "RTLSDR-Airband version " << RTL_AIRBAND_VERSION << "\n";
                 cout << "Features: " << fork_features() << "\n";
+#ifdef WITH_RTLSDR
+                cout << "librtlsdr: " << describe_library(loaded_library_path("rtlsdr_open"), RTLSDR_BUILD_VERSION) << "\n";
+#endif /* WITH_RTLSDR */
                 exit(EXIT_SUCCESS);
             case 'h':
             default:
@@ -1101,6 +1104,9 @@ int main(int argc, char* argv[]) {
     }
 
     log(LOG_INFO, "RTLSDR-Airband version %s starting\n", RTL_AIRBAND_VERSION);
+#ifdef WITH_RTLSDR
+    log(LOG_INFO, "librtlsdr: %s\n", describe_library(loaded_library_path("rtlsdr_open"), RTLSDR_BUILD_VERSION).c_str());
+#endif /* WITH_RTLSDR */
 
     if (!foreground) {
         int pid1, pid2;

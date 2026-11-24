@@ -268,6 +268,12 @@ removed that driver). `fm_demod` follows `nfm`, since only NFM builds have it. T
 from a stock build, since both use the same `vN.x` version numbers. Names are only ever added,
 never renamed or removed.
 
+A third line names the librtlsdr in use, e.g. `librtlsdr: /usr/lib/x86_64-linux-gnu/librtlsdr.so.2.0.1
+(pkg-config at build: 2.0.1)`, or `static` when it's linked into the binary. It's logged at startup
+too. The library affects real gain: a distribution's osmocom librtlsdr and RTL-SDR Blog's fork can
+differ by several dB at the same `gain` setting. The Dockerfile here builds the Blog fork, while a
+build on a Debian or Ubuntu machine uses whatever `librtlsdr-dev` (or `/usr/local`) provides.
+
 ### Cross-Instance Mixer Input
 
 Normally a mixer can only combine channels from devices declared in its own instance's

@@ -1132,6 +1132,20 @@ warning. `needs_raw_iq` stays set.
   parse succeeds, so other `cerr` warnings in `parse_channel()` never show on a live edit.
 - Just below the limit the filter is stable but float rounding shows (1.5% at 15999, 0.1% at 15990).
 
+**55. `-v` and the startup log name the librtlsdr in use** (`loaded_library_path()`,
+`describe_library()` in `src/helper_functions.cpp`; `src/rtl_airband.cpp`, `src/config.h.in`). A
+`librtlsdr:` line, printed after `Features:` when built `WITH_RTLSDR`, gives the real file that
+exports `rtlsdr_open`, or `static`, plus the pkg-config version seen at build time.
+- **Why.** A 2026-11-23 deploy changed librtlsdr from an RTL-SDR Blog build to Ubuntu's 2.0.1, with
+  no visible sign but a several-dB change in received levels. librtlsdr has no version function, and
+  which register differences cause it is unproven.
+- **Goes through `dlsym()`**, since in a non-PIE executable `&rtlsdr_open` can be a stub in the
+  executable itself. A `static` build can't name the library, so only the pkg-config version helps.
+- **Which library a release uses is a per-release decision.** This repo's Dockerfile and
+  rtl-airband-panel's packaging build the Blog fork. A `cmake` build on Ubuntu uses the distro's.
+- Not a `Features:` name: the panel reads `Features:` and the version line by prefix and ignores
+  other lines.
+
 ### Do not import from `yegors`
 
 The `yegors` fork also contains SRT output support and its own UDP path. The UDP path there is

@@ -17,6 +17,8 @@
  * along with this program; if not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <sys/stat.h>
+
 #include "test_base_class.h"
 
 #include <cstring>
@@ -476,6 +478,25 @@ TEST_F(HelperFunctionsTest, setting_as_bool_or_rejects_non_bool) {
     bool value = false;
     EXPECT_FALSE(setting_as_bool_or(config.getRoot(), "int_value", false, &value));
     EXPECT_FALSE(setting_as_bool_or(config.getRoot(), "string_value", false, &value));
+}
+
+TEST_F(HelperFunctionsTest, loaded_library_path_is_the_real_file_a_symbol_comes_from) {
+    string const path = loaded_library_path("sqrtf");
+    ASSERT_FALSE(path.empty());
+    EXPECT_EQ(path[0], '/') << path;
+    struct stat st;
+    ASSERT_EQ(lstat(path.c_str(), &st), 0) << path;
+    EXPECT_FALSE(S_ISLNK(st.st_mode)) << path;
+}
+
+TEST_F(HelperFunctionsTest, loaded_library_path_is_empty_for_a_symbol_no_library_exports) {
+    EXPECT_EQ(loaded_library_path("rtl_airband_no_such_symbol"), "");
+}
+
+TEST_F(HelperFunctionsTest, describe_library_covers_shared_and_static_links) {
+    EXPECT_EQ(describe_library("/usr/lib/librtlsdr.so.2.0.1", "2.0.1"), "/usr/lib/librtlsdr.so.2.0.1 (pkg-config at build: 2.0.1)");
+    EXPECT_EQ(describe_library("", "2.0.1"), "static (pkg-config at build: 2.0.1)");
+    EXPECT_EQ(describe_library("", ""), "static (pkg-config at build: unknown)");
 }
 
 TEST_F(HelperFunctionsTest, fork_features_names_the_fork_and_its_capabilities) {
