@@ -109,9 +109,8 @@ TEST_F(DeviceStatsTest, consumed_samples_wrap_around_the_circular_buffer) {
     EXPECT_EQ(input.peak_window_samples, 2u);
 }
 
-// The demod loop's 7-term Blackman-Harris window (rtl_airband.cpp). It matters here:
-// compute_channel_bin() picks the bin *below* a channel that lands exactly on a bin center, and
-// only the window's main lobe makes the carrier visible in that neighbouring bin at all.
+// The demod loop's 7-term Blackman-Harris window (rtl_airband.cpp). A carrier up to half a bin from
+// its bin's center is still seen through the window's main lobe.
 static double fft_window(size_t i, size_t n) {
     const double a[] = {0.27105140069342, 0.43329793923448, 0.21812299954311, 0.06592544638803, 0.01081174209837, 0.00077658482522, 0.00001388721735};
     double x = 0.0;

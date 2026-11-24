@@ -180,8 +180,8 @@ void mixer_remote_dispatch_packet(mixer_remote_listener_t* listener, const uint8
     // Observability only, not filtering: a duplicate/reordered/gapped packet is still applied to
     // the mixer slot below (mixer_put_samples() always writes "this tick's" audio - there is no
     // reordering buffer here, matching the wider "audio timing derives from the SDR sample rate,
-    // there is no wall-clock pacing" design already documented for this codebase). last_seq only
-    // ever advances (never rewinds on a duplicate/reorder), so a later genuinely-new packet is
+    // there is no wall-clock pacing" design already documented for this codebase). last_seq
+    // never rewinds on a duplicate/reorder, only on a sender restart, so a later genuinely-new packet is
     // still classified correctly against the highest sequence actually seen so far.
     mixer_remote_seq_class seq_class = mixer_remote_classify_seq(route->have_last_seq, route->last_seq, hdr.seq);
     if (seq_class == mixer_remote_seq_class::kGap) {
@@ -189,6 +189,9 @@ void mixer_remote_dispatch_packet(mixer_remote_listener_t* listener, const uint8
         route->last_seq = hdr.seq;
     } else if (seq_class == mixer_remote_seq_class::kDuplicateOrReorder) {
         route->seq_reorder_or_duplicate_count++;
+    } else if (seq_class == mixer_remote_seq_class::kRestart) {
+        route->seq_restart_count++;
+        route->last_seq = hdr.seq;
     } else {
         route->last_seq = hdr.seq;
     }

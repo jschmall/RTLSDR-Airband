@@ -787,9 +787,8 @@ and signal levels and per-device buffer counters only, and the control socket ha
   R_SCAN batches that hopped mid-batch are dropped, and the result is EMA-smoothed (0.2) into
   `freq_t::freq_offset_hz`. Works whether `afc` is on or off. AM sidebands bias the estimate
   slightly (a 0.8-modulated 1 kHz test tone reads ~3% low: ~0.2 ppm at 120 MHz).
-  **Gotcha found while testing:** `compute_channel_bin()` picks the bin *below* a channel that
-  lands exactly on a bin center; only the 7-term Blackman-Harris window's main lobe makes the
-  carrier visible there, so the unit test's simulated DFT has to apply the same window.
+  The unit test's simulated DFT applies the demod loop's window, since a channel can be up to half
+  a bin from its bin's center (a full bin before item 53).
 - **Driver settings readback.** New nullable `input_t::get_settings` hook (rtlsdr,
   soapysdr; also mirisdr until upstream v7.0.0 removed that driver) reports gain / correction / tuner bandwidth from the driver's `dev_data`. Originally
   called only from the control socket thread; since item 45 every caller holds
@@ -1095,6 +1094,98 @@ behavior), `"atan2"` (exact), `"quadri"` (the existing `-Q`).
   −18.6 dB. The −62.6 dB above is from a strong generated signal.
 - **Not validated:** a live dongle with `atan2`, a 136.5 Hz channel off the air, a downstream tone
   decoder, or ARM.
+
+#### FFT bin selection
+
+**53. A channel uses the nearest FFT bin** (`compute_channel_bin()` in `src/live_reconfig.cpp`, so
+startup, live retune and live `sample_rate` change). Upstream computes
+`ceil((freq + fs - cf) / (fs / N) - 1.0) % N`, with an integer division for `fs / N`.
+- **Bins were low.** That formula floors, and takes a whole bin off a channel that lands exactly on
+  one (5 kHz at 2.56 Msps / 512). One bin off costs 1.9 dB of level and rejects the two adjacent
+  channels unequally. Scan mode sits exactly on a bin whenever the bin width is a whole number of
+  Hz, so there it was always one low.
+- **The truncated width adds up.** At 2.4 Msps the bin was up to 2.3 off at `fft_size = 2048`, 9.7
+  at 4096 and 40 at 8192, where the window reaches about 7 bins: effectively deaf.
+- **Now** `lround((freq - cf) * N / fs)`, wrapped into 0..N-1. A channel exactly between two bins
+  takes the one further from `centerfreq`.
+- **Derotation isn't affected:** `compute_channel_dm_dphi()` and the estimator's expected rotation use
+  the channel frequency, never the bin.
+- **The offset estimate changes only for weak signals.** In a simulation, a carrier 7 dB or more above the noise in its
+  bin reads the same at any bin error. Below that it is pulled towards the bin's center: at 1.024
+  Msps and a full bin, −256 Hz at 3 dB, −596 Hz at 0 dB, −1625 Hz on noise alone. At a centered bin
+  the readings stay within ±70 Hz. Seen on a live dongle too: channels with no usable carrier read
+  −850..−1580 Hz on the old bin and −125..+82 Hz on the new one. So auto_ppm gets steadier votes
+  from weak channels. Item 45's P25 bias didn't reproduce in the simulation. AFC still searches outward from `base_bins`. A channel on
+  `centerfreq` now has base bin 0 rather than N−1, so AFC can't step below it (it couldn't step
+  above before). No unit test covers AFC: the class lives in `rtl_airband.cpp`, which the test
+  binary doesn't link.
+- **Measured** with a carrier exactly on a bin, through the v7.5.0 and fixed binaries (file input):
+  −17.99 to −16.05 dBFS, +1.94. No live carrier strong enough to repeat it was available.
+- **Levels move.** Signal and noise readings rise by up to 1.9 dB on channels that were a full bin
+  off, so a manual `squelch_threshold` tuned to the old reading may need adjusting.
+- **rtl-airband-panel has its own copy** (`compute_bin()` in `crates/airband-validate`), used for
+  its bin-collision check. It must change with this.
+- This replaces two tests that pinned the old formula. Expect a conflict if upstream changes it.
+
+**54. A channel `bandwidth` at or above the sample rate leaves the lowpass filter off**
+(`src/filters.cpp`, `make_channel_lowpass()` in `src/config.cpp`). `LowpassFilter`'s poles reach the
+unit circle at `WAVE_RATE / 2` (bandwidth 16000 in NFM builds, 8000 in AM-only ones) and leave it
+above that, so the filter diverged. The constructor now disables itself there, and the parser logs a
+warning. `needs_raw_iq` stays set.
+- **A warning, not a config error**, because `reload_diff` removes the old channel before parsing the
+  new one: an error would take the channel off the air.
+- **Logged with `log()`, not `cerr`.** `try_append_channels()` captures `cerr` and drops it when the
+  parse succeeds, so other `cerr` warnings in `parse_channel()` never show on a live edit.
+- Just below the limit the filter is stable but float rounding shows (1.5% at 15999, 0.1% at 15990).
+
+**55. `-v` and the startup log name the librtlsdr in use** (`loaded_library_path()`,
+`describe_library()` in `src/helper_functions.cpp`; `src/rtl_airband.cpp`, `src/config.h.in`). A
+`librtlsdr:` line, printed after `Features:` when built `WITH_RTLSDR`, gives the real file that
+exports `rtlsdr_open`, or `static`, plus the pkg-config version seen at build time.
+- **Why.** A 2026-11-23 deploy reportedly changed the librtlsdr build, with no visible sign but a
+  several-dB change in received levels (reported by the monitoring session, cause unproven).
+  librtlsdr has no version function. Don't identify a build by its strings: Ubuntu's 2.0.1 prints
+  "RTL-SDR Blog V4 Detected" too.
+- **Goes through `dlsym()`**, since in a non-PIE executable `&rtlsdr_open` can be a stub in the
+  executable itself. A `static` build can't name the library, so only the pkg-config version helps.
+- **Which library a release uses is a per-release decision.** This repo's Dockerfile and
+  rtl-airband-panel's packaging build the Blog fork. A `cmake` build on Ubuntu uses the distro's.
+- Not a `Features:` name: the panel reads `Features:` and the version line by prefix and ignores
+  other lines.
+
+**56. A restarted `mixer_remote` sender is resynced and counted once** (`src/mixer_remote_wire.{h,cpp}`,
+`src/mixer_remote.{h,cpp}`, `src/output.cpp`). A sender starts again at seq 0, but `last_seq` never
+rewound, so every packet counted as `seq_reorder_or_duplicate` until it passed the old number
+(10,572 after one production restart). `kRestart` is now seq 0, or a jump back of more than 64
+packets (8 s; AF_UNIX datagrams don't reorder). It resyncs `last_seq` and counts in
+`reason="seq_restart"`. Audio was never affected. A restarted sender whose first packets are lost,
+after running for under 64 packets, still counts as reorders until it catches up.
+
+**57. Squelch and dBFS behavior, documented not changed** (README "Device Health Status").
+- `level_to_dBFS()` adds `7.54 + 10 log10(fft_size / 2) - 2.38` dB, which suits noise: a full-scale
+  carrier comes out +17.9 dB at `fft_size` 512 (clamped to 0), 3 dB more per doubling. Cross-checked
+  with the demod window's coherent gain.
+- `calculate_noise_floor()` adds 1e-6 every 16 samples and never clamps to anything but the
+  signal, so a constant carrier raises the floor until squelch closes. `noise_floor_` is a float, and
+  at 8.33 the step rounds away (a float32 replay sticks at 8.33008), so whether a given carrier
+  mutes depends on rounding.
+- `squelch_snr_threshold = 0` sets the level to the floor (0.9 of it while flapping); the parser's
+  "disables squelch" comment is loose. Left without a warning: `config/noaa.conf` and
+  `test_squelch_disabled.py` use 0 on purpose.
+
+**58. A mixer stops waiting for an input that stopped delivering** (`mixer_ready_to_emit()` in
+`src/mixer.cpp`, `mixinput_t::missed_batches`). A connected input that sends nothing, such as a
+`remote_inputs` route whose sender is stopped or restarting, took every batch to its last interval:
+three 62.5 ms passes, 187.5 ms per 125 ms batch.
+- **Measured** with the real `mixer_thread()`: the other inputs overran 9,622 times/h (a third of
+  their audio) and output ran at 5.3 batches/s instead of 8. Through the binary, 31 overruns in 12 s.
+- **Now** an input that misses 4 batches in a row (`MIXER_STALE_BATCHES`, about 0.75 s) isn't waited
+  for, until it delivers again. If every input stopped, the interval still paces the batch, or the
+  mixer would emit on every pass. After the fix: 8.0/s, and 2 overruns in 90 s.
+- **Doesn't change a slow sender.** One that loses samples (0.43% at 2.56 Msps in production) still
+  makes the faster inputs overrun by the difference, about 120/h, because the mixer is paced by its
+  slowest input. The model and a real-thread run agree with production's 124/h.
+- Tests: `MixerReadyTest` and a real-time `mixer_thread()` test in `src/test_mixer.cpp` (8 s).
 
 ### Do not import from `yegors`
 

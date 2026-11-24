@@ -54,6 +54,9 @@ input (below), and `v5.3.0` introduced live reconfiguration and `send_tx_tags` s
 - **Selectable FM demodulator (`fm_demod`)** — use the exact arctangent instead of the default
   approximation, which adds harmonics to low-frequency tones. See
   [FM Demodulator](#fm-demodulator), below.
+- **Nearest FFT bin per channel** — stock builds use the FFT bin at or just below each channel, up to
+  a full bin off (about 2 dB, and more bleed from one neighboring channel), and far more at large
+  `fft_size` values. Readings can rise up to 2 dB, so recheck any manual `squelch_threshold`.
 - **SIGHUP config reload** — SIGHUP now triggers a clean restart to pick up config
   changes, instead of just exiting.
 - **Assorted stability fixes** — buffer overflow, thread-safety, and error-handling
@@ -140,6 +143,23 @@ new in this fork:
   the configured frequency, measured while the channel's squelch is open. If every channel
   on a radio is off by about the same number of parts per million, that radio's
   `correction` is off by that much.
+
+`signal_dbfs` and `noise_dbfs` (and the stats file's `channel_dbfs_*`) use a noise-calibrated
+scale, so they aren't comparable with `peak_dbfs`:
+
+- A steady carrier reads about 18 dB above its true level at `fft_size = 512`, and 3 dB more for each
+  doubling. Anything that would exceed 0 reads 0.
+- `squelch_threshold` uses the same scale, so a value tuned at one `fft_size` needs moving 3 dB per
+  doubling to open at the same carrier.
+
+Two things to know about squelch on channels like these:
+
+- **Automatic squelch can mute a continuous carrier.** The noise floor estimate rises slowly while a
+  signal is present, so a transmitter that never stops (NOAA weather, a control channel) eventually
+  raises it enough to close the squelch. How long that takes depends on level, and rounding can
+  stall it indefinitely. Set an explicit `squelch_threshold` instead.
+- **`squelch_snr_threshold = 0` doesn't fix the level.** It sets the squelch level to the noise floor
+  itself, which still moves as above.
 
 The stats file also carries `device_peak_dbfs`, `device_clipped_sample_count` and
 `channel_freq_offset_hz` for graphing over time.
@@ -265,6 +285,12 @@ removed that driver). `fm_demod` follows `nfm`, since only NFM builds have it. T
 from a stock build, since both use the same `vN.x` version numbers. Names are only ever added,
 never renamed or removed.
 
+A third line names the librtlsdr in use, e.g. `librtlsdr: /usr/lib/x86_64-linux-gnu/librtlsdr.so.2.0.1
+(pkg-config at build: 2.0.1)`, or `static` when it's linked into the binary. It's logged at startup
+too. The library affects real gain: a distribution's osmocom librtlsdr and RTL-SDR Blog's fork can
+differ by several dB at the same `gain` setting. The Dockerfile here builds the Blog fork, while a
+build on a Debian or Ubuntu machine uses whatever `librtlsdr-dev` (or `/usr/local`) provides.
+
 ### Cross-Instance Mixer Input
 
 Normally a mixer can only combine channels from devices declared in its own instance's
@@ -363,7 +389,7 @@ rather than just knowing that it is.
 | Metric | Meaning |
 |---|---|
 | `mixer_remote_last_packet_time_seconds` | Unix timestamp of the last packet received for a `remote_inputs` route (0 = never). Distinguishes a quiet-but-alive sender from one whose process is gone entirely. |
-| `mixer_remote_route_failure_count{reason=...}` | Per-route failures: `rate_mismatch`, `sample_count_mismatch`, `malformed_payload`, `seq_gap`, `seq_reorder_or_duplicate`. |
+| `mixer_remote_route_failure_count{reason=...}` | Per-route failures: `rate_mismatch`, `sample_count_mismatch`, `malformed_payload`, `seq_gap`, `seq_reorder_or_duplicate`, `seq_restart` (the sender restarted; one per restart). Two senders wrongly sharing a `stream_id` show as steadily climbing `seq_gap` plus either `seq_restart` or `seq_reorder_or_duplicate`, depending on how far apart their counters are. |
 | `mixer_remote_listener_failure_count{reason=...}` | Per-listener failures that can't be attributed to a specific route: `rejected_uid`, `malformed_header`, `unknown_stream`. |
 
 **Process-wide**:

@@ -80,6 +80,7 @@ struct mixer_remote_route_t {
     size_t sample_count_mismatch_count = 0;
     size_t seq_gap_count = 0;
     size_t seq_reorder_or_duplicate_count = 0;
+    size_t seq_restart_count = 0;
 };
 
 // One AF_UNIX SOCK_DGRAM listen path, potentially multiplexing several remote_inputs entries

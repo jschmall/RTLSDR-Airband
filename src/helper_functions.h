@@ -60,6 +60,8 @@ double rusage_cpu_seconds(const struct rusage& ru);
 // fork capabilities plus the optional build components compiled in. Names are an interface:
 // add new ones, never rename or drop one.
 std::string fork_features();
+std::string loaded_library_path(const char* symbol);
+std::string describe_library(const std::string& path, const std::string& build_version);
 
 // Builds the Icecast "song" tag content for a currently-active transmission: the configured
 // label if set, else a "%.3f MHz" formatted frequency (matching the existing

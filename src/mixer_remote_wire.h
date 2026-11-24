@@ -85,7 +85,10 @@ enum class mixer_remote_seq_class {
     kInOrder,             // new_seq == last_seq + 1
     kGap,                 // new_seq > last_seq + 1 - one or more packets presumed lost
     kDuplicateOrReorder,  // new_seq <= last_seq
+    kRestart,             // sender restarted: seq 0 again, or more than MIXER_REMOTE_RESTART_JUMP back
 };
+// Larger than any reorder AF_UNIX datagrams could show, smaller than 10 s of packets.
+constexpr uint64_t MIXER_REMOTE_RESTART_JUMP = 64;
 mixer_remote_seq_class mixer_remote_classify_seq(bool have_last_seq, uint64_t last_seq, uint64_t new_seq);
 
 #endif /* _MIXER_REMOTE_WIRE_H */

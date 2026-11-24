@@ -442,6 +442,16 @@ static struct freq_t* mk_freqlist(int n) {
     return fl;
 }
 
+static LowpassFilter make_channel_lowpass(int bandwidth, int dev_idx, int chan_idx) {
+    if (bandwidth >= WAVE_RATE) {
+        // Not a config error: reload_diff has already torn down the old channel when it parses the
+        // new one, so failing here would take the channel off the air. And not cerr, which
+        // reload_diff discards when the parse succeeds.
+        log(LOG_WARNING, "Warning: dev[%d].channel[%d]: bandwidth %d Hz is not below the sample rate of %d Hz, leaving the filter off\n", dev_idx, chan_idx, bandwidth, WAVE_RATE);
+    }
+    return LowpassFilter((float)bandwidth / 2, WAVE_RATE);
+}
+
 static void warn_if_freq_not_in_range(int devidx, int chanidx, int freq, int centerfreq, int sample_rate) {
     static const float soft_bw_threshold = 0.9f;
     float bw_limit = (float)sample_rate / 2.f * soft_bw_threshold;
@@ -853,7 +863,7 @@ bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx,
                 } else if (bandwidth < 0) {
                     cerr << "devices.[" << dev_idx << "] channels.[" << chan_idx << "] freq.[" << f << "]: bandwidth value '" << bandwidth << "' invalid, ignoring\n";
                 } else {
-                    channel->freqlist[f].lowpass_filter = LowpassFilter((float)bandwidth / 2, WAVE_RATE);
+                    channel->freqlist[f].lowpass_filter = make_channel_lowpass(bandwidth, dev_idx, chan_idx);
                 }
             }
         } else {
@@ -864,7 +874,7 @@ bool parse_channel(libconfig::Setting& chan_setting, device_t* dev, int dev_idx,
                 cerr << "devices.[" << dev_idx << "] channels.[" << chan_idx << "]: bandwidth value '" << bandwidth << "' invalid, ignoring\n";
             } else {
                 for (int f = 0; f < channel->freq_count; f++) {
-                    channel->freqlist[f].lowpass_filter = LowpassFilter((float)bandwidth / 2, WAVE_RATE);
+                    channel->freqlist[f].lowpass_filter = make_channel_lowpass(bandwidth, dev_idx, chan_idx);
                 }
             }
         }

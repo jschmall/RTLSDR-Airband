@@ -588,6 +588,10 @@ struct mixinput_t {
     std::atomic<bool> has_signal;
     pthread_mutex_t mutex;
     size_t input_overrun_count;
+    // Consecutive mixed batches this input was due for but missed; only mixer_thread() writes it
+    // once the slot is connected. At MIXER_STALE_BATCHES mixer_thread() stops waiting for the input
+    // until it delivers again.
+    int missed_batches;
     // index into devices[]/devices[].channels[] this input was configured from, set to -1 by
     // mixer_connect_input() and resolved by config.cpp's parse_outputs() right after; read
     // live by process_outputs() to look up the source channel's current label/freq_idx for
@@ -792,6 +796,8 @@ void mixer_disable(mixer_t* mixer);
 void mixer_enable(mixer_t* mixer);
 void mixer_put_samples(mixer_t* mixer, int input_idx, const float* samples, bool has_signal, unsigned int len);
 void* mixer_thread(void* params);
+#define MIXER_STALE_BATCHES 4
+bool mixer_ready_to_emit(const mixer_t* mixer);
 const char* mixer_get_error();
 // pure - no I/O or global state - so it can be unit tested directly
 void mix_waveforms(float* sum, const float* in, float mult, int size);

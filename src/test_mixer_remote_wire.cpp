@@ -178,6 +178,15 @@ TEST_F(MixerRemoteWireTest, classify_seq_duplicate) {
     EXPECT_EQ(mixer_remote_classify_seq(true, 10, 10), mixer_remote_seq_class::kDuplicateOrReorder);
 }
 
+TEST_F(MixerRemoteWireTest, classify_seq_restart) {
+    EXPECT_EQ(mixer_remote_classify_seq(true, 10572, 0), mixer_remote_seq_class::kRestart);
+    EXPECT_EQ(mixer_remote_classify_seq(true, 3, 0), mixer_remote_seq_class::kRestart) << "a sender that ran only briefly";
+    EXPECT_EQ(mixer_remote_classify_seq(true, 10572, 2), mixer_remote_seq_class::kRestart) << "its first packets were lost";
+    EXPECT_EQ(mixer_remote_classify_seq(true, 100, 35), mixer_remote_seq_class::kRestart);
+    EXPECT_EQ(mixer_remote_classify_seq(true, 100, 36), mixer_remote_seq_class::kDuplicateOrReorder);
+    EXPECT_EQ(mixer_remote_classify_seq(true, 0, 0), mixer_remote_seq_class::kDuplicateOrReorder);
+}
+
 TEST_F(MixerRemoteWireTest, classify_seq_reorder_older) {
     EXPECT_EQ(mixer_remote_classify_seq(true, 10, 3), mixer_remote_seq_class::kDuplicateOrReorder);
 }
