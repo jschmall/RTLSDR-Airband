@@ -1173,6 +1173,20 @@ after running for under 64 packets, still counts as reorders until it catches up
   "disables squelch" comment is loose. Left without a warning: `config/noaa.conf` and
   `test_squelch_disabled.py` use 0 on purpose.
 
+**58. A mixer stops waiting for an input that stopped delivering** (`mixer_ready_to_emit()` in
+`src/mixer.cpp`, `mixinput_t::missed_batches`). A connected input that sends nothing, such as a
+`remote_inputs` route whose sender is stopped or restarting, took every batch to its last interval:
+three 62.5 ms passes, 187.5 ms per 125 ms batch.
+- **Measured** with the real `mixer_thread()`: the other inputs overran 9,622 times/h (a third of
+  their audio) and output ran at 5.3 batches/s instead of 8. Through the binary, 31 overruns in 12 s.
+- **Now** an input that misses 4 batches in a row (`MIXER_STALE_BATCHES`, about 0.75 s) isn't waited
+  for, until it delivers again. If every input stopped, the interval still paces the batch, or the
+  mixer would emit on every pass. After the fix: 8.0/s, and 2 overruns in 90 s.
+- **Doesn't change a slow sender.** One that loses samples (0.43% at 2.56 Msps in production) still
+  makes the faster inputs overrun by the difference, about 120/h, because the mixer is paced by its
+  slowest input. The model and a real-thread run agree with production's 124/h.
+- Tests: `MixerReadyTest` and a real-time `mixer_thread()` test in `src/test_mixer.cpp` (8 s).
+
 ### Do not import from `yegors`
 
 The `yegors` fork also contains SRT output support and its own UDP path. The UDP path there is

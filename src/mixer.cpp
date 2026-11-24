@@ -95,6 +95,7 @@ int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance) {
         mixer->inputs[j].ready = false;
         mixer->inputs[j].has_signal = false;
         mixer->inputs[j].input_overrun_count = 0;
+        mixer->inputs[j].missed_batches = 0;
         // Reset to the same "not yet resolved" sentinel the fresh-slot path below uses -
         // otherwise a reused slot would transiently expose the PREVIOUS occupant's source
         // indices to process_outputs()'s send_tx_tags lookup (mixer_tx_tag()) in the brief
@@ -159,6 +160,7 @@ int mixer_connect_input(mixer_t* mixer, float ampfactor, float balance) {
     mixer->inputs[i].ready = false;
     mixer->inputs[i].has_signal = false;
     mixer->inputs[i].input_overrun_count = 0;
+    mixer->inputs[i].missed_batches = 0;
     mixer->inputs[i].source_device_idx = -1;
     mixer->inputs[i].source_channel_idx = -1;
     mixer->inputs[i].remote_label = NULL;
@@ -211,6 +213,7 @@ void mixer_finalize_capacity() {
                 mixer->inputs[k].ready = false;
                 mixer->inputs[k].has_signal = false;
                 mixer->inputs[k].input_overrun_count = 0;
+                mixer->inputs[k].missed_batches = 0;
                 mixer->inputs[k].source_device_idx = -1;
                 mixer->inputs[k].source_channel_idx = -1;
                 mixer->inputs[k].remote_label = NULL;
@@ -291,6 +294,29 @@ int mixer_select_active_tag_input(const mixinput_t* inputs, int input_count) {
     return -1;
 }
 
+// True when every input still due has been mixed. An input that stopped delivering isn't waited for:
+// each wait would take the batch to its last interval, which is 1.5 batches long, and the inputs
+// that still deliver would overrun. If they all stopped, only the interval may end the batch, or
+// this would emit on every pass.
+bool mixer_ready_to_emit(const mixer_t* mixer) {
+    bool any_connected = false;
+    bool any_delivering = false;
+    for (int k = 0; k < mixer->input_count; k++) {
+        if (!mixer->input_mask[k]) {
+            continue;
+        }
+        any_connected = true;
+        if (mixer->inputs[k].missed_batches >= MIXER_STALE_BATCHES) {
+            continue;
+        }
+        any_delivering = true;
+        if (mixer->inputs_todo[k]) {
+            return false;
+        }
+    }
+    return any_delivering || !any_connected;
+}
+
 /* Samples are delivered to mixer inputs in batches of WAVE_BATCH size (default 1000, ie. 1/8 secs
  * of audio). mixer_thread emits mixed audio in batches of the same size, but the loop runs
  * twice more often (MIX_DIVISOR = 2) in order to accomodate for any possible input jitter
@@ -361,20 +387,12 @@ void* mixer_thread(void* param) {
                     }
                     input->ready = false;
                     mixer->inputs_todo[j] = false;
+                    input->missed_batches = 0;
                 }
                 pthread_mutex_unlock(&input->mutex);
             }
 
-            // check if all "good" inputs have been handled.  this means there is no enabled mixer (mixer->input_mask is true) that has a
-            // input to handle (mixer->inputs_todo is true)
-            bool all_good_inputs_handled = true;
-            for (int k = 0; k < mixer->input_count && all_good_inputs_handled; k++) {
-                if (mixer->inputs_todo[k] && mixer->input_mask[k]) {
-                    all_good_inputs_handled = false;
-                }
-            }
-
-            if ((all_good_inputs_handled == true) || mixer->interval == 0) {  // all good inputs handled or last interval passed
+            if (mixer_ready_to_emit(mixer) || mixer->interval == 0) {  // all good inputs handled or last interval passed
 
 #ifdef DEBUG
                 gettimeofday(&te, NULL);
@@ -402,6 +420,9 @@ void* mixer_thread(void* param) {
                 signal->send();
                 mixer->interval = MIX_DIVISOR;
                 for (int k = 0; k < mixer->input_count; k++) {
+                    if (mixer->inputs_todo[k] && mixer->input_mask[k] && mixer->inputs[k].missed_batches < MIXER_STALE_BATCHES) {
+                        mixer->inputs[k].missed_batches++;
+                    }
                     mixer->inputs_todo[k] = true;
                 }
             } else {

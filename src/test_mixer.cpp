@@ -17,6 +17,9 @@
  * along with this program; if not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <chrono>
+#include <thread>
+
 #include "test_base_class.h"
 
 #include "rtl_airband.h"
@@ -118,6 +121,96 @@ TEST_F(MixerTest, select_active_tag_input_zero_input_count) {
     mixinput_t inputs[1] = {};
     inputs[0].has_signal = true;
     EXPECT_EQ(mixer_select_active_tag_input(inputs, 0), -1);
+}
+
+class MixerReadyTest : public MixerTest {
+   protected:
+    mixer_t mixer = {};
+    mixinput_t inputs[3] = {};
+    bool todo[3] = {true, true, true};
+    bool mask[3] = {true, true, true};
+
+    void SetUp() override {
+        MixerTest::SetUp();
+        mixer.inputs = inputs;
+        mixer.inputs_todo = todo;
+        mixer.input_mask = mask;
+        mixer.input_count = 3;
+    }
+};
+
+TEST_F(MixerReadyTest, waits_for_an_input_that_is_merely_late) {
+    todo[0] = todo[1] = false;
+    inputs[2].missed_batches = MIXER_STALE_BATCHES - 1;
+    EXPECT_FALSE(mixer_ready_to_emit(&mixer));
+    todo[2] = false;
+    EXPECT_TRUE(mixer_ready_to_emit(&mixer));
+}
+
+TEST_F(MixerReadyTest, does_not_wait_for_an_input_that_stopped) {
+    todo[0] = todo[1] = false;
+    inputs[2].missed_batches = MIXER_STALE_BATCHES;
+    EXPECT_TRUE(mixer_ready_to_emit(&mixer));
+    todo[1] = true;  // another input is still due
+    EXPECT_FALSE(mixer_ready_to_emit(&mixer));
+}
+
+TEST_F(MixerReadyTest, keeps_its_pace_when_every_input_stopped) {
+    for (int i = 0; i < 3; i++) {
+        inputs[i].missed_batches = MIXER_STALE_BATCHES;
+    }
+    EXPECT_FALSE(mixer_ready_to_emit(&mixer)) << "must fall back to the interval, not emit on every tick";
+}
+
+TEST_F(MixerReadyTest, ignores_masked_off_inputs) {
+    todo[0] = todo[1] = false;
+    mask[2] = false;
+    EXPECT_TRUE(mixer_ready_to_emit(&mixer));
+}
+
+// Runs the real mixer_thread() in real time: a sender that never sends must not cost the input
+// that does.
+TEST_F(MixerTest, a_silent_input_does_not_slow_the_mixer_down) {
+    mixer_t mixer = {};
+    mixer.name = "m";
+    mixer.interval = MIX_DIVISOR;
+    mixer.channel.state = CH_DIRTY;
+    mixers = &mixer;
+    mixer_count = 1;
+    mixer_capacity_finalized = false;
+    int const live = mixer_connect_input(&mixer, 1.0f, 0.0f);
+    ASSERT_NE(mixer_connect_input(&mixer, 1.0f, 0.0f), -1);
+
+    Signal signal;
+    do_exit = 0;
+    pthread_t thread;
+    ASSERT_EQ(pthread_create(&thread, NULL, &mixer_thread, &signal), 0);
+    vector<float> samples(WAVE_BATCH, 0.1f);
+    size_t overruns_before = 0;
+    int emitted = 0;
+    auto const start = chrono::steady_clock::now();
+    // 5 ms ticks and a batch every 125 ms: 2 s for the mixer to notice, then 6 s measured
+    for (int tick = 0; tick < 1600; tick++) {
+        this_thread::sleep_until(start + chrono::milliseconds(5 * tick));
+        if (mixer.channel.state == CH_READY) {
+            emitted += tick >= 400;
+            mixer.channel.state = CH_DIRTY;
+        }
+        if (tick % 25 == 0) {
+            mixer_put_samples(&mixer, live, samples.data(), true, WAVE_BATCH);
+        }
+        if (tick == 400) {
+            overruns_before = mixer.inputs[live].input_overrun_count;
+        }
+    }
+    do_exit = 1;
+    pthread_join(thread, NULL);
+    do_exit = 0;
+    mixers = nullptr;
+    mixer_count = 0;
+
+    EXPECT_LE(mixer.inputs[live].input_overrun_count - overruns_before, 2u);
+    EXPECT_GE(emitted, 45);  // of 48
 }
 
 // mixer_finalize_capacity() operates on the global mixers/mixer_count (like production code
