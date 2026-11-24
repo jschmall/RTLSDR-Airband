@@ -1154,6 +1154,18 @@ packets (8 s; AF_UNIX datagrams don't reorder). It resyncs `last_seq` and counts
 `reason="seq_restart"`. Audio was never affected. A restarted sender whose first packets are lost,
 after running for under 64 packets, still counts as reorders until it catches up.
 
+**57. Squelch and dBFS behavior, documented not changed** (README "Device Health Status").
+- `level_to_dBFS()` adds `7.54 + 10 log10(fft_size / 2) - 2.38` dB, which suits noise: a full-scale
+  carrier comes out +17.9 dB at `fft_size` 512 (clamped to 0), 3 dB more per doubling. Cross-checked
+  with the demod window's coherent gain.
+- `calculate_noise_floor()` adds 1e-6 every 16 samples and never clamps to anything but the
+  signal, so a constant carrier raises the floor until squelch closes. `noise_floor_` is a float, and
+  at 8.33 the step rounds away (a float32 replay sticks at 8.33008), so whether a given carrier
+  mutes depends on rounding.
+- `squelch_snr_threshold = 0` sets the level to the floor (0.9 of it while flapping); the parser's
+  "disables squelch" comment is loose. Left without a warning: `config/noaa.conf` and
+  `test_squelch_disabled.py` use 0 on purpose.
+
 ### Do not import from `yegors`
 
 The `yegors` fork also contains SRT output support and its own UDP path. The UDP path there is

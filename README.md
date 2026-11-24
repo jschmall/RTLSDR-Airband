@@ -144,6 +144,23 @@ new in this fork:
   on a radio is off by about the same number of parts per million, that radio's
   `correction` is off by that much.
 
+`signal_dbfs` and `noise_dbfs` (and the stats file's `channel_dbfs_*`) use a noise-calibrated
+scale, so they aren't comparable with `peak_dbfs`:
+
+- A steady carrier reads about 18 dB above its true level at `fft_size = 512`, and 3 dB more for each
+  doubling. Anything that would exceed 0 reads 0.
+- `squelch_threshold` uses the same scale, so a value tuned at one `fft_size` needs moving 3 dB per
+  doubling to open at the same carrier.
+
+Two things to know about squelch on channels like these:
+
+- **Automatic squelch can mute a continuous carrier.** The noise floor estimate rises slowly while a
+  signal is present, so a transmitter that never stops (NOAA weather, a control channel) eventually
+  raises it enough to close the squelch. How long that takes depends on level, and rounding can
+  stall it indefinitely. Set an explicit `squelch_threshold` instead.
+- **`squelch_snr_threshold = 0` doesn't fix the level.** It sets the squelch level to the noise floor
+  itself, which still moves as above.
+
 The stats file also carries `device_peak_dbfs`, `device_clipped_sample_count` and
 `channel_freq_offset_hz` for graphing over time.
 
