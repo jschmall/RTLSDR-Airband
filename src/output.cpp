@@ -1426,8 +1426,8 @@ static void output_mixer_remote_recv_health(FILE* f) {
 
     fprintf(f,
             "# HELP mixer_remote_route_failure_count Per-remote_inputs-route packet failures: "
-            "rate/sample_count mismatches, malformed payloads, and out-of-order/duplicate "
-            "sequence numbers.\n"
+            "rate/sample_count mismatches, malformed payloads, out-of-order/duplicate "
+            "sequence numbers, and sender restarts.\n"
             "# TYPE mixer_remote_route_failure_count counter\n");
     for (mixer_remote_listener_t* listener : mixer_remote_listeners) {
         for (const mixer_remote_route_t& route : listener->routes) {
@@ -1440,6 +1440,7 @@ static void output_mixer_remote_recv_health(FILE* f) {
             fprintf(f, "mixer_remote_route_failure_count{listen_path=\"%s\",stream_id=\"%u\",reason=\"seq_gap\"}\t%zu\n", listener->listen_path.c_str(), route.stream_id, route.seq_gap_count);
             fprintf(f, "mixer_remote_route_failure_count{listen_path=\"%s\",stream_id=\"%u\",reason=\"seq_reorder_or_duplicate\"}\t%zu\n", listener->listen_path.c_str(), route.stream_id,
                     route.seq_reorder_or_duplicate_count);
+            fprintf(f, "mixer_remote_route_failure_count{listen_path=\"%s\",stream_id=\"%u\",reason=\"seq_restart\"}\t%zu\n", listener->listen_path.c_str(), route.stream_id, route.seq_restart_count);
         }
     }
     fprintf(f, "\n");

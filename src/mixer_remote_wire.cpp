@@ -92,5 +92,8 @@ mixer_remote_seq_class mixer_remote_classify_seq(bool have_last_seq, uint64_t la
     if (new_seq > last_seq + 1) {
         return mixer_remote_seq_class::kGap;
     }
+    if (new_seq < last_seq && (new_seq == 0 || last_seq - new_seq > MIXER_REMOTE_RESTART_JUMP)) {
+        return mixer_remote_seq_class::kRestart;
+    }
     return mixer_remote_seq_class::kDuplicateOrReorder;
 }

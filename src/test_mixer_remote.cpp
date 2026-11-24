@@ -381,6 +381,19 @@ TEST_F(MixerRemoteDispatchTest, a_skipped_sequence_number_is_counted_as_a_gap) {
     EXPECT_EQ(listener->routes[0].last_seq, 5u);
 }
 
+TEST_F(MixerRemoteDispatchTest, a_restarted_sender_is_counted_once_and_resynced) {
+    uint8_t buf[sizeof(mixer_remote_packet_header) + WAVE_BATCH * sizeof(float)];
+    for (uint64_t seq : {0, 1000, 0, 1, 2, 3}) {
+        ASSERT_GT(make_packet(buf, sizeof(buf), seq), 0u);
+        mixer_remote_dispatch_packet(listener, buf, sizeof(buf), getuid());
+    }
+
+    EXPECT_EQ(listener->routes[0].seq_restart_count, 1u);
+    EXPECT_EQ(listener->routes[0].seq_reorder_or_duplicate_count, 0u);
+    EXPECT_EQ(listener->routes[0].seq_gap_count, 1u);  // 0 -> 1000
+    EXPECT_EQ(listener->routes[0].last_seq, 3u);
+}
+
 TEST_F(MixerRemoteDispatchTest, a_duplicate_sequence_number_is_counted_but_does_not_rewind_last_seq) {
     uint8_t buf[sizeof(mixer_remote_packet_header) + WAVE_BATCH * sizeof(float)];
     ASSERT_GT(make_packet(buf, sizeof(buf), 0), 0u);

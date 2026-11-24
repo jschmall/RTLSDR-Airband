@@ -1146,6 +1146,14 @@ exports `rtlsdr_open`, or `static`, plus the pkg-config version seen at build ti
 - Not a `Features:` name: the panel reads `Features:` and the version line by prefix and ignores
   other lines.
 
+**56. A restarted `mixer_remote` sender is resynced and counted once** (`src/mixer_remote_wire.{h,cpp}`,
+`src/mixer_remote.{h,cpp}`, `src/output.cpp`). A sender starts again at seq 0, but `last_seq` never
+rewound, so every packet counted as `seq_reorder_or_duplicate` until it passed the old number
+(10,572 after one production restart). `kRestart` is now seq 0, or a jump back of more than 64
+packets (8 s; AF_UNIX datagrams don't reorder). It resyncs `last_seq` and counts in
+`reason="seq_restart"`. Audio was never affected. A restarted sender whose first packets are lost,
+after running for under 64 packets, still counts as reorders until it catches up.
+
 ### Do not import from `yegors`
 
 The `yegors` fork also contains SRT output support and its own UDP path. The UDP path there is

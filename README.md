@@ -372,7 +372,7 @@ rather than just knowing that it is.
 | Metric | Meaning |
 |---|---|
 | `mixer_remote_last_packet_time_seconds` | Unix timestamp of the last packet received for a `remote_inputs` route (0 = never). Distinguishes a quiet-but-alive sender from one whose process is gone entirely. |
-| `mixer_remote_route_failure_count{reason=...}` | Per-route failures: `rate_mismatch`, `sample_count_mismatch`, `malformed_payload`, `seq_gap`, `seq_reorder_or_duplicate`. |
+| `mixer_remote_route_failure_count{reason=...}` | Per-route failures: `rate_mismatch`, `sample_count_mismatch`, `malformed_payload`, `seq_gap`, `seq_reorder_or_duplicate`, `seq_restart` (the sender restarted; one per restart). Two senders wrongly sharing a `stream_id` show as steadily climbing `seq_gap` plus either `seq_restart` or `seq_reorder_or_duplicate`, depending on how far apart their counters are. |
 | `mixer_remote_listener_failure_count{reason=...}` | Per-listener failures that can't be attributed to a specific route: `rejected_uid`, `malformed_header`, `unknown_stream`. |
 
 **Process-wide**:
