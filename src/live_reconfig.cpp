@@ -31,7 +31,12 @@
 using namespace std;
 
 size_t compute_channel_bin(int channel_freq, int centerfreq, int sample_rate, size_t num_fft_bins) {
-    return (size_t)ceil((channel_freq + sample_rate - centerfreq) / (double)(sample_rate / num_fft_bins) - 1.0) % num_fft_bins;
+    // The bin width is usually not a whole number of Hz, so it must not be computed as one: over a
+    // large FFT the truncation adds up to dozens of bins. lround() takes a channel exactly between
+    // two bins to the one further from centerfreq.
+    long const n = (long)num_fft_bins;
+    long const bin = lround(((double)channel_freq - (double)centerfreq) * (double)n / (double)sample_rate) % n;
+    return (size_t)(bin < 0 ? bin + n : bin);
 }
 
 uint32_t compute_channel_dm_dphi(int channel_freq, int centerfreq, int sample_rate) {

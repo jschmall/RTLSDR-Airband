@@ -17,6 +17,7 @@
 
 #include "test_base_class.h"
 
+#include <complex>
 #include <thread>
 
 #include "live_reconfig.h"
@@ -64,36 +65,103 @@ bool init_output(channel_t*, output_t*) {
 
 class LiveReconfigTest : public TestBaseClass {};
 
-TEST_F(LiveReconfigTest, compute_channel_bin_matches_hand_computed_value) {
-    // sample_rate=2000000, fft_size=2048 -> bin width = 976.5625 Hz (truncated to 976 by the
-    // integer division baked into the original formula, see live_reconfig.cpp's comment)
-    int const sample_rate = 2000000;
-    size_t const num_bins = 2048;
-    int const centerfreq = 100000000;
-    int const channel_freq = 100050000;  // +50kHz from center
-
-    size_t bin = compute_channel_bin(channel_freq, centerfreq, sample_rate, num_bins);
-
-    // bin_width = sample_rate / fft_size = 976 (integer division)
-    // bin = ceil((channel_freq + sample_rate - centerfreq) / (double)bin_width - 1.0) % fft_size
-    //     = ceil((100050000 + 2000000 - 100000000) / 976.0 - 1.0) % 2048
-    //     = ceil(2050000 / 976.0 - 1.0) % 2048
-    double const bin_width = (double)(sample_rate / (int)num_bins);
-    size_t const expected = (size_t)ceil((channel_freq + sample_rate - centerfreq) / bin_width - 1.0) % num_bins;
-    EXPECT_EQ(bin, expected);
+TEST_F(LiveReconfigTest, compute_channel_bin_picks_the_bin_a_channel_lands_exactly_on) {
+    EXPECT_EQ(compute_channel_bin(119800000, 120750000, 2560000, 512), 322u);
+    EXPECT_EQ(compute_channel_bin(121000000, 120750000, 2560000, 512), 50u);
+    EXPECT_EQ(compute_channel_bin(162550000, 162350000, 1024000, 512), 100u);
 }
 
-TEST_F(LiveReconfigTest, compute_channel_bin_at_center_frequency) {
-    // A channel exactly at the tuned center should land near bin fft_size-1 (the formula's -1.0
-    // term), not bin 0 - this pins the "off by one" convention rather than deriving it.
-    int const sample_rate = 2000000;
-    size_t const num_bins = 2048;
-    int const centerfreq = 100000000;
+TEST_F(LiveReconfigTest, compute_channel_bin_is_zero_at_center_frequency) {
+    EXPECT_EQ(compute_channel_bin(100000000, 100000000, 2560000, 512), 0u);
+    EXPECT_EQ(compute_channel_bin(100000000, 100000000, 2000000, 2048), 0u);
+}
 
-    size_t bin = compute_channel_bin(centerfreq, centerfreq, sample_rate, num_bins);
-    double const bin_width = (double)(sample_rate / (int)num_bins);
-    size_t const expected = (size_t)ceil(sample_rate / bin_width - 1.0) % num_bins;
-    EXPECT_EQ(bin, expected);
+TEST_F(LiveReconfigTest, compute_channel_bin_rounds_to_the_nearest_bin) {
+    EXPECT_EQ(compute_channel_bin(161310000, 161500000, 2400000, 512), 471u);  // 471.47
+    EXPECT_EQ(compute_channel_bin(162550000, 162200000, 2400000, 512), 75u);   // 74.67
+    EXPECT_EQ(compute_channel_bin(99999000, 100000000, 2560000, 512), 0u);     // -0.2
+    EXPECT_EQ(compute_channel_bin(99997000, 100000000, 2560000, 512), 511u);   // -0.6
+}
+
+TEST_F(LiveReconfigTest, compute_channel_bin_rounds_a_tie_away_from_the_center_frequency) {
+    EXPECT_EQ(compute_channel_bin(154740000, 155012500, 2560000, 512), 457u);  // -54.5 -> -55
+    EXPECT_EQ(compute_channel_bin(155285000, 155012500, 2560000, 512), 55u);   // +54.5 -> +55
+}
+
+TEST_F(LiveReconfigTest, compute_channel_bin_is_unaffected_by_a_100hz_centerfreq_nudge) {
+    EXPECT_EQ(compute_channel_bin(119800000, 120749900, 2560000, 512), compute_channel_bin(119800000, 120750000, 2560000, 512));
+    EXPECT_EQ(compute_channel_bin(162550000, 162349900, 1024000, 512), compute_channel_bin(162550000, 162350000, 1024000, 512));
+}
+
+TEST_F(LiveReconfigTest, compute_channel_bin_handles_the_band_edges) {
+    EXPECT_EQ(compute_channel_bin(101280000, 100000000, 2560000, 512), 256u);
+    EXPECT_EQ(compute_channel_bin(98720000, 100000000, 2560000, 512), 256u);
+    EXPECT_EQ(compute_channel_bin(98725000, 100000000, 2560000, 512), 257u);
+}
+
+// The bin width is not a whole number of Hz at most of these, and truncating it to one moved the
+// bin by dozens at the larger fft sizes.
+TEST_F(LiveReconfigTest, compute_channel_bin_is_never_more_than_half_a_bin_from_the_channel) {
+    int const centerfreq = 120000000;
+    for (int sample_rate : {1000000, 1024000, 2000000, 2400000, 2560000}) {
+        for (size_t n : {256, 512, 1024, 2048, 4096, 8192}) {
+            for (int off = -sample_rate * 49 / 100; off < sample_rate * 49 / 100; off += 1250) {
+                size_t const bin = compute_channel_bin(centerfreq + off, centerfreq, sample_rate, n);
+                ASSERT_LT(bin, n);
+                double err = (double)off * n / sample_rate - (double)bin;
+                err -= n * round(err / n);
+                ASSERT_LE(fabs(err), 0.5 + 1e-9) << "fs=" << sample_rate << " n=" << n << " off=" << off;
+            }
+        }
+    }
+}
+
+// Scan mode parks centerfreq 20 truncated bin widths above each frequency (config.cpp,
+// controller_thread()).
+TEST_F(LiveReconfigTest, compute_channel_bin_is_twenty_below_center_for_scan_mode) {
+    for (int sample_rate : {1024000, 2000000, 2400000, 2560000}) {
+        for (size_t n : {256, 512, 1024, 2048, 4096, 8192}) {
+            int const freq = 118300000;
+            int const centerfreq = freq + 20 * (double)(sample_rate / n);
+            EXPECT_EQ(compute_channel_bin(freq, centerfreq, sample_rate, n), n - 20) << "fs=" << sample_rate << " n=" << n;
+        }
+    }
+}
+
+// The demod loop's 7-term Blackman-Harris window (rtl_airband.cpp).
+static double windowed_bin_power(double carrier_hz, int centerfreq, int sample_rate, size_t n, size_t bin) {
+    const double a[] = {0.27105140069342, 0.43329793923448, 0.21812299954311, 0.06592544638803, 0.01081174209837, 0.00077658482522, 0.00001388721735};
+    complex<double> z;
+    for (size_t m = 0; m < n; m++) {
+        double w = 0.0;
+        for (int k = 0; k < 7; k++) {
+            w += (k % 2 ? -a[k] : a[k]) * cos(2.0 * M_PI * k * (double)m / (double)(n - 1));
+        }
+        z += w * polar(1.0, 2.0 * M_PI * ((carrier_hz - centerfreq) / sample_rate - (double)bin / n) * (double)m);
+    }
+    return norm(z);
+}
+
+TEST_F(LiveReconfigTest, compute_channel_bin_is_the_strongest_bin_for_a_carrier_on_the_channel) {
+    struct {
+        int freq, centerfreq, sample_rate;
+        size_t n;
+    } const cases[] = {{119800000, 120750000, 2560000, 512}, {162550000, 162200000, 2400000, 512},  {162550000, 162350000, 1024000, 512},  {118300000, 118300000, 2000000, 512},
+                       {42440000, 42700000, 1024000, 1024},  {133912500, 133000000, 2400000, 2048}, {161310000, 161500000, 2400000, 8192}, {99997000, 100000000, 2560000, 512}};
+    for (const auto& c : cases) {
+        size_t const bin = compute_channel_bin(c.freq, c.centerfreq, c.sample_rate, c.n);
+        double const chosen = windowed_bin_power(c.freq, c.centerfreq, c.sample_rate, c.n, bin);
+        EXPECT_GT(chosen, windowed_bin_power(c.freq, c.centerfreq, c.sample_rate, c.n, (bin + 1) % c.n)) << c.freq;
+        EXPECT_GT(chosen, windowed_bin_power(c.freq, c.centerfreq, c.sample_rate, c.n, (bin + c.n - 1) % c.n)) << c.freq;
+    }
+}
+
+TEST_F(LiveReconfigTest, compute_channel_bin_rejects_both_neighbours_equally_on_an_aligned_channel) {
+    int const centerfreq = 120750000, freq = 119800000, sample_rate = 2560000;
+    size_t const bin = compute_channel_bin(freq, centerfreq, sample_rate, 512);
+    double const above = windowed_bin_power(freq + 12500, centerfreq, sample_rate, 512, bin);
+    double const below = windowed_bin_power(freq - 12500, centerfreq, sample_rate, 512, bin);
+    EXPECT_NEAR(10.0 * log10(above / below), 0.0, 0.1);
 }
 
 TEST_F(LiveReconfigTest, compute_channel_dm_dphi_is_zero_when_channel_equals_center) {

@@ -787,9 +787,8 @@ and signal levels and per-device buffer counters only, and the control socket ha
   R_SCAN batches that hopped mid-batch are dropped, and the result is EMA-smoothed (0.2) into
   `freq_t::freq_offset_hz`. Works whether `afc` is on or off. AM sidebands bias the estimate
   slightly (a 0.8-modulated 1 kHz test tone reads ~3% low: ~0.2 ppm at 120 MHz).
-  **Gotcha found while testing:** `compute_channel_bin()` picks the bin *below* a channel that
-  lands exactly on a bin center; only the 7-term Blackman-Harris window's main lobe makes the
-  carrier visible there, so the unit test's simulated DFT has to apply the same window.
+  The unit test's simulated DFT applies the demod loop's window, since a channel can be up to half
+  a bin from its bin's center (a full bin before item 53).
 - **Driver settings readback.** New nullable `input_t::get_settings` hook (rtlsdr,
   soapysdr; also mirisdr until upstream v7.0.0 removed that driver) reports gain / correction / tuner bandwidth from the driver's `dev_data`. Originally
   called only from the control socket thread; since item 45 every caller holds
@@ -1095,6 +1094,32 @@ behavior), `"atan2"` (exact), `"quadri"` (the existing `-Q`).
   −18.6 dB. The −62.6 dB above is from a strong generated signal.
 - **Not validated:** a live dongle with `atan2`, a 136.5 Hz channel off the air, a downstream tone
   decoder, or ARM.
+
+#### FFT bin selection
+
+**53. A channel uses the nearest FFT bin** (`compute_channel_bin()` in `src/live_reconfig.cpp`, so
+startup, live retune and live `sample_rate` change). Upstream computes
+`ceil((freq + fs - cf) / (fs / N) - 1.0) % N`, with an integer division for `fs / N`.
+- **Bins were low.** That formula floors, and takes a whole bin off a channel that lands exactly on
+  one (5 kHz at 2.56 Msps / 512). One bin off costs 1.9 dB of level and rejects the two adjacent
+  channels unequally. Scan mode sits exactly on a bin whenever the bin width is a whole number of
+  Hz, so there it was always one low.
+- **The truncated width adds up.** At 2.4 Msps the bin was up to 2.3 off at `fft_size = 2048`, 9.7
+  at 4096 and 40 at 8192, where the window reaches about 7 bins: effectively deaf.
+- **Now** `lround((freq - cf) * N / fs)`, wrapped into 0..N-1. A channel exactly between two bins
+  takes the one further from `centerfreq`.
+- **Not affected:** `compute_channel_dm_dphi()` and the offset estimator / auto_ppm both use the
+  channel frequency, never the bin. Simulated estimates (tone, FM, C4FM-like) agree within 1–2 Hz
+  for bin errors of 0 to 1, except a tone at −15 dB SNR, which read −10 Hz at a full bin. Item 45's P25 bias didn't reproduce in that model, so
+  whether this changes it is unknown. AFC still searches outward from `base_bins`. A channel on
+  `centerfreq` now has base bin 0 rather than N−1, so AFC can't step below it (it couldn't step
+  above before). No unit test covers AFC: the class lives in `rtl_airband.cpp`, which the test
+  binary doesn't link.
+- **Levels move.** Signal and noise readings rise by up to 1.9 dB on channels that were a full bin
+  off, so a manual `squelch_threshold` tuned to the old reading may need adjusting.
+- **rtl-airband-panel has its own copy** (`compute_bin()` in `crates/airband-validate`), used for
+  its bin-collision check. It must change with this.
+- This replaces two tests that pinned the old formula. Expect a conflict if upstream changes it.
 
 ### Do not import from `yegors`
 

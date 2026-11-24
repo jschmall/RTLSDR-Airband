@@ -54,6 +54,9 @@ input (below), and `v5.3.0` introduced live reconfiguration and `send_tx_tags` s
 - **Selectable FM demodulator (`fm_demod`)** — use the exact arctangent instead of the default
   approximation, which adds harmonics to low-frequency tones. See
   [FM Demodulator](#fm-demodulator), below.
+- **Nearest FFT bin per channel** — stock builds use the FFT bin at or just below each channel, up to
+  a full bin off (about 2 dB, and more bleed from one neighboring channel), and far more at large
+  `fft_size` values. Readings can rise up to 2 dB, so recheck any manual `squelch_threshold`.
 - **SIGHUP config reload** — SIGHUP now triggers a clean restart to pick up config
   changes, instead of just exiting.
 - **Assorted stability fixes** — buffer overflow, thread-safety, and error-handling
