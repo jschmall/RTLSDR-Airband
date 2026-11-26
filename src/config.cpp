@@ -152,6 +152,15 @@ static int parse_outputs(libconfig::Setting& outs, channel_t* channel, int i, in
                              "send_tx_tags is not supported on R_SCAN (scan mode) channels - the frequency itself changes "
                              "at runtime there; use send_scan_freq_tags instead");
             }
+            if (outs[o].exists("tx_tag_idle_text")) {
+                if (outs[o]["tx_tag_idle_text"].getType() != libconfig::Setting::TypeString) {
+                    output_error(i, j, o, parsing_mixers, "tx_tag_idle_text must be a string");
+                } else if (!idata->send_tx_tags) {
+                    output_error(i, j, o, parsing_mixers, "tx_tag_idle_text needs send_tx_tags = true");
+                } else {
+                    idata->tx_tag_idle_text = (const char*)outs[o]["tx_tag_idle_text"];
+                }
+            }
 #ifdef LIBSHOUT_HAS_TLS
             idata->tls_mode = SHOUT_TLS_DISABLED;
 #endif /* LIBSHOUT_HAS_TLS */

@@ -67,9 +67,15 @@ class MetadataUpdate:
 class FakeIcecastServer:
     """Context manager wrapping a background fake Icecast source server."""
 
-    def __init__(self, metadata_delay_s: float = 0.0) -> None:
+    def __init__(
+        self, metadata_delay_s: float = 0.0, metadata_auth: str | None = None
+    ) -> None:
         # How long to wait before answering a metadata request, like a slow remote server.
         self._metadata_delay_s = metadata_delay_s
+        # When set (the expected "Basic ..." value), a metadata request without it is refused the
+        # way Icecast 2.5 does: 401 with Connection: Keep-Alive. libshout 2.4.6 never retries that.
+        self._metadata_auth = metadata_auth
+        self.metadata_refused: int = 0
         self._listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listen_sock.bind(("127.0.0.1", 0))
@@ -149,8 +155,33 @@ class FakeIcecastServer:
                 self._conn_threads.append(t)
             t.start()
 
-    def _handle_metadata_request(self, conn: socket.socket, request_line: str) -> None:
+    def _handle_metadata_request(
+        self, conn: socket.socket, request_line: str, headers: str
+    ) -> None:
         # e.g. "GET /admin/metadata?mode=updinfo&mount=%2Ftest.mp3&song=... HTTP/1.0"
+        if self._metadata_auth is not None:
+            auth = [
+                line.split(":", 1)[1].strip()
+                for line in headers.split("\r\n")[1:]
+                if line.lower().startswith("authorization:")
+            ]
+            if auth != [self._metadata_auth]:
+                with self._metadata_lock:
+                    self.metadata_refused += 1
+                conn.sendall(
+                    b"HTTP/1.1 401 Authentication Required\r\n"
+                    b"Connection: Keep-Alive\r\n"
+                    b'WWW-Authenticate: Basic realm="Icecast2 Server"\r\n'
+                    b"Content-Length: 0\r\n\r\n"
+                )
+                # Keep the connection open, as Icecast 2.5 does, until the client gives up.
+                conn.settimeout(5.0)
+                try:
+                    while conn.recv(4096):
+                        pass
+                except OSError:
+                    pass
+                return
         parts = request_line.split(" ")
         path = parts[1] if len(parts) >= 2 else ""
         params = parse_qs(urlparse(path).query)
@@ -180,7 +211,7 @@ class FakeIcecastServer:
                 request_line, headers, pending = result
 
                 if first_request and request_line.startswith("GET /admin/metadata"):
-                    self._handle_metadata_request(conn, request_line)
+                    self._handle_metadata_request(conn, request_line, headers)
                     return
                 first_request = False
 

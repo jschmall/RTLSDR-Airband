@@ -158,6 +158,8 @@ struct icecast_data {
     // send_scan_freq_tags - rejected at config parse time on R_SCAN channels, where
     // send_scan_freq_tags already covers frequency-change tagging.
     bool send_tx_tags;
+    // With send_tx_tags: the tag between transmissions (e.g. "Scanning"). Empty clears it.
+    std::string tx_tag_idle_text;
     icecast_tx_tag_state tx_tag_state;
     shout_t* shout;
     // number of times this stream's connection was lost (network error or the

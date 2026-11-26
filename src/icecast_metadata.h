@@ -85,6 +85,15 @@ class IcecastMetaQueue {
 struct icecast_data;
 std::shared_ptr<IcecastMetaTarget> icecast_metadata_target_new(const icecast_data* icecast);
 
+// The worker sends its own HTTP/1.0 request with Basic auth up front, except on a TLS output
+// (libshout then). libshout 2.4.6 first asks without credentials and retries with them only once
+// the server closes the connection: Icecast 2.4 answers 401 with Connection: Close, but 2.5
+// answers 401 with Keep-Alive, so libshout never retries and every update fails.
+std::string icecast_metadata_request(const IcecastMetaTarget& t, const std::string& song);
+// Sends one update. On failure, error says why: a network error or the server's status line,
+// never the password.
+bool icecast_metadata_send_http(const IcecastMetaTarget& t, const std::string& song, std::string* error);
+
 // Queues "song" = value for the target's mount. A no-op for a null target.
 void icecast_metadata_submit(const std::shared_ptr<IcecastMetaTarget>& target, const std::string& value);
 

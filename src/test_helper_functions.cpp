@@ -203,6 +203,21 @@ TEST_F(HelperFunctionsTest, compute_tx_tag_content_falls_back_to_frequency_witho
     EXPECT_EQ(compute_tx_tag_content(true, NULL, 154265000), "154.265 MHz");
 }
 
+TEST_F(HelperFunctionsTest, icecast_song_value_sends_a_cleared_tag_as_a_space) {
+    EXPECT_EQ(icecast_song_value(""), " ");
+}
+
+TEST_F(HelperFunctionsTest, tx_tag_or_idle_prefers_the_transmission) {
+    EXPECT_EQ(tx_tag_or_idle("Fire Dispatch", "Scanning"), "Fire Dispatch");
+    EXPECT_EQ(tx_tag_or_idle("", "Scanning"), "Scanning");
+    EXPECT_EQ(tx_tag_or_idle("", ""), "");
+}
+
+TEST_F(HelperFunctionsTest, icecast_song_value_keeps_a_label) {
+    EXPECT_EQ(icecast_song_value("Fire Dispatch"), "Fire Dispatch");
+    EXPECT_EQ(icecast_song_value("154.265 MHz"), "154.265 MHz");
+}
+
 namespace {
 struct timeval make_tv(long sec) {
     struct timeval tv;
@@ -238,6 +253,23 @@ TEST_F(HelperFunctionsTest, icecast_tx_tag_step_defers_first_change_until_deadli
     EXPECT_EQ(out, "Fire Dispatch");
     EXPECT_EQ(state.applied, "Fire Dispatch");
     EXPECT_FALSE(state.pending);
+}
+
+// With idle text, the stream gets it one delay after startup, the label during a transmission,
+// and the idle text again after it.
+TEST_F(HelperFunctionsTest, icecast_tx_tag_step_with_idle_text) {
+    icecast_tx_tag_state state;
+    string out;
+    const string idle = "Scanning";
+    EXPECT_FALSE(icecast_tx_tag_step(&state, tx_tag_or_idle("", idle), make_tv(100), 3, &out));
+    EXPECT_TRUE(icecast_tx_tag_step(&state, tx_tag_or_idle("", idle), make_tv(103), 3, &out));
+    EXPECT_EQ(out, "Scanning");
+    EXPECT_FALSE(icecast_tx_tag_step(&state, tx_tag_or_idle("Fire Dispatch", idle), make_tv(110), 3, &out));
+    EXPECT_TRUE(icecast_tx_tag_step(&state, tx_tag_or_idle("Fire Dispatch", idle), make_tv(113), 3, &out));
+    EXPECT_EQ(out, "Fire Dispatch");
+    EXPECT_FALSE(icecast_tx_tag_step(&state, tx_tag_or_idle("", idle), make_tv(120), 3, &out));
+    EXPECT_TRUE(icecast_tx_tag_step(&state, tx_tag_or_idle("", idle), make_tv(123), 3, &out));
+    EXPECT_EQ(out, "Scanning");
 }
 
 TEST_F(HelperFunctionsTest, icecast_tx_tag_step_zero_delay_applies_immediately) {
@@ -507,8 +539,8 @@ TEST_F(HelperFunctionsTest, describe_library_covers_shared_and_static_links) {
 TEST_F(HelperFunctionsTest, fork_features_names_the_fork_and_its_capabilities) {
     std::string const features = " " + fork_features() + " ";
     EXPECT_EQ(fork_features().rfind("fork ", 0), 0u);
-    for (const char* name :
-         {"control_socket", "device_status", "reserve", "mixer_remote", "send_tx_tags", "stats_http", "json_log", "post_write_script", "auto_ppm", "usb_chunk_sizing", "auto_ppm_voting"}) {
+    for (const char* name : {"control_socket", "device_status", "reserve", "mixer_remote", "send_tx_tags", "stats_http", "json_log", "post_write_script", "auto_ppm", "usb_chunk_sizing",
+                             "auto_ppm_voting", "tx_tag_idle_text"}) {
         EXPECT_NE(features.find(std::string(" ") + name + " "), std::string::npos) << name;
     }
 #ifdef NFM

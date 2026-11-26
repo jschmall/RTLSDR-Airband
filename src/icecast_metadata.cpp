@@ -19,7 +19,14 @@
  */
 
 #include "icecast_metadata.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
 #include <shout/shout.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <chrono>
 #include <thread>
 #include "config.h"
@@ -91,6 +98,180 @@ shared_ptr<IcecastMetaTarget> icecast_metadata_target_new(const icecast_data* ic
 
 namespace {
 
+const int HTTP_TIMEOUT_MS = 10000;
+
+string url_encode(const string& s) {
+    static const char hex[] = "0123456789ABCDEF";
+    string out;
+    for (unsigned char c : s) {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+    return out;
+}
+
+string base64(const string& s) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    string out;
+    size_t i = 0;
+    for (; i + 2 < s.size(); i += 3) {
+        unsigned n = ((unsigned char)s[i] << 16) | ((unsigned char)s[i + 1] << 8) | (unsigned char)s[i + 2];
+        out += table[n >> 18];
+        out += table[(n >> 12) & 63];
+        out += table[(n >> 6) & 63];
+        out += table[n & 63];
+    }
+    if (i + 1 == s.size()) {
+        unsigned n = (unsigned char)s[i] << 16;
+        out += table[n >> 18];
+        out += table[(n >> 12) & 63];
+        out += "==";
+    } else if (i + 2 == s.size()) {
+        unsigned n = ((unsigned char)s[i] << 16) | ((unsigned char)s[i + 1] << 8);
+        out += table[n >> 18];
+        out += table[(n >> 12) & 63];
+        out += table[(n >> 6) & 63];
+        out += '=';
+    }
+    return out;
+}
+
+// Waits for fd to become ready for events, up to the time left until deadline.
+bool wait_fd(int fd, short events, chrono::steady_clock::time_point deadline) {
+    while (true) {
+        auto left = chrono::duration_cast<chrono::milliseconds>(deadline - chrono::steady_clock::now()).count();
+        if (left <= 0) {
+            return false;
+        }
+        struct pollfd p = {fd, events, 0};
+        int r = poll(&p, 1, (int)left);
+        if (r > 0) {
+            return true;
+        }
+        if (r == 0 || errno != EINTR) {
+            return false;
+        }
+    }
+}
+
+// A non-blocking connection to host:port, trying each address in turn, or -1 with error set.
+int connect_to(const string& host, int port, chrono::steady_clock::time_point deadline, string* error) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = NULL;
+    int rc = getaddrinfo(host.c_str(), to_string(port).c_str(), &hints, &res);
+    if (rc != 0) {
+        *error = string("can't look up the host: ") + gai_strerror(rc);
+        return -1;
+    }
+    int fd = -1;
+    for (struct addrinfo* a = res; a != NULL; a = a->ai_next) {
+        fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (fd < 0) {
+            *error = string("socket: ") + strerror(errno);
+            continue;
+        }
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+#ifdef SO_NOSIGPIPE
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+        if (connect(fd, a->ai_addr, a->ai_addrlen) == 0) {
+            break;
+        }
+        if (errno == EINPROGRESS && wait_fd(fd, POLLOUT, deadline)) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+            if (err == 0) {
+                break;
+            }
+            *error = string("can't connect: ") + strerror(err);
+        } else {
+            *error = errno == EINPROGRESS ? string("can't connect: timed out") : string("can't connect: ") + strerror(errno);
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+}  // namespace
+
+string icecast_metadata_request(const IcecastMetaTarget& t, const string& song) {
+    return "GET /admin/metadata?mode=updinfo&charset=UTF-8&mount=" + url_encode(t.mount) + "&song=" + url_encode(song) +
+           " HTTP/1.0\r\n"
+           "Host: " +
+           t.host + ":" + to_string(t.port) +
+           "\r\n"
+           "Authorization: Basic " +
+           base64(t.username + ":" + t.password) +
+           "\r\n"
+           "User-Agent: RTLSDR-Airband\r\n"
+           "\r\n";
+}
+
+bool icecast_metadata_send_http(const IcecastMetaTarget& t, const string& song, string* error) {
+    auto deadline = chrono::steady_clock::now() + chrono::milliseconds(HTTP_TIMEOUT_MS);
+    int fd = connect_to(t.host, t.port, deadline, error);
+    if (fd < 0) {
+        return false;
+    }
+#ifdef MSG_NOSIGNAL
+    const int send_flags = MSG_NOSIGNAL;
+#else
+    const int send_flags = 0;
+#endif
+    string request = icecast_metadata_request(t, song);
+    size_t sent = 0;
+    while (sent < request.size()) {
+        ssize_t n = send(fd, request.data() + sent, request.size() - sent, send_flags);
+        if (n > 0) {
+            sent += n;
+        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) && wait_fd(fd, POLLOUT, deadline)) {
+            continue;
+        } else {
+            *error = n < 0 ? string("send: ") + strerror(errno) : string("send: timed out");
+            close(fd);
+            return false;
+        }
+    }
+    // Only the status line matters; the server closes the connection after its answer.
+    string response;
+    char buf[1024];
+    while (response.find("\r\n") == string::npos && response.size() < 4096) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            response.append(buf, n);
+        } else if (n == 0) {
+            break;
+        } else if ((errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) && wait_fd(fd, POLLIN, deadline)) {
+            continue;
+        } else {
+            *error = errno == EAGAIN || errno == EWOULDBLOCK ? string("no answer: timed out") : string("no answer: ") + strerror(errno);
+            close(fd);
+            return false;
+        }
+    }
+    close(fd);
+    string status = response.substr(0, response.find("\r\n"));
+    if (status.compare(0, 5, "HTTP/") == 0 && status.find(' ') != string::npos && status.compare(status.find(' ') + 1, 3, "200") == 0) {
+        return true;
+    }
+    *error = status.empty() ? string("the server closed the connection without an answer") : "the server answered " + status;
+    return false;
+}
+
+namespace {
+
 // Never freed: a worker still stuck in a request when shutdown gives up on it keeps using these
 // while the process exits, so they must outlive static destruction.
 IcecastMetaQueue* queue = new IcecastMetaQueue;
@@ -120,6 +301,21 @@ shout_t* make_metadata_shout(const IcecastMetaTarget& t) {
 }
 
 void send_update(IcecastMetaTarget* t, const string& value) {
+#ifdef LIBSHOUT_HAS_TLS
+    const bool use_libshout = t->tls_mode != SHOUT_TLS_DISABLED;
+#else
+    const bool use_libshout = false;
+#endif /* LIBSHOUT_HAS_TLS */
+    if (!use_libshout) {
+        string error;
+        if (icecast_metadata_send_http(*t, icecast_song_value(value), &error)) {
+            t->update_count++;
+        } else {
+            log(LOG_WARNING, "Failed to set Icecast metadata for %s:%d%s: %s\n", t->host.c_str(), t->port, t->mount.c_str(), error.c_str());
+            t->failure_count++;
+        }
+        return;
+    }
     if (t->shout == nullptr) {
         t->shout = make_metadata_shout(*t);
         if (t->shout == nullptr) {
@@ -129,7 +325,7 @@ void send_update(IcecastMetaTarget* t, const string& value) {
     }
     shout_t* s = (shout_t*)t->shout;
     shout_metadata_t* meta = shout_metadata_new();
-    if (meta == NULL || shout_metadata_add(meta, "song", value.c_str()) != SHOUTERR_SUCCESS) {
+    if (meta == NULL || shout_metadata_add(meta, "song", icecast_song_value(value).c_str()) != SHOUTERR_SUCCESS) {
         log(LOG_WARNING, "Failed to add shout metadata\n");
         t->failure_count++;
         if (meta != NULL) {

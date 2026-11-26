@@ -4,8 +4,9 @@ test_icecast_tx_tags.py — send_tx_tags: on-air metadata tag per transmission.
 Unlike send_scan_freq_tags (R_SCAN only, driven by controller_thread hopping
 between scan frequencies), send_tx_tags applies to R_MULTICHANNEL channels and
 mixers: it pushes the channel's configured label as the Icecast "song" tag
-when squelch opens (a transmission starts) and clears it to an empty string
-when squelch closes (the transmission ends). See icecast_tx_tag_step() in
+when squelch opens (a transmission starts) and clears it when squelch closes
+(the transmission ends). A cleared tag is sent as a single space (CLEARED):
+Icecast 2.5 keeps the old title on an empty one. See icecast_tx_tag_step() in
 src/helper_functions.cpp and compute_tx_tag_content()/
 mixer_select_active_tag_input() in src/output.cpp / src/mixer.cpp.
 
@@ -22,6 +23,8 @@ end-to-end wiring (axcindicate / mixer input -> label -> Icecast
 Parametrized over all provided binaries (non-NFM and NFM if available).
 """
 
+import base64
+import subprocess
 from pathlib import Path
 
 from conftest import BinaryUnderTest, run_rtl_airband
@@ -37,10 +40,13 @@ DURATION_S = 8.0
 TOTAL_IQ_DURATION_S = DURATION_S + 2 * iq_generator.NOISE_PAD_S  # 10 s
 TIMEOUT_S = TOTAL_IQ_DURATION_S * 3 + 30  # 60 s
 
+# How a cleared tag reaches the server: a space, since Icecast 2.5 ignores an empty song=.
+CLEARED = " "
 MOUNTPOINT = "test_tx_tags.mp3"
 USERNAME = "source"
 PASSWORD = "test-password"
 LABEL = "Fire Dispatch"
+IDLE_TEXT = 'tx_tag_idle_text = "Scanning";'
 
 
 def pytest_generate_tests(metafunc):
@@ -54,7 +60,7 @@ def pytest_generate_tests(metafunc):
         )
 
 
-def _icecast_block(port: int, mountpoint: str) -> str:
+def _icecast_block(port: int, mountpoint: str, extra: str = "") -> str:
     return "\n".join(
         [
             "        {",
@@ -65,6 +71,7 @@ def _icecast_block(port: int, mountpoint: str) -> str:
             f'          username = "{USERNAME}";',
             f'          password = "{PASSWORD}";',
             "          send_tx_tags = true;",
+            *([f"          {extra}"] if extra else []),
             "        }",
         ]
     )
@@ -118,14 +125,14 @@ def test_icecast_tx_tags_channel(
         ), f"Unexpected mount in metadata update: {u.mount!r}"
 
     label_updates = [u for u in updates if u.song == LABEL]
-    clear_updates = [u for u in updates if u.song == ""]
+    clear_updates = [u for u in updates if u.song == CLEARED]
 
     assert label_updates, (
         f"Expected a metadata update with song={LABEL!r}, "
         f"got: {[u.song for u in updates]}"
     )
     assert clear_updates, (
-        "Expected a metadata update clearing the tag (song=''), "
+        "Expected a metadata update clearing the tag (song=' '), "
         f"got: {[u.song for u in updates]}"
     )
     assert updates.index(label_updates[0]) < updates.index(clear_updates[-1]), (
@@ -133,7 +140,146 @@ def test_icecast_tx_tags_channel(
         f"got order: {[u.song for u in updates]}"
     )
     # only ever these two values - no stray/garbled content
-    assert {u.song for u in updates} == {LABEL, ""}
+    assert {u.song for u in updates} == {LABEL, CLEARED}
+
+
+def test_icecast_tx_tags_icecast_2_5_login(
+    binary_under_test: BinaryUnderTest,
+    test_output_dir: Path,
+    cache_dir: Path,
+    speedup_factor: float,
+) -> None:
+    """Titles reach a server that refuses a request without credentials the way Icecast 2.5 does.
+
+    libshout 2.4.6 asks without credentials first and retries with them only when the server
+    closes the connection. Icecast 2.5 keeps it open after the 401, so every update failed.
+    """
+    iq_file = iq_generator.get_or_generate_am(
+        offset_hz=CHANNEL_OFFSET_HZ,
+        audio_hz=AUDIO_TONE_HZ,
+        duration_s=DURATION_S,
+        cache_dir=cache_dir,
+    )
+    config_path = test_output_dir / "rtl_airband.conf"
+    basic = "Basic " + base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
+
+    with FakeIcecastServer(metadata_auth=basic) as server:
+        config_writer.write_config(
+            config_path=config_path,
+            iq_filepath=iq_file,
+            sample_rate=SAMPLE_RATE,
+            centerfreq_hz=CENTERFREQ_HZ,
+            channels=[
+                {
+                    "freq_hz": CENTERFREQ_HZ + CHANNEL_OFFSET_HZ,
+                    "label": LABEL,
+                    "extra_output_blocks": [_icecast_block(server.port, MOUNTPOINT)],
+                }
+            ],
+            output_dir=test_output_dir,
+            speedup_factor=speedup_factor,
+            mode="multichannel",
+            shout_metadata_delay=0,
+        )
+        run_rtl_airband(binary_under_test.path, config_path, timeout_s=TIMEOUT_S)
+        songs = [
+            u.song for u in sorted(server.metadata_updates, key=lambda u: u.received_at)
+        ]
+        refused = server.metadata_refused
+
+    assert refused == 0, f"{refused} metadata requests were sent without credentials"
+    assert LABEL in songs, f"Expected the label to reach the server, got: {songs}"
+    assert songs[-1] == CLEARED, f"Expected the title cleared last, got: {songs}"
+
+
+def test_icecast_tx_tags_idle_text(
+    binary_under_test: BinaryUnderTest,
+    test_output_dir: Path,
+    cache_dir: Path,
+    speedup_factor: float,
+) -> None:
+    """With tx_tag_idle_text, the title says it before and after a transmission."""
+    iq_file = iq_generator.get_or_generate_am(
+        offset_hz=CHANNEL_OFFSET_HZ,
+        audio_hz=AUDIO_TONE_HZ,
+        duration_s=DURATION_S,
+        cache_dir=cache_dir,
+    )
+    config_path = test_output_dir / "rtl_airband.conf"
+
+    with FakeIcecastServer() as server:
+        config_writer.write_config(
+            config_path=config_path,
+            iq_filepath=iq_file,
+            sample_rate=SAMPLE_RATE,
+            centerfreq_hz=CENTERFREQ_HZ,
+            channels=[
+                {
+                    "freq_hz": CENTERFREQ_HZ + CHANNEL_OFFSET_HZ,
+                    "label": LABEL,
+                    "extra_output_blocks": [
+                        _icecast_block(server.port, MOUNTPOINT, extra=IDLE_TEXT)
+                    ],
+                }
+            ],
+            output_dir=test_output_dir,
+            speedup_factor=speedup_factor,
+            mode="multichannel",
+            shout_metadata_delay=0,
+        )
+        run_rtl_airband(binary_under_test.path, config_path, timeout_s=TIMEOUT_S)
+        songs = [
+            u.song for u in sorted(server.metadata_updates, key=lambda u: u.received_at)
+        ]
+
+    assert songs, "Expected Icecast metadata updates, got none"
+    assert songs[0] == "Scanning", f"Expected the idle text first, got: {songs}"
+    assert LABEL in songs, f"Expected the label, got: {songs}"
+    assert songs[-1] == "Scanning", f"Expected the idle text last, got: {songs}"
+    assert CLEARED not in songs, f"The idle text replaces clearing, got: {songs}"
+
+
+def test_icecast_tx_tag_idle_text_needs_send_tx_tags(
+    binary_under_test: BinaryUnderTest, test_output_dir: Path, cache_dir: Path
+) -> None:
+    """tx_tag_idle_text without send_tx_tags is a configuration error."""
+    iq_file = iq_generator.get_or_generate_am(
+        offset_hz=CHANNEL_OFFSET_HZ,
+        audio_hz=AUDIO_TONE_HZ,
+        duration_s=DURATION_S,
+        cache_dir=cache_dir,
+    )
+    config_path = test_output_dir / "rtl_airband.conf"
+    block = _icecast_block(8000, MOUNTPOINT, extra=IDLE_TEXT)
+    config_writer.write_config(
+        config_path=config_path,
+        iq_filepath=iq_file,
+        sample_rate=SAMPLE_RATE,
+        centerfreq_hz=CENTERFREQ_HZ,
+        channels=[
+            {
+                "freq_hz": CENTERFREQ_HZ + CHANNEL_OFFSET_HZ,
+                "label": LABEL,
+                "extra_output_blocks": [
+                    block.replace("send_tx_tags = true;", "send_tx_tags = false;")
+                ],
+            }
+        ],
+        output_dir=test_output_dir,
+        mode="multichannel",
+    )
+    result = subprocess.run(
+        [str(binary_under_test.path), "-F", "-e", "-c", str(config_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode != 0, "The config should be rejected"
+    assert any(
+        "Configuration error" in line and "tx_tag_idle_text" in line
+        for line in result.stderr.splitlines()
+    ), f"Unexpected stderr:\n{result.stderr}"
 
 
 def test_icecast_tx_tags_mixer(
@@ -203,14 +349,14 @@ def test_icecast_tx_tags_mixer(
     assert updates, "Expected at least one Icecast metadata update, got none"
 
     label_updates = [u for u in updates if u.song == LABEL]
-    clear_updates = [u for u in updates if u.song == ""]
+    clear_updates = [u for u in updates if u.song == CLEARED]
 
     assert label_updates, (
         f"Expected a metadata update tagging the talking input ({LABEL!r}), "
         f"got: {[u.song for u in updates]}"
     )
     assert clear_updates, (
-        "Expected a metadata update clearing the tag (song=''), "
+        "Expected a metadata update clearing the tag (song=' '), "
         f"got: {[u.song for u in updates]}"
     )
     assert "Channel B" not in {u.song for u in updates}, (

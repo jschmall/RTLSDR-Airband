@@ -28,9 +28,11 @@ input (below), and `v5.3.0` introduced live reconfiguration and `send_tx_tags` s
 - **`send_tx_tags` Icecast output option** — push the channel's (or, for a mixer, whichever
   source channel is currently talking) configured `label` as the Icecast "song" tag when a
   transmission starts, and clear it when squelch closes — an on-air indicator for plain
-  (non-scanning) channels and mixers. Complements the existing `send_scan_freq_tags`, which
-  only applies in scan mode. Updates for both are sent from a background thread, so a slow
-  Icecast server never holds up the audio.
+  (non-scanning) channels and mixers. Set `tx_tag_idle_text` (e.g. `"Scanning"`) to show that
+  between transmissions instead of a blank title. Complements the existing `send_scan_freq_tags`,
+  which only applies in scan mode. Updates for both are sent from a background thread, so a slow
+  Icecast server never holds up the audio, and work with Icecast 2.5, where libshout's own
+  metadata request is always refused (TLS outputs still use libshout).
 - **Configurable `udp_stream` output** — choose the bit depth (32/16/8-bit PCM) and
   sample rate sent over UDP, to match what a downstream consumer like trunk-recorder
   expects.
