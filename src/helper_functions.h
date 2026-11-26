@@ -69,6 +69,10 @@ std::string describe_library(const std::string& path, const std::string& build_v
 // so callers can send that value straight through to clear the Now Playing tag.
 std::string compute_tx_tag_content(bool has_signal, const char* label, int frequency_hz);
 
+// The send_tx_tags tag wanted now: the transmission's, or idle_text between transmissions
+// ("" clears the tag).
+std::string tx_tag_or_idle(const std::string& tx_tag, const std::string& idle_text);
+
 // The "song" value to send for a tag: "" (cleared) is sent as a single space, because
 // Icecast 2.5 answers 200 to an empty song= but keeps the old title. A space clears it
 // on 2.4 and 2.5 alike.

@@ -259,6 +259,19 @@ against the old binary.
   `test_icecast_tx_tags_icecast_2_5_login` uses it and fails on the libshout path. Checked live
   against Docker `libretime/icecast:2.5.0` and `2.4.4`: the label shows, then clears.
 
+**61. `tx_tag_idle_text`: the `send_tx_tags` title between transmissions** (`src/rtl_airband.h`,
+`src/config.cpp`, `src/output.cpp`, `src/helper_functions.{h,cpp}` `tx_tag_or_idle()`). From the
+icecast-endpoint plugin's "Title when quiet" (#4/#5 there). An optional string on an icecast
+output, e.g. `tx_tag_idle_text = "Scanning";`. `process_outputs()` feeds
+`tx_tag_or_idle(tx_tag, idle_text)` to `icecast_tx_tag_step()`, so the idle text goes through the
+same `shout_metadata_delay` deferral: the stream gets it one delay after startup and after each
+transmission. Unset (empty), the title is cleared as before (item 59). A config error unless the
+same output has `send_tx_tags = true`, or when it isn't a string. Live edits need nothing extra:
+the channel's config signature changes, so the channel is rebuilt. `Features:` name
+`tx_tag_idle_text`, so the panel can tell a build that has it. Tests: `tx_tag_or_idle` and
+`icecast_tx_tag_step_with_idle_text` (unit); `test_icecast_tx_tags_idle_text` and
+`test_icecast_tx_tag_idle_text_needs_send_tx_tags` (system).
+
 #### Observability / metrics
 
 **8. HTTP metrics endpoint** (`src/stats_http.cpp`, new) — `write_stats_file()` already writes
@@ -841,7 +854,7 @@ and signal levels and per-device buffer counters only, and the control socket ha
 **44. `rtl_airband -v` prints a `Features:` line** (`fork_features()` in
 `src/helper_functions.cpp`, printed from `main()`). The version line is unchanged; a second line
 reads `Features: fork control_socket device_status reserve mixer_remote send_tx_tags stats_http
-json_log post_write_script auto_ppm usb_chunk_sizing auto_ppm_voting` (`auto_ppm` added by item 45, `usb_chunk_sizing` by item 46, `auto_ppm_voting` by item 47), followed by whichever optional build components are compiled in
+json_log post_write_script auto_ppm usb_chunk_sizing auto_ppm_voting tx_tag_idle_text` (`auto_ppm` added by item 45, `usb_chunk_sizing` by item 46, `auto_ppm_voting` by item 47, `tx_tag_idle_text` by item 61), followed by whichever optional build components are compiled in
 (`rdio_scanner`, `soapysdr`, `pulseaudio`, `nfm`). NFM builds also list `fm_demod` (item 52) after `nfm`. `mirisdr` was also in that list until
 upstream v7.0.0 removed the driver. It was a build-component name, not a fork capability, so its
 disappearance doesn't break the never-remove rule below, which covers the fork capability names.

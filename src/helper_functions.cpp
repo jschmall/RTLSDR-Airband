@@ -96,7 +96,7 @@ string make_icecast_mountpoint(const string& mountpoint) {
 }
 
 std::string fork_features() {
-    std::string features = "fork control_socket device_status reserve mixer_remote send_tx_tags stats_http json_log post_write_script auto_ppm usb_chunk_sizing auto_ppm_voting";
+    std::string features = "fork control_socket device_status reserve mixer_remote send_tx_tags stats_http json_log post_write_script auto_ppm usb_chunk_sizing auto_ppm_voting tx_tag_idle_text";
 #ifdef WITH_RDIO_SCANNER
     features += " rdio_scanner";
 #endif
@@ -145,6 +145,10 @@ string compute_tx_tag_content(bool has_signal, const char* label, int frequency_
     char description[32];
     snprintf(description, sizeof(description), "%.3f MHz", frequency_hz / 1000000.0);
     return string(description);
+}
+
+string tx_tag_or_idle(const string& tx_tag, const string& idle_text) {
+    return tx_tag.empty() ? idle_text : tx_tag;
 }
 
 string icecast_song_value(const string& tag) {

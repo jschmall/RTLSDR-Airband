@@ -673,7 +673,7 @@ void process_outputs(channel_t* channel, int cur_scan_freq, const std::string& t
                 struct timeval now;
                 gettimeofday(&now, NULL);
                 std::string out_value;
-                if (icecast_tx_tag_step(&icecast->tx_tag_state, tx_tag, now, shout_metadata_delay, &out_value)) {
+                if (icecast_tx_tag_step(&icecast->tx_tag_state, tx_tag_or_idle(tx_tag, icecast->tx_tag_idle_text), now, shout_metadata_delay, &out_value)) {
                     icecast_metadata_submit(icecast->meta, out_value);
                 }
             }

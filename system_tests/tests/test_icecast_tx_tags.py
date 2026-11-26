@@ -24,6 +24,7 @@ Parametrized over all provided binaries (non-NFM and NFM if available).
 """
 
 import base64
+import subprocess
 from pathlib import Path
 
 from conftest import BinaryUnderTest, run_rtl_airband
@@ -45,6 +46,7 @@ MOUNTPOINT = "test_tx_tags.mp3"
 USERNAME = "source"
 PASSWORD = "test-password"
 LABEL = "Fire Dispatch"
+IDLE_TEXT = 'tx_tag_idle_text = "Scanning";'
 
 
 def pytest_generate_tests(metafunc):
@@ -58,7 +60,7 @@ def pytest_generate_tests(metafunc):
         )
 
 
-def _icecast_block(port: int, mountpoint: str) -> str:
+def _icecast_block(port: int, mountpoint: str, extra: str = "") -> str:
     return "\n".join(
         [
             "        {",
@@ -69,6 +71,7 @@ def _icecast_block(port: int, mountpoint: str) -> str:
             f'          username = "{USERNAME}";',
             f'          password = "{PASSWORD}";',
             "          send_tx_tags = true;",
+            *([f"          {extra}"] if extra else []),
             "        }",
         ]
     )
@@ -187,6 +190,96 @@ def test_icecast_tx_tags_icecast_2_5_login(
     assert refused == 0, f"{refused} metadata requests were sent without credentials"
     assert LABEL in songs, f"Expected the label to reach the server, got: {songs}"
     assert songs[-1] == CLEARED, f"Expected the title cleared last, got: {songs}"
+
+
+def test_icecast_tx_tags_idle_text(
+    binary_under_test: BinaryUnderTest,
+    test_output_dir: Path,
+    cache_dir: Path,
+    speedup_factor: float,
+) -> None:
+    """With tx_tag_idle_text, the title says it before and after a transmission."""
+    iq_file = iq_generator.get_or_generate_am(
+        offset_hz=CHANNEL_OFFSET_HZ,
+        audio_hz=AUDIO_TONE_HZ,
+        duration_s=DURATION_S,
+        cache_dir=cache_dir,
+    )
+    config_path = test_output_dir / "rtl_airband.conf"
+
+    with FakeIcecastServer() as server:
+        config_writer.write_config(
+            config_path=config_path,
+            iq_filepath=iq_file,
+            sample_rate=SAMPLE_RATE,
+            centerfreq_hz=CENTERFREQ_HZ,
+            channels=[
+                {
+                    "freq_hz": CENTERFREQ_HZ + CHANNEL_OFFSET_HZ,
+                    "label": LABEL,
+                    "extra_output_blocks": [
+                        _icecast_block(server.port, MOUNTPOINT, extra=IDLE_TEXT)
+                    ],
+                }
+            ],
+            output_dir=test_output_dir,
+            speedup_factor=speedup_factor,
+            mode="multichannel",
+            shout_metadata_delay=0,
+        )
+        run_rtl_airband(binary_under_test.path, config_path, timeout_s=TIMEOUT_S)
+        songs = [
+            u.song for u in sorted(server.metadata_updates, key=lambda u: u.received_at)
+        ]
+
+    assert songs, "Expected Icecast metadata updates, got none"
+    assert songs[0] == "Scanning", f"Expected the idle text first, got: {songs}"
+    assert LABEL in songs, f"Expected the label, got: {songs}"
+    assert songs[-1] == "Scanning", f"Expected the idle text last, got: {songs}"
+    assert CLEARED not in songs, f"The idle text replaces clearing, got: {songs}"
+
+
+def test_icecast_tx_tag_idle_text_needs_send_tx_tags(
+    binary_under_test: BinaryUnderTest, test_output_dir: Path, cache_dir: Path
+) -> None:
+    """tx_tag_idle_text without send_tx_tags is a configuration error."""
+    iq_file = iq_generator.get_or_generate_am(
+        offset_hz=CHANNEL_OFFSET_HZ,
+        audio_hz=AUDIO_TONE_HZ,
+        duration_s=DURATION_S,
+        cache_dir=cache_dir,
+    )
+    config_path = test_output_dir / "rtl_airband.conf"
+    block = _icecast_block(8000, MOUNTPOINT, extra=IDLE_TEXT)
+    config_writer.write_config(
+        config_path=config_path,
+        iq_filepath=iq_file,
+        sample_rate=SAMPLE_RATE,
+        centerfreq_hz=CENTERFREQ_HZ,
+        channels=[
+            {
+                "freq_hz": CENTERFREQ_HZ + CHANNEL_OFFSET_HZ,
+                "label": LABEL,
+                "extra_output_blocks": [
+                    block.replace("send_tx_tags = true;", "send_tx_tags = false;")
+                ],
+            }
+        ],
+        output_dir=test_output_dir,
+        mode="multichannel",
+    )
+    result = subprocess.run(
+        [str(binary_under_test.path), "-F", "-e", "-c", str(config_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode != 0, "The config should be rejected"
+    assert any(
+        "Configuration error" in line and "tx_tag_idle_text" in line
+        for line in result.stderr.splitlines()
+    ), f"Unexpected stderr:\n{result.stderr}"
 
 
 def test_icecast_tx_tags_mixer(
