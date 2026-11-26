@@ -230,6 +230,14 @@ came from `send_tx_tags`.
   against `fake_icecast_server.py` answering metadata after 1 s. The old code overran the mixer
   21 times; the fix stays at ≤ 2.
 
+**59. A cleared title is sent as a space** (`src/helper_functions.{h,cpp}` `icecast_song_value()`,
+`src/icecast_metadata.cpp`). From the icecast-endpoint plugin (Broadcastify's report, checked live
+there and again here against Docker `libretime/icecast` images): Icecast 2.4.4 clears the title on an
+empty `song=` or on a space, but **2.5.0 answers `200` to an empty `song=` and keeps the old title**.
+A space clears it on both. The state machine still treats `""` as "cleared"; only the value sent
+changes, so nothing is sent at startup. `test_icecast_tx_tags.py` expects `song == " "` and fails
+against the old binary.
+
 #### Observability / metrics
 
 **8. HTTP metrics endpoint** (`src/stats_http.cpp`, new) — `write_stats_file()` already writes

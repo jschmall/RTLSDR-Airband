@@ -129,7 +129,7 @@ void send_update(IcecastMetaTarget* t, const string& value) {
     }
     shout_t* s = (shout_t*)t->shout;
     shout_metadata_t* meta = shout_metadata_new();
-    if (meta == NULL || shout_metadata_add(meta, "song", value.c_str()) != SHOUTERR_SUCCESS) {
+    if (meta == NULL || shout_metadata_add(meta, "song", icecast_song_value(value).c_str()) != SHOUTERR_SUCCESS) {
         log(LOG_WARNING, "Failed to add shout metadata\n");
         t->failure_count++;
         if (meta != NULL) {

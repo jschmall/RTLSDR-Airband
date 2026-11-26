@@ -203,6 +203,15 @@ TEST_F(HelperFunctionsTest, compute_tx_tag_content_falls_back_to_frequency_witho
     EXPECT_EQ(compute_tx_tag_content(true, NULL, 154265000), "154.265 MHz");
 }
 
+TEST_F(HelperFunctionsTest, icecast_song_value_sends_a_cleared_tag_as_a_space) {
+    EXPECT_EQ(icecast_song_value(""), " ");
+}
+
+TEST_F(HelperFunctionsTest, icecast_song_value_keeps_a_label) {
+    EXPECT_EQ(icecast_song_value("Fire Dispatch"), "Fire Dispatch");
+    EXPECT_EQ(icecast_song_value("154.265 MHz"), "154.265 MHz");
+}
+
 namespace {
 struct timeval make_tv(long sec) {
     struct timeval tv;

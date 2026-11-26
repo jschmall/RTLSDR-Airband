@@ -147,6 +147,10 @@ string compute_tx_tag_content(bool has_signal, const char* label, int frequency_
     return string(description);
 }
 
+string icecast_song_value(const string& tag) {
+    return tag.empty() ? string(" ") : tag;
+}
+
 bool icecast_tx_tag_step(icecast_tx_tag_state* state, const string& desired_tag, const struct timeval& now, int delay_sec, string* out_value) {
     if (desired_tag == state->applied) {
         // already live (or reverted back to it before a pending change applied) - nothing to do

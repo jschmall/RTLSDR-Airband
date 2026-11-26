@@ -4,8 +4,9 @@ test_icecast_tx_tags.py — send_tx_tags: on-air metadata tag per transmission.
 Unlike send_scan_freq_tags (R_SCAN only, driven by controller_thread hopping
 between scan frequencies), send_tx_tags applies to R_MULTICHANNEL channels and
 mixers: it pushes the channel's configured label as the Icecast "song" tag
-when squelch opens (a transmission starts) and clears it to an empty string
-when squelch closes (the transmission ends). See icecast_tx_tag_step() in
+when squelch opens (a transmission starts) and clears it when squelch closes
+(the transmission ends). A cleared tag is sent as a single space (CLEARED):
+Icecast 2.5 keeps the old title on an empty one. See icecast_tx_tag_step() in
 src/helper_functions.cpp and compute_tx_tag_content()/
 mixer_select_active_tag_input() in src/output.cpp / src/mixer.cpp.
 
@@ -37,6 +38,8 @@ DURATION_S = 8.0
 TOTAL_IQ_DURATION_S = DURATION_S + 2 * iq_generator.NOISE_PAD_S  # 10 s
 TIMEOUT_S = TOTAL_IQ_DURATION_S * 3 + 30  # 60 s
 
+# How a cleared tag reaches the server: a space, since Icecast 2.5 ignores an empty song=.
+CLEARED = " "
 MOUNTPOINT = "test_tx_tags.mp3"
 USERNAME = "source"
 PASSWORD = "test-password"
@@ -118,14 +121,14 @@ def test_icecast_tx_tags_channel(
         ), f"Unexpected mount in metadata update: {u.mount!r}"
 
     label_updates = [u for u in updates if u.song == LABEL]
-    clear_updates = [u for u in updates if u.song == ""]
+    clear_updates = [u for u in updates if u.song == CLEARED]
 
     assert label_updates, (
         f"Expected a metadata update with song={LABEL!r}, "
         f"got: {[u.song for u in updates]}"
     )
     assert clear_updates, (
-        "Expected a metadata update clearing the tag (song=''), "
+        "Expected a metadata update clearing the tag (song=' '), "
         f"got: {[u.song for u in updates]}"
     )
     assert updates.index(label_updates[0]) < updates.index(clear_updates[-1]), (
@@ -133,7 +136,7 @@ def test_icecast_tx_tags_channel(
         f"got order: {[u.song for u in updates]}"
     )
     # only ever these two values - no stray/garbled content
-    assert {u.song for u in updates} == {LABEL, ""}
+    assert {u.song for u in updates} == {LABEL, CLEARED}
 
 
 def test_icecast_tx_tags_mixer(
@@ -203,14 +206,14 @@ def test_icecast_tx_tags_mixer(
     assert updates, "Expected at least one Icecast metadata update, got none"
 
     label_updates = [u for u in updates if u.song == LABEL]
-    clear_updates = [u for u in updates if u.song == ""]
+    clear_updates = [u for u in updates if u.song == CLEARED]
 
     assert label_updates, (
         f"Expected a metadata update tagging the talking input ({LABEL!r}), "
         f"got: {[u.song for u in updates]}"
     )
     assert clear_updates, (
-        "Expected a metadata update clearing the tag (song=''), "
+        "Expected a metadata update clearing the tag (song=' '), "
         f"got: {[u.song for u in updates]}"
     )
     assert "Channel B" not in {u.song for u in updates}, (
