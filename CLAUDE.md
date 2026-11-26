@@ -238,6 +238,27 @@ A space clears it on both. The state machine still treats `""` as "cleared"; onl
 changes, so nothing is sent at startup. `test_icecast_tx_tags.py` expects `song == " "` and fails
 against the old binary.
 
+**60. Icecast metadata sent with its own HTTP request, Basic auth up front**
+(`src/icecast_metadata.{h,cpp}` `icecast_metadata_request()` / `icecast_metadata_send_http()`).
+- **Found** while checking item 59 against Docker Icecast 2.5.0: no title update worked at all,
+  labels included (`Failed to set shout metadata ...: No error`). libshout 2.4.6 (its latest release)
+  sends `GET /admin/metadata` without credentials, and adds `Authorization: Basic` only on a retry
+  after the server *closes* the connection. Icecast 2.4.4 answers the 401 with `Connection: Close`;
+  2.5.0 answers it with `Connection: Keep-Alive`, so libshout never retries. The streaming connection
+  is unaffected.
+- **The fix.** For a plain (`tls` disabled, the default) output, the worker sends
+  `GET /admin/metadata?mode=updinfo&charset=UTF-8&mount=...&song=... HTTP/1.0` with Basic auth itself
+  over a non-blocking socket (getaddrinfo, each address in turn, 10 s overall deadline) and reads
+  only the status line, so a 2.5 server holding the connection open doesn't stall it. TLS outputs
+  still go through the never-opened `shout_t` (item 49), and still fail on 2.5. Failures log the
+  server's status line or the network error, never the password, and count in
+  `icecast_metadata_failure_count`.
+- **Tests.** `test_icecast_metadata.cpp` (the exact request, URL encoding, base64 padding, an
+  accepted update, a 2.5-style 401 that's read without waiting for a close, nothing listening).
+  `fake_icecast_server.py` gained `metadata_auth=`, which refuses a request without it the 2.5 way;
+  `test_icecast_tx_tags_icecast_2_5_login` uses it and fails on the libshout path. Checked live
+  against Docker `libretime/icecast:2.5.0` and `2.4.4`: the label shows, then clears.
+
 #### Observability / metrics
 
 **8. HTTP metrics endpoint** (`src/stats_http.cpp`, new) — `write_stats_file()` already writes

@@ -23,6 +23,7 @@ end-to-end wiring (axcindicate / mixer input -> label -> Icecast
 Parametrized over all provided binaries (non-NFM and NFM if available).
 """
 
+import base64
 from pathlib import Path
 
 from conftest import BinaryUnderTest, run_rtl_airband
@@ -137,6 +138,55 @@ def test_icecast_tx_tags_channel(
     )
     # only ever these two values - no stray/garbled content
     assert {u.song for u in updates} == {LABEL, CLEARED}
+
+
+def test_icecast_tx_tags_icecast_2_5_login(
+    binary_under_test: BinaryUnderTest,
+    test_output_dir: Path,
+    cache_dir: Path,
+    speedup_factor: float,
+) -> None:
+    """Titles reach a server that refuses a request without credentials the way Icecast 2.5 does.
+
+    libshout 2.4.6 asks without credentials first and retries with them only when the server
+    closes the connection. Icecast 2.5 keeps it open after the 401, so every update failed.
+    """
+    iq_file = iq_generator.get_or_generate_am(
+        offset_hz=CHANNEL_OFFSET_HZ,
+        audio_hz=AUDIO_TONE_HZ,
+        duration_s=DURATION_S,
+        cache_dir=cache_dir,
+    )
+    config_path = test_output_dir / "rtl_airband.conf"
+    basic = "Basic " + base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
+
+    with FakeIcecastServer(metadata_auth=basic) as server:
+        config_writer.write_config(
+            config_path=config_path,
+            iq_filepath=iq_file,
+            sample_rate=SAMPLE_RATE,
+            centerfreq_hz=CENTERFREQ_HZ,
+            channels=[
+                {
+                    "freq_hz": CENTERFREQ_HZ + CHANNEL_OFFSET_HZ,
+                    "label": LABEL,
+                    "extra_output_blocks": [_icecast_block(server.port, MOUNTPOINT)],
+                }
+            ],
+            output_dir=test_output_dir,
+            speedup_factor=speedup_factor,
+            mode="multichannel",
+            shout_metadata_delay=0,
+        )
+        run_rtl_airband(binary_under_test.path, config_path, timeout_s=TIMEOUT_S)
+        songs = [
+            u.song for u in sorted(server.metadata_updates, key=lambda u: u.received_at)
+        ]
+        refused = server.metadata_refused
+
+    assert refused == 0, f"{refused} metadata requests were sent without credentials"
+    assert LABEL in songs, f"Expected the label to reach the server, got: {songs}"
+    assert songs[-1] == CLEARED, f"Expected the title cleared last, got: {songs}"
 
 
 def test_icecast_tx_tags_mixer(
